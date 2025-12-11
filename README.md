@@ -45,6 +45,6 @@ Show me the skill profile of Anthony Edwards and Shai Gilgeous-Alexander in 2024
 
 Example of analysis questions
 -------------------
-top 5 scorers 2023
-top 5 defenders 2023
-what are jaylen brown's stats
+top 5 scorers 2023  
+top 5 defenders 2023  
+what are jaylen brown's stats  

@@ -291,11 +291,17 @@ def analyze_dataframe() -> str:
     if score_table is not None and not score_table.empty:
         score_text = score_table.to_string(index=True)
         system_prompt = (
-            "You are an expert NBA analyst. Use ONLY the provided data and ranking. "
-            "DO NOT change the ranking order. Write an in-depth analysis with clear sections: "
-            "1) Executive summary, 2) Ranking rationale, 3) Top contenders breakdown with metric-by-metric evidence "
-            "(include strengths, weaknesses, and role fit), 4) Context (usage, role, sample caveats), "
-            "5) Sensitivity and limitations, 6) Actionable insights. Be specific and role-aware."
+            "You are an expert NBA analyst. Provide a clear, well-structured analysis.\n\n"
+            "Format your response with these sections (use ### for headers):\n"
+            "### Executive Summary\n"
+            "One concise paragraph highlighting the key finding.\n\n"
+            "### Key Metrics\n"
+            "Bullet points of the most important stats (use - for bullets).\n\n"
+            "### Detailed Analysis\n"
+            "2-3 paragraphs with specific evidence from the data.\n\n"
+            "### Context & Considerations\n"
+            "Brief paragraph about role, usage, and limitations.\n\n"
+            "Use the provided ranking. Be specific and reference actual numbers from the data."
         )
         user_prompt = (
             f"Question: {user_input}\n\n"
@@ -303,21 +309,28 @@ def analyze_dataframe() -> str:
             f"Guidance: {rubric_by_domain[domain]}\n\n"
             f"RANKED (DO NOT REORDER):\n{score_text}\n\n"
             f"ORIGINAL DATA (first rows):\n{rows_to_show.to_string(index=False)}\n\n"
-            f"Explain the result by identifying #1 and comparing them to the next strongest contenders."
+            f"Analyze the top result and compare to the next strongest contenders."
         )
     else:
         system_prompt = (
-            "You are an expert NBA data analyst. Produce an in-depth analysis based ONLY on the provided DataFrame.\n\n"
-            f"DECISION RUBRIC (domain={domain}): {rubric_by_domain[domain]}\n"
-            "If players span positions, explain role differences but still pick ONE overall best unless asked by role.\n"
-            "Structure your response with: Executive summary; Detailed findings (metric-by-metric); "
-            "Comparative evaluation; Context (role, usage, sample size); Limitations; Actionable insights. "
-            "Be specific, avoid generic statements, and tie every claim to the data shown."
+            "You are an expert NBA analyst. Provide a clear, well-structured analysis.\n\n"
+            f"Domain: {domain}\n"
+            f"Guidance: {rubric_by_domain[domain]}\n\n"
+            "Format your response with these sections (use ### for headers):\n"
+            "### Executive Summary\n"
+            "One concise paragraph highlighting the key finding.\n\n"
+            "### Key Metrics\n"
+            "Bullet points of the most important stats (use - for bullets).\n\n"
+            "### Detailed Analysis\n"
+            "2-3 paragraphs with specific evidence from the data.\n\n"
+            "### Context & Considerations\n"
+            "Brief paragraph about role, usage, and any limitations.\n\n"
+            "Be specific and reference actual numbers from the data."
         )
         user_prompt = (
             f"User's question: {user_input}\n\n"
             f"Data:\n{df_summary}\n"
-            "Please analyze the data and answer the question clearly."
+            "Analyze the data and answer the question clearly."
         )
 
     try:
@@ -330,7 +343,13 @@ def analyze_dataframe() -> str:
             temperature=0,
             max_tokens=1600,
         )
-        return response.choices[0].message.content.strip()
+        raw_response = response.choices[0].message.content.strip()
+        
+        # Format the response for better readability
+        formatted_response = raw_response.replace("###", "\n\n###").replace("####", "\n\n####")
+        formatted_response = "\n" + formatted_response.strip()
+        
+        return formatted_response
     except Exception as e:
         return f"Error during AI analysis: {str(e)}"
 
@@ -406,11 +425,17 @@ def analyze_question(question: str) -> str:
     if score_table is not None and not score_table.empty:
         score_text = score_table.to_string(index=True)
         system_prompt = (
-            "You are an expert NBA analyst. Use ONLY the provided data and ranking. "
-            "DO NOT change the ranking order. Write an in-depth analysis with clear sections: "
-            "1) Executive summary, 2) Ranking rationale, 3) Top contenders breakdown with metric-by-metric evidence "
-            "(include strengths, weaknesses, and role fit), 4) Context (usage, role, sample caveats), "
-            "5) Sensitivity and limitations, 6) Actionable insights. Be specific and role-aware."
+            "You are an expert NBA analyst. Provide a clear, well-structured analysis.\n\n"
+            "Format your response with these sections (use ### for headers):\n"
+            "### Executive Summary\n"
+            "One concise paragraph highlighting the key finding.\n\n"
+            "### Key Metrics\n"
+            "Bullet points of the most important stats (use - for bullets).\n\n"
+            "### Detailed Analysis\n"
+            "2-3 paragraphs with specific evidence from the data.\n\n"
+            "### Context & Considerations\n"
+            "Brief paragraph about role, usage, and limitations.\n\n"
+            "Use the provided ranking. Be specific and reference actual numbers from the data."
         )
         user_prompt = (
             f"Question: {question}\n\n"
@@ -418,21 +443,28 @@ def analyze_question(question: str) -> str:
             f"Guidance: {rubric_by_domain[domain]}\n\n"
             f"RANKED (DO NOT REORDER):\n{score_text}\n\n"
             f"ORIGINAL DATA (first rows):\n{rows_to_show.to_string(index=False)}\n\n"
-            f"Explain the result by identifying #1 and comparing them to the next strongest contenders."
+            f"Analyze the top result and compare to the next strongest contenders."
         )
     else:
         system_prompt = (
-            "You are an expert NBA data analyst. Produce an in-depth analysis based ONLY on the provided DataFrame.\n\n"
-            f"DECISION RUBRIC (domain={domain}): {rubric_by_domain[domain]}\n"
-            "If players span positions, explain role differences but still pick ONE overall best unless asked by role.\n"
-            "Structure your response with: Executive summary; Detailed findings (metric-by-metric); "
-            "Comparative evaluation; Context (role, usage, sample size); Limitations; Actionable insights. "
-            "Be specific, avoid generic statements, and tie every claim to the data shown."
+            "You are an expert NBA analyst. Provide a clear, well-structured analysis.\n\n"
+            f"Domain: {domain}\n"
+            f"Guidance: {rubric_by_domain[domain]}\n\n"
+            "Format your response with these sections (use ### for headers):\n"
+            "### Executive Summary\n"
+            "One concise paragraph highlighting the key finding.\n\n"
+            "### Key Metrics\n"
+            "Bullet points of the most important stats (use - for bullets).\n\n"
+            "### Detailed Analysis\n"
+            "2-3 paragraphs with specific evidence from the data.\n\n"
+            "### Context & Considerations\n"
+            "Brief paragraph about role, usage, and any limitations.\n\n"
+            "Be specific and reference actual numbers from the data."
         )
         user_prompt = (
             f"User's question: {question}\n\n"
             f"Data:\n{df_summary}\n"
-            "Please analyze the data and answer the question clearly."
+            "Analyze the data and answer the question clearly."
         )
 
     try:
@@ -445,7 +477,13 @@ def analyze_question(question: str) -> str:
             temperature=0,
             max_tokens=1600,
         )
-        return response.choices[0].message.content.strip()
+        raw_response = response.choices[0].message.content.strip()
+        
+        # Format the response for better readability
+        formatted_response = raw_response.replace("###", "\n\n###").replace("####", "\n\n####")
+        formatted_response = "\n" + formatted_response.strip()
+        
+        return formatted_response
     except Exception as e:
         return f"Error during AI analysis: {str(e)}"
 

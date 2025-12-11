@@ -1,4 +1,4 @@
-# Team45seniordesign
+Team45seniordesign
 Senior Design project
 
 
@@ -11,24 +11,40 @@ Senior Design project
 
 To start backend
 ------------------
-0. Open new terminal
-1. cd Team45seniordesign
-2. cd backend
-3. run "python -m uvicorn main:app --reload --port 8000" in terminal
+1. Open new terminal
+2. cd Team45seniordesign
+3. cd backend
+4. run 'pip install -r requirements.txt' to install requirements
+5. run "python -m uvicorn main:app --reload --port 8000" in terminal
+
 
 To start frontend
 ------------------
-0. Open new terminal
-1. cd Team45seniordesign
-2. cd frontend
-3. cd ai_analyst
-4. run "npm i" or "npm install" in terminal"
-5. run "npm run dev"
+1. Open new terminal
+2. cd Team45seniordesign
+3. cd frontend
+4. cd ai_analyst
+5. run "npm i" or "npm install" in terminal"
+6. run "npm run dev"
 
-For dashboard section
+
+Example of dashboard questions
 -------------------
-Example questions
-1. Show me the top 10 players with the most assists in 2016.
-3. Show me the skill profiles of Anthony Edwards and Shai Gilgeous-Alexander in 2024.
-4. Compare LeBron James and Kevin Durant points per game in 2024.
-5. Show me Steph Curry's 3-point percentage trend from 2019 to 2024.
+Leaderboard
+Who are the top 5 players with the most total minutes played in the 2024 season?
+
+Trend
+Show me the trend for Shai Gilgeous-Alexander's attempted free throws per year in his career
+
+Comparison
+Show me a comparison of Lebron James and Kevin Durant points per game in the 2024 season
+
+Skill Profile
+Show me the skill profile of Anthony Edwards and Shai Gilgeous-Alexander in 2024.
+
+
+Example of analysis questions
+-------------------
+top 5 scorers 2023
+top 5 defenders 2023
+what are jaylen brown's stats

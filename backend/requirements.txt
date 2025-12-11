@@ -1,0 +1,9 @@
+flask
+flask-cors
+requests
+psycopg2
+python-dotenv
+openai
+pydantic
+uvicorn
+fastapi

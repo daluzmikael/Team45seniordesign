@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 # Setting up OpenAI client
-print("API Key Loaded:", os.getenv("OPENAI_API_KEY"))
+#print("API Key Loaded:", os.getenv("OPENAI_API_KEY"))
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # 2. Connect to PostgreSQL (AWS RDS)

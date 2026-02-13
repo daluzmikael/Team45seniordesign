@@ -162,7 +162,7 @@ export function AppSidebar() {
                     <AvatarImage src="/placeholder.svg?height=32&width=32" />
                     <AvatarFallback>JD</AvatarFallback>
                   </Avatar>
-                  <span className="flex-1 text-left">John Doe</span>
+                  <span className="flex-1 text-left">Guest</span>
                   <MoreHorizontal className="h-4 w-4" />
                 </SidebarMenuButton>
               </DropdownMenuTrigger>

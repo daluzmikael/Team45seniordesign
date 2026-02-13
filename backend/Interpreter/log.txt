@@ -1,0 +1,13 @@
+2/12
+- Added new functionality: automatic schema aware retry mechanism for invalid prompt
+    - If SQL generation fails due to schema related reasons, the program will attempt to correc the error and regenerate SQL
+    - Reduces manual debugging and allows for cleaner experience
+- Revised some SQL safety checks
+- Improved prompt engineering for base prompts
+    - Updated generation promt to be more detailed clear rules
+    - Created a repair prompt with role, guardrails, and preserve user intent 
+- Code refactor
+    - Split the query_bot file into executor and interpreter files
+    executor.py: Database connection, Schema extraction, SQL safety validation, LIMIT enforcement, Query execution
+    interpreter.py: OpenAI client, Prompt construction, SQL generation, Schema-aware repair loop, Retry function 
+    - This will help if we try to remove the OpenAI with our own

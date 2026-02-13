@@ -1,4 +1,8 @@
-﻿import psycopg2
+﻿"""
+To be deleted. Call executor.py and interpreter.py functions directly instead of this layer.
+"""
+
+import psycopg2
 import re
 import pandas as pd
 from openai import OpenAI
@@ -32,9 +36,7 @@ df_output = None
 user_input = None
 
 
-# ------------------------------
 # 3. Read DB schema (for GPT prompt)
-# ------------------------------
 def get_db_schema():
     global conn, cursor
     try:
@@ -72,9 +74,7 @@ def get_db_schema():
     return schema_description
 
 
-# ------------------------------
 # 4. SQL safety checker
-# ------------------------------
 def is_safe_sql(sql_query):
     sql_lower = sql_query.strip().lower()
     sql_lower = re.sub(r"--.*?\n", "", sql_lower).strip()
@@ -92,9 +92,7 @@ def is_safe_sql(sql_query):
     return True
 
 
-# ------------------------------
 # 5. Add LIMIT automatically
-# ------------------------------
 def limit_rows(sql_query, limit=50):
     """Add LIMIT to query if not present, handling UNION queries properly"""
     sql_lower = sql_query.lower()
@@ -112,90 +110,161 @@ def limit_rows(sql_query, limit=50):
     sql_query = sql_query.rstrip(";")
     return f"{sql_query} LIMIT {limit};"
 
+# 5.5 repair SQL error
 
-# ------------------------------
+def repair_sql_error(original_sql, error_message, schema_description, user_input):
+    r_prompt = f"""
+    The following SQL query failed:
+
+    Database schema:
+    {schema_description}
+
+    User request:
+    "{user_input}"
+
+    Failed SQL:
+    {original_sql}
+
+    Database error:
+    {error_message}
+
+    Fix the SQL to match the schema exactly.
+    Return ONLY a valid PostgreSQL SELECT query.
+    Do NOT include any additional text or markdown.
+    """
+
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "Return ONLY valid SQL."},
+            {"role": "user", "content": r_prompt}
+        ],
+        temperature=0,
+        max_tokens=1500
+    )
+
+    fixed_sql = response.choices[0].message.content.strip()
+    fixed_sql = fixed_sql.replace("```sql", "").replace("```", "").strip()
+
+    return fixed_sql
+
+
+
 # 6. Convert natural language → SQL
-# ------------------------------
 def natural_language_to_sql(user_input_param: str):
-    global df_output, conn, cursor
-    global user_input
-    user_input = user_input_param
+    global df_output, conn, cursor, user_input
 
+    user_input = user_input_param
     schema_description = get_db_schema()
 
     prompt = f"""
-You convert natural language into SQL queries.
-Use only the database schema below:
+You are a senior SQL data engineer.
+Your task is to convert a natural language request into a VALID PostgreSQL SELECT query for the NBA stats database.
+RULES:
+- Use ONLY tables and columns that exist in the schema below.
+- Do NOT invent columns.
+- Do NOT guess column names.
+- If unsure, choose the closest matching column from the schema.
+- Use explicit table aliases when joining.
+- Fully qualify ambiguous columns (table.column).
+- ONLY generate SELECT queries.
+- Do NOT include explanations.
+- Do NOT include markdown.
+- Output SQL only.
 
+PERFORMANCE RULES:
+- Use GROUP BY only when aggregation is required.
+- Avoid SELECT * unless explicitly requested.
+- Use the most efficient query structure.
+
+DATABASE SCHEMA:
 {schema_description}
 
-User request: "{user_input_param}"
+USER REQUEST:
+{user_input_param}
 
-Return ONLY a safe SQL SELECT query.
-Do NOT include markdown or code fences.
-"""
+Generate the SQL"""
 
     try:
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a SQL query generator. Return ONLY valid SQL queries without any markdown formatting or explanations. Keep queries concise and efficient."},
+                {"role": "system", "content": "You are a SQL query generator. Return ONLY valid SQL queries."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0,
-            max_tokens=1500  # Increased from 500 to handle longer queries
+            max_tokens=1500
         )
 
         sql_query = response.choices[0].message.content.strip()
-        print(f"\n[DEBUG] Generated SQL: {sql_query[:200]}...")  # Only show first 200 chars
+        sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
+
     except Exception as e:
         print(f"[ERROR] OpenAI API error: {e}")
         return None
 
-    # strip accidental markdown formatting
-    sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
-
     sql_query = limit_rows(sql_query)
 
     if not is_safe_sql(sql_query):
-        print(f"\n[ERROR] Unsafe SQL generated: {sql_query}")
+        print(f"[ERROR] Unsafe SQL generated: {sql_query}")
         return None
 
-    print(f"[DEBUG] Executing SQL query...")
+    # Execution with self query repair loop
+    max_attempts = 3
 
-    # ------------------------------
-    # Execute the query and return DataFrame
-    # ------------------------------
-    try:
-        cursor.execute(sql_query)
-        rows = cursor.fetchall()
-        colnames = [desc[0] for desc in cursor.description]
-
-        df = pd.DataFrame(rows, columns=colnames)
-        print(f"[DEBUG] Query returned {len(df)} rows, {len(df.columns)} columns")
-
-        df_output = df
-        conn.commit()  # Commit the transaction
-        return df
-
-    except Exception as e:
-        print(f"[ERROR] SQL execution error: {e}")
-        print(f"[ERROR] Failed query was: {sql_query}")
-        conn.rollback()  # Rollback failed transaction
-        # Try to reconnect for next query
+    for attempt in range(max_attempts):
         try:
-            conn = get_connection()
-            cursor = conn.cursor()
-        except Exception:
-            pass
-        return None
+            print(f"[DEBUG] Attempt {attempt+1} executing query...")
+            cursor.execute(sql_query)
+
+            rows = cursor.fetchall()
+            colnames = [desc[0] for desc in cursor.description]
+
+            df = pd.DataFrame(rows, columns=colnames)
+            print(f"[DEBUG] Query returned {len(df)} rows")
+
+            df_output = df
+            #conn.commit() not needed here -kon
+            return df
+
+        except Exception as e:
+            error_message = str(e)
+            print(f"[ERROR] SQL execution error: {error_message}")
+
+            # Only repair schema-related errors
+            if any(keyword in error_message.lower()
+                   for keyword in ["does not exist", "column", "relation"]):
+
+                print("[DEBUG] Attempting schema self-repair...")
+
+                sql_query = repair_sql_error(
+                    original_sql=sql_query,
+                    error_message=error_message,
+                    schema_description=schema_description,
+                    user_input=user_input_param
+                )
+
+                sql_query = limit_rows(sql_query)
+
+                if not is_safe_sql(sql_query):
+                    print("[ERROR] Repaired SQL is unsafe.")
+                    return None
+
+                continue
+
+            else:
+                print("[ERROR] Non-repairable error.")
+                conn.rollback()
+                return None
+
+    print("[ERROR] Max repair attempts reached.")
+    conn.rollback()
+    return None
 
 
-# ------------------------------
 # 7. Interactive query loop
-# ------------------------------
 if __name__ == "__main__":
-    print("Welcome to QUERY BOT (Pandas Edition)! Type 'quit' to exit.")
+    print("Welcome to HoopQuery! Type 'quit' to exit.")
     while True:
         user_inp = input("\nAsk a question about NBA data: ")
         if user_inp.lower() in ["quit", "exit"]:

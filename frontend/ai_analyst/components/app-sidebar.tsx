@@ -9,6 +9,8 @@ import {
   Trash2,
   LayoutDashboard,
   MessageCircle,
+  LogOut,
+  LogIn,
 } from "lucide-react"
 import {
   Sidebar,
@@ -26,8 +28,9 @@ import {
 } from "@/components/ui/sidebar"
 import { Button } from "@/components/ui/button"
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu"
-import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
+import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import Link from "next/link"
+import { useAuth } from "@/context/auth-context"
 
 // Just for showcase, dud code
 const chatHistory = [
@@ -58,7 +61,6 @@ const chatHistory = [
   },
 ]
 
-// group everything by its dae
 const groupedChats = chatHistory.reduce(
   (acc, chat) => {
     if (!acc[chat.date]) {
@@ -70,7 +72,14 @@ const groupedChats = chatHistory.reduce(
   {} as Record<string, typeof chatHistory>,
 )
 
+// Get initials from email e.g. "john@gmail.com" -> "JO"
+function getInitials(email: string) {
+  return email.slice(0, 2).toUpperCase()
+}
+
 export function AppSidebar() {
+  const { user, logout } = useAuth()
+
   return (
     <Sidebar>
       <SidebarHeader className="border-b border-sidebar-border p-4">
@@ -155,28 +164,42 @@ export function AppSidebar() {
       <SidebarFooter className="border-t border-sidebar-border p-4">
         <SidebarMenu>
           <SidebarMenuItem>
-            <DropdownMenu>
-              <DropdownMenuTrigger asChild>
-                <SidebarMenuButton className="w-full">
-                  <Avatar className="h-6 w-6">
-                    <AvatarImage src="/placeholder.svg?height=32&width=32" />
-                    <AvatarFallback>JD</AvatarFallback>
-                  </Avatar>
-                  <span className="flex-1 text-left">Guest</span>
-                  <MoreHorizontal className="h-4 w-4" />
-                </SidebarMenuButton>
-              </DropdownMenuTrigger>
-              <DropdownMenuContent side="top" align="start" className="w-56">
-                <DropdownMenuItem>
-                  <User className="h-4 w-4 mr-2" />
-                  Profile
-                </DropdownMenuItem>
-                <DropdownMenuItem>
-                  <Settings className="h-4 w-4 mr-2" />
-                  Settings
-                </DropdownMenuItem>
-              </DropdownMenuContent>
-            </DropdownMenu>
+            {user ? (
+              // Logged in state
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <SidebarMenuButton className="w-full">
+                    <Avatar className="h-6 w-6">
+                      <AvatarFallback className="text-xs">{getInitials(user.email)}</AvatarFallback>
+                    </Avatar>
+                    <span className="flex-1 text-left truncate">{user.email}</span>
+                    <MoreHorizontal className="h-4 w-4" />
+                  </SidebarMenuButton>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent side="top" align="start" className="w-56">
+                  <DropdownMenuItem>
+                    <User className="h-4 w-4 mr-2" />
+                    Profile
+                  </DropdownMenuItem>
+                  <DropdownMenuItem>
+                    <Settings className="h-4 w-4 mr-2" />
+                    Settings
+                  </DropdownMenuItem>
+                  <DropdownMenuItem onClick={logout} className="text-destructive focus:text-destructive">
+                    <LogOut className="h-4 w-4 mr-2" />
+                    Sign Out
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
+            ) : (
+              // Guest state
+              <SidebarMenuButton asChild>
+                <Link href="/login">
+                  <LogIn className="h-4 w-4" />
+                  <span>Sign In</span>
+                </Link>
+              </SidebarMenuButton>
+            )}
           </SidebarMenuItem>
         </SidebarMenu>
       </SidebarFooter>

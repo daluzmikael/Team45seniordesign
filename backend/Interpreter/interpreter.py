@@ -5,9 +5,10 @@ from openai import OpenAI
 from executor import (
     get_connection,
     get_db_schema,
-    is_safe_sql,
+    #is_safe_sql,
     limit_rows,
-    execute_query
+    execute_query,
+    validate_and_normalize_sql
 )
 
 load_dotenv()
@@ -104,8 +105,10 @@ Generate the SQL
 
     sql_query = limit_rows(sql_query)
 
-    if not is_safe_sql(sql_query):
-        print(f"[ERROR] Unsafe SQL generated: {sql_query}")
+    try:
+        sql_query = validate_and_normalize_sql(sql_query)
+    except ValueError as e:
+        print(f"[ERROR] Validation error: {e}")
         return None
 
     max_attempts = 3
@@ -133,8 +136,10 @@ Generate the SQL
 
                 sql_query = limit_rows(sql_query)
 
-                if not is_safe_sql(sql_query):
-                    print("[ERROR] Repaired SQL is unsafe.")
+                try:
+                    sql_query = validate_and_normalize_sql(sql_query)
+                except ValueError as e:
+                    print(f"[ERROR] Repaired SQL is unsafe: {e}")
                     return None
 
                 continue

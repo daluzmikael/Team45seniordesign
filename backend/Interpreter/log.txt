@@ -11,3 +11,17 @@
     executor.py: Database connection, Schema extraction, SQL safety validation, LIMIT enforcement, Query execution
     interpreter.py: OpenAI client, Prompt construction, SQL generation, Schema-aware repair loop, Retry function 
     - This will help if we try to remove the OpenAI with our own
+
+2/27
+- Added actual SQL parsing via sqlglot library.
+    - Uses a library to check for multiple queries and select only, instead of just using string comparing
+    - Makes the query bot less prone to producing bad sql
+    - Incorporated the new function into the code in executor.py and interpreter.py
+- Added Query cost estimator 
+    - Blocks out full table joins, bad aggregates, massive cross joins, LLM hallucinations 
+    - If postgre total cost exceeds max cost the query is blocked pre execution
+    - Includes a timeout feature that cancels queries that take too long to run
+    - Tune using EXPLAIN (FORMAT JSON) SELECT ... on the database 
+        set max cost to be max_cost = 2–3x highest normal query cost after running
+To Do:
+1. Add schema embedding rather than injection

@@ -1,6 +1,10 @@
 import psycopg2
 import pandas as pd
 import re
+import sqlglot
+from sqlglot import parse_one
+from sqlglot.errors import ParseError
+import json
 
 # 2. Connect to PostgreSQL (AWS RDS)
 def get_connection():
@@ -45,22 +49,27 @@ def get_db_schema(conn):
 
 
 # 4. SQL safety checker
-def is_safe_sql(sql_query):
-    sql_lower = sql_query.strip().lower()
-    sql_lower = re.sub(r"--.*?\n", "", sql_lower).strip()
+# replaced the function is_sql_safe()
+def validate_and_normalize_sql(sql_query: str) -> str:
+    try:
+        # parse SQL to ensure validity
+        parsed = parse_one(sql_query, read="postgres")
 
-    if "select" not in sql_lower:
-        return False
+    except ParseError as e:
+        raise ValueError(f"SQL Syntax Error: {e}")
 
-    dangerous = ["insert", "update", "delete", "drop",
-                 "alter", "create", "replace", "truncate"]
+    #  only SELECT statement
+    if parsed.key.upper() != "SELECT":
+        raise ValueError("Only SELECT statements are allowed.")
 
-    for keyword in dangerous:
-        if re.search(rf"\b{keyword}\b", sql_lower):
-            return False
+    # no multiple statements
+    if ";" in sql_query.strip().rstrip(";"):
+        raise ValueError("Multiple SQL statements are not allowed.")
 
-    return True
+    # normalize SQL 
+    normalized_sql = parsed.sql(dialect="postgres")
 
+    return normalized_sql
 
 # 5. Add LIMIT automatically
 def limit_rows(sql_query, limit=50):
@@ -76,14 +85,41 @@ def limit_rows(sql_query, limit=50):
     sql_query = sql_query.rstrip(";")
     return f"{sql_query} LIMIT {limit};"
 
+def set_query_timeout(conn, timeout_ms=3000):
+    cursor = conn.cursor()
+    cursor.execute(f"SET LOCAL statement_timeout = {timeout_ms};")
+
+def check_query_cost(conn, sql_query, max_cost=100000):
+    cursor = conn.cursor()
+
+    explain_query = f"EXPLAIN (FORMAT JSON) {sql_query}"
+    cursor.execute(explain_query)
+
+    result = cursor.fetchone()
+    explain_json = result[0][0]
+
+    total_cost = explain_json["Plan"]["Total Cost"]
+
+    print(f"[DEBUG] Estimated Query Cost: {total_cost}")
+
+    if total_cost > max_cost:
+        raise ValueError(
+            f"Query blocked: Estimated cost {total_cost} exceeds threshold {max_cost}"
+        )
+
+    return total_cost
 
 # Query execution function
-def execute_query(conn, sql_query):
+def execute_query(conn, sql_query, max_cost=100000, timeout_ms=3000):
     cursor = conn.cursor()
-    cursor.execute(sql_query)
+    cursor.execute("BEGIN;")
 
+    set_query_timeout(conn, timeout_ms)
+    check_query_cost(conn, sql_query, max_cost)
+
+    cursor.execute(sql_query)
     rows = cursor.fetchall()
     colnames = [desc[0] for desc in cursor.description]
 
-    df = pd.DataFrame(rows, columns=colnames)
-    return df
+    conn.commit()
+    return pd.DataFrame(rows, columns=colnames)

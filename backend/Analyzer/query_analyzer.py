@@ -232,15 +232,15 @@ SCORING_CONFIG = ScoreConfig(
         "fga": 0.10,
         "usage_pct": 0.10,
 
-        # How they get points (helps separate archetypes)
+        # How they get points (helps separate archetypes of players)
         "fta": 0.06,
         "ft_rate": 0.05,
         "three_pa": 0.04,
         "three_pm": 0.03,
 
         # Mistakes that reduce scoring value
-        "tov_per_game": 0.04,              # lower better
-        "tov_pct": 0.02,                   # lower better
+        "tov_per_game": 0.04,              
+        "tov_pct": 0.02,                   
     },
     invert={"tov_per_game", "tov_pct"},
     tiebreakers=["ppg", "ts_pct", "usage_pct", "fga", "ft_rate", "three_pa"],

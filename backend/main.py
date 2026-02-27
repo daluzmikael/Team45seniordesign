@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from DashboardBackend.dashboardInterpreter import interpret_question
 from Analyzer.query_analyzer import analyze_question
+from auth import sign_up, log_in
 
 # Initialize the app with FastAPI
 app = FastAPI()
@@ -53,5 +54,23 @@ async def analysis_endpoint(request: QueryRequest):
     except Exception as e:
         print(f"Analysis error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
+    
+class AuthRequest(BaseModel):
+    email: str
+    password: str
+
+@app.post("/api/signup")
+async def signup_endpoint(request: AuthRequest):
+    result = sign_up(request.email, request.password)
+    if result["success"]:
+        return result
+    raise HTTPException(status_code=400, detail=result["error"])
+
+@app.post("/api/login")
+async def login_endpoint(request: AuthRequest):
+    result = log_in(request.email, request.password)
+    if result["success"]:
+        return result
+    raise HTTPException(status_code=400, detail=result["error"])
 # To run this:
 # uvicorn main:app --reload --port 8000

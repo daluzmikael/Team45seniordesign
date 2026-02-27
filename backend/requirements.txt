@@ -8,3 +8,5 @@ pydantic
 uvicorn
 fastapi
 pandas
+numpy
+pyrebase4

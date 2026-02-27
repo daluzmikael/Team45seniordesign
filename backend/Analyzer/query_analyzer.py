@@ -108,61 +108,169 @@ class ScoreConfig:
     invert: Set[str]
     tiebreakers: List[str]
 
+# 0.02 → Barely matters
+
+# 0.05 → Minor contributor
+
+# 0.08–0.12 → More meaningful
+
+# 0.15+ → Core pillar of the domain
 
 DEFENSE_CONFIG = ScoreConfig(
     weights={
-        "defensive_impact": 0.35,
-        "rim_fg_pct_allowed": 0.18,
-        "rim_shots_contested": 0.12,
-        "opp_fg_pct_as_primary_defender": 0.10,
-        "versatility_index": 0.10,
-        "deflections_per_game": 0.08,
+        # --- overall / impact ---
+        "defensive_impact": 0.26,          
+        "def_rtg": 0.08,                   
+        "def_ws": 0.03,                    
+
+        # --- rim protection ---
+        "rim_fg_pct_allowed": 0.14,        
+        "rim_shots_contested": 0.10,       
+        "blk_per_game": 0.03,
+        "blk_pct": 0.06,
+
+        # --- on-ball / matchup ---
+        "opp_fg_pct_as_primary_defender": 0.09,  
+        "matchup_difficulty": 0.05,              
+
+        # --- disruption / activity ---
+        "deflections_per_game": 0.07,
         "loose_balls_recovered": 0.04,
+        "charges_drawn": 0.02,
         "stl_per_game": 0.02,
-        "blk_per_game": 0.01,
+        "stl_pct": 0.04,
+
+        # --- versatility / mistake reduction ---
+        "versatility_index": 0.05,
+        "fouls_per_game": 0.02,            
+        "dreb_pct": 0.07,                  
     },
-    invert={"rim_fg_pct_allowed", "opp_fg_pct_as_primary_defender"},
+    invert={
+        "rim_fg_pct_allowed",
+        "opp_fg_pct_as_primary_defender",
+        "def_rtg",
+        "fouls_per_game",
+    },
     tiebreakers=[
         "defensive_impact",
         "rim_fg_pct_allowed",
-        "rim_shots_contested",
-        "versatility_index",
         "opp_fg_pct_as_primary_defender",
+        "rim_shots_contested",
+        "blk_pct",
+        "stl_pct",
         "deflections_per_game",
+        "versatility_index",
     ],
 )
 
+
 SHOOTING_CONFIG = ScoreConfig(
-    weights={"three_pt_pct": 0.55, "three_pm": 0.30, "three_pa": 0.15},
+    weights={
+        "three_pt_pct": 0.28,
+        "three_pm": 0.16,
+        "three_pa": 0.08,
+
+        "ts_pct": 0.12,                    
+        "efg_pct": 0.08,                   
+        "ft_pct": 0.05,
+
+        "three_par": 0.06,                 
+        "ft_rate": 0.03,                   
+        "corner3_pct": 0.04,
+        "catch_shoot_3p_pct": 0.06,
+        "pullup_3p_pct": 0.04,
+    },
     invert=set(),
-    tiebreakers=["three_pt_pct", "three_pm", "three_pa"],
+    tiebreakers=[
+        "three_pt_pct",
+        "three_pm",
+        "catch_shoot_3p_pct",
+        "pullup_3p_pct",
+        "three_pa",
+        "ts_pct",
+        "efg_pct",
+    ],
 )
 
 PLAYMAKING_CONFIG = ScoreConfig(
     weights={
-        "ast_per_game": 0.45,
-        "ast_pct": 0.20,
-        "potential_ast": 0.15,
+        "ast_per_game": 0.26,
+        "ast_pct": 0.14,
+        "potential_ast": 0.10,
+
         "assist_points_created": 0.10,
-        "tov_per_game": 0.05,
-        "ast_to_tov": 0.05,
+        "secondary_ast": 0.06,             
+        "passes_made": 0.05,
+        "time_of_poss": 0.04,              
+        "usage_pct": 0.03,                 
+
+        # Ball security (efficiency)
+        "tov_per_game": 0.08,              
+        "tov_pct": 0.08,                   
+        "ast_to_tov": 0.06,
     },
-    invert={"tov_per_game"},
-    tiebreakers=["ast_per_game", "ast_pct", "ast_to_tov", "potential_ast"],
+    invert={"tov_per_game", "tov_pct"},
+    tiebreakers=[
+        "ast_per_game",
+        "ast_pct",
+        "assist_points_created",
+        "potential_ast",
+        "ast_to_tov",
+        "tov_pct",
+        "tov_per_game",
+    ],
 )
 
 SCORING_CONFIG = ScoreConfig(
-    weights={"ppg": 0.45, "ts_pct": 0.30, "fga": 0.15, "usage_pct": 0.10},
-    invert=set(),
-    tiebreakers=["ppg", "ts_pct", "usage_pct"],
+    weights={
+        # Output + efficiency
+        "ppg": 0.26,
+        "ts_pct": 0.22,
+        "efg_pct": 0.08,
+
+        # Volume / load
+        "fga": 0.10,
+        "usage_pct": 0.10,
+
+        # How they get points (helps separate archetypes)
+        "fta": 0.06,
+        "ft_rate": 0.05,
+        "three_pa": 0.04,
+        "three_pm": 0.03,
+
+        # Mistakes that reduce scoring value
+        "tov_per_game": 0.04,              # lower better
+        "tov_pct": 0.02,                   # lower better
+    },
+    invert={"tov_per_game", "tov_pct"},
+    tiebreakers=["ppg", "ts_pct", "usage_pct", "fga", "ft_rate", "three_pa"],
 )
+
+REBOUNDING_CONFIG = ScoreConfig(
+    weights={
+        "trb_per_game": 0.20,
+        "oreb_per_game": 0.10,
+        "dreb_per_game": 0.10,
+
+        "trb_pct": 0.20,
+        "oreb_pct": 0.15,
+        "dreb_pct": 0.15,
+
+        "contested_reb": 0.10,
+    },
+    invert=set(),
+    tiebreakers=["trb_pct", "trb_per_game", "dreb_pct", "oreb_pct", "contested_reb"],
+)
+
 
 DOMAIN_CONFIGS: Dict[str, ScoreConfig] = {
     "defense": DEFENSE_CONFIG,
     "shooting": SHOOTING_CONFIG,
     "playmaking": PLAYMAKING_CONFIG,
     "scoring": SCORING_CONFIG,
+    "rebounding": REBOUNDING_CONFIG,
 }
+
 
 
 def _minmax(series: pd.Series) -> np.ndarray:
@@ -221,22 +329,37 @@ def compute_scores(df: pd.DataFrame, cfg: ScoreConfig) -> pd.DataFrame:
 def infer_domain(user_q: str, cols: List[str]) -> str:
     uq = (user_q or "").lower()
     txt = " ".join(cols).lower()
+
+    if any(k in uq for k in ["rebound", "boards", "glass", "oreb", "dreb"]) or any(
+        k in txt for k in ["trb_per_game", "trb_pct", "oreb_pct", "dreb_pct", "contested_reb"]
+    ):
+        return "rebounding"
+
+    if any(k in uq for k in ["mvp", "best player", "top players", "overall", "impact", "most valuable"]) or any(
+        k in txt for k in ["overall_impact", "on_off"]
+    ):
+        return "overall_impact"
+
     if any(k in uq for k in ["defense", "defender", "rim", "steal", "block"]) or any(
-        k in txt for k in ["defensive_impact", "rim_fg_pct_allowed", "deflections_per_game"]
+        k in txt for k in ["defensive_impact", "rim_fg_pct_allowed", "deflections_per_game", "def_rtg"]
     ):
         return "defense"
-    if any(k in uq for k in ["shoot", "3pt", "three", "percentage", "catch-and-shoot"]) or any(
-        k in txt for k in ["three_pt_pct", "three_pm", "three_pa"]
+
+    if any(k in uq for k in ["shoot", "3pt", "three", "percentage", "catch-and-shoot", "pull-up"]) or any(
+        k in txt for k in ["three_pt_pct", "three_pm", "three_pa", "catch_shoot_3p_pct", "pullup_3p_pct"]
     ):
         return "shooting"
-    if any(k in uq for k in ["assist", "playmaker", "passing"]) or any(
-        k in txt for k in ["ast_per_game", "ast_pct", "potential_ast"]
+
+    if any(k in uq for k in ["assist", "playmaker", "passing", "creator"]) or any(
+        k in txt for k in ["ast_per_game", "ast_pct", "potential_ast", "secondary_ast", "assist_points_created"]
     ):
         return "playmaking"
-    if any(k in uq for k in ["score", "scorer", "points"]) or any(
-        k in txt for k in ["ppg", "ts_pct", "usage_pct"]
+
+    if any(k in uq for k in ["score", "scorer", "points", "bucket", "leading scorer"]) or any(
+        k in txt for k in ["ppg", "ts_pct", "usage_pct", "fga", "fta", "ft_rate"]
     ):
         return "scoring"
+
     return "scoring"
 
 

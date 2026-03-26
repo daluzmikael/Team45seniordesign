@@ -8,44 +8,53 @@ from auth import sign_up, log_in
 # Initialize the app with FastAPI
 app = FastAPI()
 
-# Allows your Next.js app on port 3000 to talk to this
+# Root route so Render health checks don't hit 404 on "/"
+@app.get("/")
+async def root():
+    return {"status": "ok", "message": "API is running"}
+
+# Allows both local frontend and deployed Vercel frontend to access the backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=[
+        "http://localhost:3000",
+        "https://team45seniordesign.vercel.app",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 class QueryRequest(BaseModel):
     question: str
 
-#Specifically for /api/dashboards endpoint, not the one for the written analysis
-#This connects to the page.tsx under frontend/ai_analyst/app/dashboards
-#For now this stays untouched
+class AuthRequest(BaseModel):
+    email: str
+    password: str
+
+# Specifically for /api/dashboards endpoint, not the one for the written analysis
+# This connects to the page.tsx under frontend/ai_analyst/app/dashboards
 @app.post("/api/dashboards")
 async def dashboard_endpoint(request: QueryRequest):
     result = interpret_question(request.question)
-    
+
     if result.get("success"):
         return result
     else:
-        # ADD THIS LINE TO PRINT THE ERROR TO YOUR TERMINAL:
-        print("Error details:", result.get("error"), result.get("details")) 
-        
+        print("Error details:", result.get("error"), result.get("details"))
         raise HTTPException(status_code=400, detail=result.get("error", "Unknown error"))
 
-#This will be for the analysis, still needs to be complete
-#This connects to the page.tsx under frontend/ai_analyst/app
+# This connects to the page.tsx under frontend/ai_analyst/app
 @app.post("/api/analysis")
 async def analysis_endpoint(request: QueryRequest):
     try:
         # Call the analyze_question function from query_analyzer
         analysis_result = analyze_question(request.question)
-        
+
         # Check if there was an error in the analysis
-        if analysis_result.startswith("Error:"):
+        if isinstance(analysis_result, str) and analysis_result.startswith("Error:"):
             raise HTTPException(status_code=500, detail=analysis_result)
-        
+
         return {
             "success": True,
             "analysis": analysis_result,
@@ -54,10 +63,6 @@ async def analysis_endpoint(request: QueryRequest):
     except Exception as e:
         print(f"Analysis error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")
-    
-class AuthRequest(BaseModel):
-    email: str
-    password: str
 
 @app.post("/api/signup")
 async def signup_endpoint(request: AuthRequest):
@@ -72,5 +77,6 @@ async def login_endpoint(request: AuthRequest):
     if result["success"]:
         return result
     raise HTTPException(status_code=400, detail=result["error"])
-# To run this:
+
+# To run locally:
 # uvicorn main:app --reload --port 8000

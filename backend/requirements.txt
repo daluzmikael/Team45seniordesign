@@ -11,3 +11,4 @@ pandas
 numpy
 pyrebase4
 pydantic
+firebase-admin

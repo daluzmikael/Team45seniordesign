@@ -16,10 +16,7 @@ async def root():
 # Allows both local frontend and deployed Vercel frontend to access the backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://team45seniordesign-6u1u.vercel.app",
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

@@ -24,8 +24,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [loading, setLoading] = useState(true)
   const router = useRouter()
 
+  const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
+
   useEffect(() => {
-    // Check if user is already logged in
     const stored = localStorage.getItem("auth_user")
     if (stored) {
       setUser(JSON.parse(stored))
@@ -35,7 +36,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const login = async (email: string, password: string) => {
     try {
-      const res = await fetch("http://localhost:8000/api/login", {
+      const res = await fetch(`${API_URL}/api/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email, password }),
@@ -54,7 +55,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const signup = async (email: string, password: string) => {
     try {
-      const res = await fetch("http://localhost:8000/api/signup", {
+      const res = await fetch(`${API_URL}/api/signup`, { 
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email, password }),

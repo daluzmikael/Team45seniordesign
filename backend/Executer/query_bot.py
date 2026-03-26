@@ -6,7 +6,7 @@ import psycopg2
 import re
 import pandas as pd
 from openai import OpenAI
-import os
+import os 
 
 # 1. OpenAI client
 from dotenv import load_dotenv
@@ -160,22 +160,25 @@ def natural_language_to_sql(user_input_param: str):
     prompt = f"""
 You are a senior SQL data engineer.
 Your task is to convert a natural language request into a VALID PostgreSQL SELECT query for the NBA stats database.
-RULES:
+
+CRITICAL TABLE USAGE RULES:
+1. **Season Summaries** (`all_players_regular_...` / `all_players_playoffs_...` tables):
+   - USE FOR: "Averages", "Top Scorers", "Season long trends".
+   - These contain PER GAME averages.
+
+2. **Game Logs** (`player_game_logs`):
+   - USE FOR: "Recent Games", "Streaks", "Splits" (Home/Away), "Specific Game Logs", "Matchups", "Last X games".
+   - CRITICAL: Use `season_id = '22025'` for current 2025-26 stats unless specified otherwise.
+   - CRITICAL: Use `ORDER BY game_date DESC LIMIT X` for recent games.
+   - CRITICAL: ALWAYS use `ILIKE` for `player_name` searches (e.g., `player_name ILIKE '%Luka Doncic%'`).
+   - CRITICAL: For "Home/Away" queries, use a CASE WHEN on the 'matchup' column ('vs.' = Home, '@' = Away).
+
+GENERAL RULES:
 - Use ONLY tables and columns that exist in the schema below.
 - Do NOT invent columns.
-- Do NOT guess column names.
-- If unsure, choose the closest matching column from the schema.
-- Use explicit table aliases when joining.
 - Fully qualify ambiguous columns (table.column).
 - ONLY generate SELECT queries.
-- Do NOT include explanations.
-- Do NOT include markdown.
-- Output SQL only.
-
-PERFORMANCE RULES:
-- Use GROUP BY only when aggregation is required.
-- Avoid SELECT * unless explicitly requested.
-- Use the most efficient query structure.
+- Output SQL only. No explanations. No markdown.
 
 DATABASE SCHEMA:
 {schema_description}

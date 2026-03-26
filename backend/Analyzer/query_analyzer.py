@@ -384,12 +384,17 @@ def analyze_dataframe() -> str:
 
     domain = infer_domain(user_input, df_output.columns.tolist())
 
+    # Check if we are using the game logs table by looking for game_id
+    is_game_log = "game_id" in df_output.columns
+
+    # Skip the scoring/ranking engine entirely if it's just a player's game logs
     score_table: Optional[pd.DataFrame] = None
-    try:
-        cfg = DOMAIN_CONFIGS[domain]
-        score_table = compute_scores(df_output, cfg)
-    except Exception:
-        score_table = None
+    if not is_game_log:
+        try:
+            cfg = DOMAIN_CONFIGS[domain]
+            score_table = compute_scores(df_output, cfg)
+        except Exception:
+            score_table = None
 
     is_comparison = len(df_output) <= 5 and any(
         k in user_input.lower() for k in ["compare", "better", "versus", "vs", "between", "who"]
@@ -411,49 +416,50 @@ def analyze_dataframe() -> str:
         "scoring": "Prioritize ppg and efficiency (ts_pct), then usage and volume (fga). Discuss shot mix and scalability.",
     }
 
+    # Check if we are using the game logs table by looking for game_id
+    is_game_log = "game_id" in df_output.columns
+
     if score_table is not None and not score_table.empty:
         score_text = score_table.to_string(index=True)
         system_prompt = (
-            "You are an expert NBA analyst. Provide a clear, well-structured analysis.\n\n"
-            "Format your response with these sections (use ### for headers):\n"
-            "### Executive Summary\n"
-            "One concise paragraph highlighting the key finding.\n\n"
-            "### Key Metrics\n"
-            "Bullet points of the most important stats (use - for bullets).\n\n"
-            "### Detailed Analysis\n"
-            "2-3 paragraphs with specific evidence from the data.\n\n"
-            "### Context & Considerations\n"
-            "Brief paragraph about role, usage, and limitations.\n\n"
+            "You are an expert NBA analyst providing insightful, narrative-driven analysis.\n\n"
+            "Adapt your formatting to best answer the specific question asked. Do NOT use standard rigid headers like 'Executive Summary' or 'Detailed Analysis' every time.\n"
+            "Instead, write in a fluid, engaging sports article style:\n"
+            "- Start with a strong hook or direct answer.\n"
+            "- Use natural paragraphs, bold text for emphasis, and bullet points only when helpful (like listing specific player rankings).\n"
+            "- Incorporate context, player roles, and data limitations organically into your sentences.\n"
             "Use the provided ranking. Be specific and reference actual numbers from the data."
         )
+        if is_game_log:
+            system_prompt += "\n\nNote: The data provided comes from game-by-game logs. Focus on trends, streaks, consistency, or individual game performances rather than just overall averages."
+            
         user_prompt = (
             f"Question: {user_input}\n\n"
             f"Domain: {domain}\n"
             f"Guidance: {rubric_by_domain[domain]}\n\n"
             f"RANKED (DO NOT REORDER):\n{score_text}\n\n"
             f"ORIGINAL DATA (first rows):\n{rows_to_show.to_string(index=False)}\n\n"
-            f"Analyze the top result and compare to the next strongest contenders."
+            f"Analyze the top result and compare to the next strongest contenders in a natural, engaging format."
         )
     else:
         system_prompt = (
-            "You are an expert NBA analyst. Provide a clear, well-structured analysis.\n\n"
+            "You are an expert NBA analyst providing insightful, narrative-driven analysis.\n\n"
             f"Domain: {domain}\n"
             f"Guidance: {rubric_by_domain[domain]}\n\n"
-            "Format your response with these sections (use ### for headers):\n"
-            "### Executive Summary\n"
-            "One concise paragraph highlighting the key finding.\n\n"
-            "### Key Metrics\n"
-            "Bullet points of the most important stats (use - for bullets).\n\n"
-            "### Detailed Analysis\n"
-            "2-3 paragraphs with specific evidence from the data.\n\n"
-            "### Context & Considerations\n"
-            "Brief paragraph about role, usage, and any limitations.\n\n"
+            "Adapt your formatting to best answer the specific question asked. Do NOT use standard rigid headers like 'Executive Summary' or 'Detailed Analysis' every time.\n"
+            "Instead, structure your response organically:\n"
+            "- For a simple stat check, provide a concise, direct answer.\n"
+            "- For complex questions, use engaging paragraphs and bold text for emphasis.\n"
+            "- Only use bullet points if listing out specific game logs or multiple stats.\n"
             "Be specific and reference actual numbers from the data."
         )
+        if is_game_log:
+            system_prompt += "\n\nNote: The data provided comes from game-by-game logs. Focus your narrative on recent form, splits, streaks, or single-game anomalies."
+
         user_prompt = (
             f"User's question: {user_input}\n\n"
             f"Data:\n{df_summary}\n"
-            "Analyze the data and answer the question clearly."
+            "Analyze the data and answer the question in a fluid, engaging sports-analyst style."
         )
 
     try:
@@ -545,49 +551,50 @@ def analyze_question(question: str) -> str:
         "scoring": "Prioritize ppg and efficiency (ts_pct), then usage and volume (fga). Discuss shot mix and scalability.",
     }
 
+    # Check if we are using the game logs table by looking for game_id
+    is_game_log = "game_id" in df.columns 
+
     if score_table is not None and not score_table.empty:
         score_text = score_table.to_string(index=True)
         system_prompt = (
-            "You are an expert NBA analyst. Provide a clear, well-structured analysis.\n\n"
-            "Format your response with these sections (use ### for headers):\n"
-            "### Executive Summary\n"
-            "One concise paragraph highlighting the key finding.\n\n"
-            "### Key Metrics\n"
-            "Bullet points of the most important stats (use - for bullets).\n\n"
-            "### Detailed Analysis\n"
-            "2-3 paragraphs with specific evidence from the data.\n\n"
-            "### Context & Considerations\n"
-            "Brief paragraph about role, usage, and limitations.\n\n"
+            "You are an expert NBA analyst providing insightful, narrative-driven analysis.\n\n"
+            "Adapt your formatting to best answer the specific question asked. Do NOT use standard rigid headers like 'Executive Summary' or 'Detailed Analysis' every time.\n"
+            "Instead, write in a fluid, engaging sports article style:\n"
+            "- Start with a strong hook or direct answer.\n"
+            "- Use natural paragraphs, bold text for emphasis, and bullet points only when helpful (like listing specific player rankings).\n"
+            "- Incorporate context, player roles, and data limitations organically into your sentences.\n"
             "Use the provided ranking. Be specific and reference actual numbers from the data."
         )
+        if is_game_log:
+            system_prompt += "\n\nNote: The data provided comes from game-by-game logs. Focus on trends, streaks, consistency, or individual game performances rather than just overall averages."
+            
         user_prompt = (
             f"Question: {question}\n\n"
             f"Domain: {domain}\n"
             f"Guidance: {rubric_by_domain[domain]}\n\n"
             f"RANKED (DO NOT REORDER):\n{score_text}\n\n"
             f"ORIGINAL DATA (first rows):\n{rows_to_show.to_string(index=False)}\n\n"
-            f"Analyze the top result and compare to the next strongest contenders."
+            f"Analyze the top result and compare to the next strongest contenders in a natural, engaging format."
         )
     else:
         system_prompt = (
-            "You are an expert NBA analyst. Provide a clear, well-structured analysis.\n\n"
+            "You are an expert NBA analyst providing insightful, narrative-driven analysis.\n\n"
             f"Domain: {domain}\n"
             f"Guidance: {rubric_by_domain[domain]}\n\n"
-            "Format your response with these sections (use ### for headers):\n"
-            "### Executive Summary\n"
-            "One concise paragraph highlighting the key finding.\n\n"
-            "### Key Metrics\n"
-            "Bullet points of the most important stats (use - for bullets).\n\n"
-            "### Detailed Analysis\n"
-            "2-3 paragraphs with specific evidence from the data.\n\n"
-            "### Context & Considerations\n"
-            "Brief paragraph about role, usage, and any limitations.\n\n"
+            "Adapt your formatting to best answer the specific question asked. Do NOT use standard rigid headers like 'Executive Summary' or 'Detailed Analysis' every time.\n"
+            "Instead, structure your response organically:\n"
+            "- For a simple stat check, provide a concise, direct answer.\n"
+            "- For complex questions, use engaging paragraphs and bold text for emphasis.\n"
+            "- Only use bullet points if listing out specific game logs or multiple stats.\n"
             "Be specific and reference actual numbers from the data."
         )
+        if is_game_log:
+            system_prompt += "\n\nNote: The data provided comes from game-by-game logs. Focus your narrative on recent form, splits, streaks, or single-game anomalies."
+
         user_prompt = (
             f"User's question: {question}\n\n"
             f"Data:\n{df_summary}\n"
-            "Analyze the data and answer the question clearly."
+            "Analyze the data and answer the question in a fluid, engaging sports-analyst style."
         )
 
     try:

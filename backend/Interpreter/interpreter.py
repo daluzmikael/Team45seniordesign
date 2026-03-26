@@ -1,4 +1,5 @@
 import os
+import logging
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -12,7 +13,13 @@ from executor import (
 )
 
 load_dotenv()
-print("API Key Loaded:", os.getenv("OPENAI_API_KEY"))
+logging.basicConfig(
+    level=logging.DEBUG,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+logger = logging.getLogger(__name__)
+logger.info("OpenAI API key loaded successfully")
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
@@ -104,9 +111,10 @@ Generate the SQL"""
 
         sql_query = response.choices[0].message.content.strip()
         sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
+        logger.debug("Generated SQL from model:\n%s", sql_query)
 
     except Exception as e:
-        print(f"[ERROR] OpenAI API error: {e}")
+        logger.error("OpenAI API error: %s", e)
         return None
 
     sql_query = limit_rows(sql_query)
@@ -114,24 +122,25 @@ Generate the SQL"""
     try:
         sql_query = validate_and_normalize_sql(sql_query)
     except ValueError as e:
-        print(f"[ERROR] Validation error: {e}")
+        logger.error("Validation error: %s", e)
         return None
 
     max_attempts = 3
 
     for attempt in range(max_attempts):
         try:
-            print(f"[DEBUG] Attempt {attempt+1} executing query...")
+            logger.debug("Attempt %d executing query...", attempt + 1)
+            logger.info("Final SQL being executed:\n%s", sql_query)
             return execute_query(conn, sql_query)
 
         except Exception as e:
             error_message = str(e)
-            print(f"[ERROR] SQL execution error: {error_message}")
+            logger.error("SQL execution error: %s", error_message)
 
             if any(keyword in error_message.lower()
                    for keyword in ["does not exist", "column", "relation"]):
 
-                print("[DEBUG] Attempting schema self-repair...")
+                logger.debug("Attempting schema self-repair...")
 
                 sql_query = repair_sql_error(
                     original_sql=sql_query,
@@ -145,15 +154,15 @@ Generate the SQL"""
                 try:
                     sql_query = validate_and_normalize_sql(sql_query)
                 except ValueError as e:
-                    print(f"[ERROR] Repaired SQL is unsafe: {e}")
+                    logger.error("Repaired SQL is unsafe: %s", e)
                     return None
 
                 continue
             else:
-                print("[ERROR] Non-repairable error.")
+                logger.error("Non-repairable error.")
                 return None
 
-    print("[ERROR] Max repair attempts reached.")
+    logger.error("Max repair attempts reached.")
     return None
 
 

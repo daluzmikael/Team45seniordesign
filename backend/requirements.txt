@@ -10,3 +10,4 @@ fastapi
 pandas
 numpy
 pyrebase4
+pydantic

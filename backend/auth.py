@@ -1,7 +1,7 @@
 import pyrebase
 
 firebase_config = {
-    "apiKey": "AIzaSyAWAsFoESLPzgj9NNUMdXA3L6xr2LtK62s",
+    "apiKey": os.getenv("FIREBASE_API_KEY"),
     "authDomain": "hq-users.firebaseapp.com",
     "projectId": "hq-users",
     "databaseURL": "",

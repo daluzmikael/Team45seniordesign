@@ -2,6 +2,7 @@ flask
 flask-cors
 requests
 psycopg2
+psycopg2-binary
 python-dotenv
 openai
 pydantic
@@ -10,5 +11,5 @@ fastapi
 pandas
 numpy
 pyrebase4
-pydantic
 firebase-admin
+sqlglot

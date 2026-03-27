@@ -7,8 +7,6 @@ from sqlglot.errors import ParseError
 import json
 import logging
 import os
-# from dotenv import load_dotenv
-# load_dotenv()
 
 if not logging.getLogger().hasHandlers():
     logging.basicConfig(level=logging.INFO)
@@ -17,11 +15,11 @@ logger = logging.getLogger(__name__)
 def get_connection():
     """Get a fresh database connection"""
     return psycopg2.connect(
-        host=os.getenv("DB_HOST=nba-sdp-project.cs1c0smw8vqa.us-east-1.rds.amazonaws.com"),
-        port=os.getenv("DB_PORT=5432"),
-        dbname=os.getenv("DB_NAME=NBA-STATS"),
-        user=os.getenv("DB_USER=VonLindenthal"),
-        password=os.getenv("DB_PASSWORD=Vlindenthal1!"),
+        host="nba-sdp-project.cs1c0smw8vqa.us-east-1.rds.amazonaws.com",
+        port=5432,
+        dbname="NBA-STATS",
+        user="VonLindenthal",
+        password="Vlindenthal1!",
         sslmode="require"
     )
 

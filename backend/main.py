@@ -4,7 +4,7 @@ from pydantic import BaseModel
 from DashboardBackend.dashboardInterpreter import interpret_question
 from Analyzer.query_analyzer import analyze_question
 from auth import sign_up, log_in
-from interpreter import run_query
+from interpreter.interpreter import run_query
 
 # Initialize the app with FastAPI
 app = FastAPI()

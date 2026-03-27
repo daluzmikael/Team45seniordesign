@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from DashboardBackend.dashboardInterpreter import interpret_question
 from Analyzer.query_analyzer import analyze_question
 from auth import sign_up, log_in
+from interpreter import run_query
 
 # Initialize the app with FastAPI
 app = FastAPI()
@@ -45,18 +46,19 @@ async def dashboard_endpoint(request: QueryRequest):
 @app.post("/api/analysis")
 async def analysis_endpoint(request: QueryRequest):
     try:
-        # Call the analyze_question function from query_analyzer
+        print("----HIT----- /api/analysis")
+
         analysis_result = analyze_question(request.question)
 
-        # Check if there was an error in the analysis
-        if isinstance(analysis_result, str) and analysis_result.startswith("Error:"):
-            raise HTTPException(status_code=500, detail=analysis_result)
+        query_result = run_query(request.question)
 
         return {
             "success": True,
             "analysis": analysis_result,
+            "data": query_result.to_dict() if query_result is not None else None,
             "question": request.question
         }
+
     except Exception as e:
         print(f"Analysis error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Analysis failed: {str(e)}")

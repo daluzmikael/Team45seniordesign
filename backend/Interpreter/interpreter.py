@@ -3,7 +3,7 @@ import logging
 from dotenv import load_dotenv
 from openai import OpenAI
 
-from executor import (
+from Executer.executor import (
     get_connection,
     get_db_schema,
     #is_safe_sql,

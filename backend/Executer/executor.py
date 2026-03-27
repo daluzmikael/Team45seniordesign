@@ -17,11 +17,11 @@ logger = logging.getLogger(__name__)
 def get_connection():
     """Get a fresh database connection"""
     return psycopg2.connect(
-        host=os.getenv("DB_HOST"),
-        port=os.getenv("DB_PORT"),
-        dbname=os.getenv("DB_NAME"),
-        user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"),
+        host=os.getenv("DB_HOST=nba-sdp-project.cs1c0smw8vqa.us-east-1.rds.amazonaws.com"),
+        port=os.getenv("DB_PORT=5432"),
+        dbname=os.getenv("DB_NAME=NBA-STATS"),
+        user=os.getenv("DB_USER=VonLindenthal"),
+        password=os.getenv("DB_PASSWORD=Vlindenthal1!"),
         sslmode="require"
     )
 

@@ -124,23 +124,23 @@ def check_query_cost(conn, sql_query, max_cost=100000):
 # Query execution function
 def execute_query(conn, sql_query, max_cost=100000, timeout_ms=3000):
     logger.info("Executing SQL Query:\n%s", sql_query)
+    
+    # CRITICAL: Clear any previous failed transactions before starting
+    conn.rollback() 
+    
     cursor = conn.cursor()
-    cursor.execute("BEGIN;")
-
-    set_query_timeout(conn, timeout_ms)
-
     try:
+        cursor.execute("BEGIN;") # Start a fresh transaction
+        set_query_timeout(conn, timeout_ms)
+
+        # Check cost before running the full query
         total_cost = check_query_cost(conn, sql_query, max_cost)
-    except Exception as e:
-        logger.error("Query cost check failed: %s", e)
-        conn.rollback()
-        raise
-
-    try:
+        
         cursor.execute(sql_query)
         rows = cursor.fetchall()
         colnames = [desc[0] for desc in cursor.description]
-        conn.commit()
+        
+        conn.commit() # Save changes
         logger.info(
             "Query executed successfully | Rows: %d | Cost: %s",
             len(rows),
@@ -149,6 +149,6 @@ def execute_query(conn, sql_query, max_cost=100000, timeout_ms=3000):
         return pd.DataFrame(rows, columns=colnames)
 
     except Exception as e:
-        conn.rollback()
+        conn.rollback() # Ensure we clean up if this attempt fails
         logger.error("Query execution failed: %s", e)
         raise

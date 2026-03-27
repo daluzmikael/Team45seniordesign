@@ -618,6 +618,120 @@ def analyze_question(question: str) -> str:
         return f"Error during AI analysis: {str(e)}"
 
 
+def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
+    """
+    Analyze a pre-fetched DataFrame directly without re-running any query.
+    This is called from main.py after run_query() has already succeeded,
+    so we never run the query twice or trigger a false empty-result error.
+    """
+    client = _resolve_client(query_bot_module)
+    if client is None:
+        # Fall back to building a client directly from env
+        try:
+            from openai import OpenAI
+            client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        except Exception as e:
+            return f"Error: OpenAI client not available: {e}"
+
+    if df is None or df.empty:
+        return (
+            "No data was found for this query. The player may not have participated "
+            "in the requested season or playoffs, or the name was not recognized."
+        )
+
+    domain = infer_domain(question, df.columns.tolist())
+
+    # Detect if data came from game logs (has game_date column)
+    is_game_log = "game_date" in df.columns
+
+    # Only run composite scoring for season summary data, not game logs
+    score_table: Optional[pd.DataFrame] = None
+    if not is_game_log:
+        try:
+            cfg = DOMAIN_CONFIGS[domain]
+            score_table = compute_scores(df, cfg)
+        except Exception:
+            score_table = None
+
+    is_comparison = len(df) <= 5 and any(
+        k in question.lower() for k in ["compare", "better", "versus", "vs", "between", "who"]
+    )
+    rows_to_show = df if is_comparison else df.head(20)
+
+    df_summary = (
+        f"DataFrame shape: {df.shape[0]} rows, {df.shape[1]} columns\n"
+        f"Columns: {', '.join(df.columns.tolist())}\n\n"
+        f"Data:\n{rows_to_show.to_string(index=False)}\n"
+    )
+    if len(df) > 20 and not is_comparison:
+        df_summary += f"\nSummary statistics:\n{df.describe().to_string()}\n"
+
+    rubric_by_domain = {
+        "defense": "Prioritize defensive_impact; rim protection (rim_fg_pct_allowed lower is better; rim_shots_contested higher is better); on-ball impact (opp_fg_pct_as_primary_defender lower is better); versatility; disruptions (deflections, loose balls).",
+        "shooting": "Prioritize accuracy (three_pt_pct), then volume (three_pm, three_pa). Include role, shot quality, and sustainability commentary.",
+        "playmaking": "Prioritize ast_per_game, ast_pct, potential_ast, assist_points_created; penalize turnovers (tov_per_game lower is better); reward efficiency (ast_to_tov). Consider on-ball workload.",
+        "scoring": "Prioritize ppg and efficiency (ts_pct), then usage and volume (fga). Discuss shot mix and scalability.",
+        "rebounding": "Prioritize trb_pct and trb_per_game, then oreb_pct and dreb_pct. Discuss contested rebounds and positioning.",
+    }
+
+    if score_table is not None and not score_table.empty:
+        score_text = score_table.to_string(index=True)
+        system_prompt = (
+            "You are an expert NBA analyst providing insightful, narrative-driven analysis.\n\n"
+            "Adapt your formatting to best answer the specific question asked. Do NOT use standard rigid headers.\n"
+            "Instead, write in a fluid, engaging sports article style:\n"
+            "- Start with a strong hook or direct answer.\n"
+            "- Use natural paragraphs, bold text for emphasis, and bullet points only when helpful.\n"
+            "- Incorporate context, player roles, and data limitations organically.\n"
+            "Use the provided ranking. Be specific and reference actual numbers from the data."
+        )
+        if is_game_log:
+            system_prompt += "\n\nNote: Data comes from game-by-game logs. Focus on trends, streaks, consistency, or individual game performances."
+
+        user_prompt = (
+            f"Question: {question}\n\n"
+            f"Domain: {domain}\n"
+            f"Guidance: {rubric_by_domain.get(domain, '')}\n\n"
+            f"RANKED (DO NOT REORDER):\n{score_text}\n\n"
+            f"ORIGINAL DATA (first rows):\n{rows_to_show.to_string(index=False)}\n\n"
+            f"Analyze the top result and compare to the next strongest contenders in a natural, engaging format."
+        )
+    else:
+        system_prompt = (
+            "You are an expert NBA analyst providing insightful, narrative-driven analysis.\n\n"
+            f"Domain: {domain}\n"
+            f"Guidance: {rubric_by_domain.get(domain, '')}\n\n"
+            "Adapt your formatting to best answer the specific question asked.\n"
+            "- For a simple stat check, provide a concise, direct answer.\n"
+            "- For complex questions, use engaging paragraphs and bold text for emphasis.\n"
+            "- Only use bullet points if listing out specific game logs or multiple stats.\n"
+            "Be specific and reference actual numbers from the data."
+        )
+        if is_game_log:
+            system_prompt += "\n\nNote: Data comes from game-by-game logs. Focus your narrative on recent form, splits, streaks, or single-game anomalies."
+
+        user_prompt = (
+            f"User's question: {question}\n\n"
+            f"Data:\n{df_summary}\n"
+            "Analyze the data and answer the question in a fluid, engaging sports-analyst style."
+        )
+
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0,
+            max_tokens=1600,
+        )
+        raw_response = response.choices[0].message.content.strip()
+        formatted_response = raw_response.replace("###", "\n\n###").replace("####", "\n\n####")
+        return "\n" + formatted_response.strip()
+    except Exception as e:
+        return f"Error during AI analysis: {str(e)}"
+
 if __name__ == "__main__":
     import argparse
 

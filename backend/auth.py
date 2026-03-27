@@ -1,10 +1,14 @@
+import os
+from dotenv import load_dotenv
 import pyrebase
+
+load_dotenv()
 
 firebase_config = {
     "apiKey": os.getenv("FIREBASE_API_KEY"),
     "authDomain": "hq-users.firebaseapp.com",
     "projectId": "hq-users",
-    "databaseURL": "",
+    "databaseURL": "https://hq-users-default-rtdb.firebaseio.com",
     "storageBucket": "hq-users.firebasestorage.app"
 }
 

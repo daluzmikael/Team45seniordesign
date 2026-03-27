@@ -1,6 +1,6 @@
 import os
 import logging
-from dotenv import load_dotenv
+# from dotenv import load_dotenv
 from openai import OpenAI
 
 from Executer.executor import (
@@ -12,7 +12,7 @@ from Executer.executor import (
     validate_and_normalize_sql
 )
 
-load_dotenv()
+# load_dotenv()
 logging.basicConfig(
     level=logging.DEBUG,
     format="%(asctime)s - %(levelname)s - %(message)s"

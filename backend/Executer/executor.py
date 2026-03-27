@@ -7,8 +7,8 @@ from sqlglot.errors import ParseError
 import json
 import logging
 import os
-from dotenv import load_dotenv
-load_dotenv()
+# from dotenv import load_dotenv
+# load_dotenv()
 
 if not logging.getLogger().hasHandlers():
     logging.basicConfig(level=logging.INFO)

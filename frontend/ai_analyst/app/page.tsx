@@ -4,6 +4,8 @@ import { useState } from "react"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
 import { Send } from "lucide-react"
+import ReactMarkdown from "react-markdown"
+import remarkGfm from "remark-gfm"
 
 export default function Home() {
   const [message, setMessage] = useState("")
@@ -148,13 +150,39 @@ export default function Home() {
               }`}
             >
               <div
-                className={`rounded-lg px-4 py-2 max-w-[80%] whitespace-pre-wrap ${
+                className={`rounded-lg px-4 py-2 max-w-[80%] ${
                   msg.role === "user"
                     ? "bg-primary text-primary-foreground"
                     : "bg-muted"
                 }`}
               >
-                {msg.content}
+                {msg.role === "assistant" ? (
+                  <ReactMarkdown
+                    remarkPlugins={[remarkGfm]}
+                    components={{
+                      table: ({ children }) => (
+                        <div className="overflow-x-auto my-2">
+                          <table className="min-w-full border-collapse border border-border text-sm">
+                            {children}
+                          </table>
+                        </div>
+                      ),
+                      thead: ({ children }) => <thead className="bg-muted/50">{children}</thead>,
+                      th: ({ children }) => (
+                        <th className="border border-border px-2 py-1 text-left font-semibold">{children}</th>
+                      ),
+                      td: ({ children }) => <td className="border border-border px-2 py-1">{children}</td>,
+                      h3: ({ children }) => (
+                        <h3 className="font-semibold underline underline-offset-4 mt-3 mb-2">{children}</h3>
+                      ),
+                      p: ({ children }) => <p className="whitespace-pre-wrap">{children}</p>,
+                    }}
+                  >
+                    {msg.content}
+                  </ReactMarkdown>
+                ) : (
+                  <p className="whitespace-pre-wrap">{msg.content}</p>
+                )}
               </div>
             </div>
           ))

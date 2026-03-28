@@ -1,5 +1,6 @@
-﻿import os
+import os
 import sys
+import re
 from dataclasses import dataclass
 from typing import Optional, Any, List, Set, Dict
 from pathlib import Path
@@ -363,6 +364,362 @@ def infer_domain(user_q: str, cols: List[str]) -> str:
     return "scoring"
 
 
+def _is_simple_top_scorers_question(question: str, domain: str) -> bool:
+    q = (question or "").lower()
+    if domain != "scoring":
+        return False
+
+    asks_for_scorers = (
+        ("scorer" in q)
+        or ("scoring" in q and "leader" in q)
+        or ("points leader" in q)
+        or ("top points" in q)
+        or ("top" in q and "points" in q)
+    )
+    if not asks_for_scorers:
+        return False
+
+    complex_markers = [
+        "compare",
+        "versus",
+        " vs ",
+        "between",
+        "why",
+        "how",
+        "predict",
+        "projection",
+        "trend",
+        "streak",
+        "split",
+    ]
+    return not any(marker in q for marker in complex_markers)
+
+
+def _build_simple_top_scorers_prompts(question: str, rows_to_show: pd.DataFrame) -> tuple[str, str]:
+    system_prompt = (
+        "You are an NBA stats assistant. For simple top-scorer questions, keep the response short and plain.\n"
+        "Output format must be exactly:\n"
+        "1) One short lead sentence in plain English, like: "
+        "\"[Player] led the league at [PPG] PPG on [FG%] FG.\"\n"
+        "2) A compact list of exactly the top 5 scorers from the provided data, each line in this exact style: "
+        "Name, TEAM | X ppg | Y% fg | Z% 3p | N games\n"
+        "3) One final follow-up line asking if the user wants deeper scoring breakdowns, such as: "
+        "\"Want me to break down each player's scoring profile further?\"\n\n"
+        "Rules:\n"
+        "- Keep total response concise.\n"
+        "- No long paragraphs, no extra sections, no generic commentary.\n"
+        "- Use only numbers from the provided data.\n"
+        "- The lead sentence must always include player name, PPG, and FG% (use N/A if FG% is missing).\n"
+        "- If a field is unavailable, show N/A.\n"
+        "- Do not output unlabeled number-only lines.\n"
+        "- Use lowercase stat labels exactly: ppg, fg, 3p, games.\n"
+        "- Preserve ranking order from highest to lowest scorer.\n"
+    )
+    user_prompt = (
+        f"Question: {question}\n\n"
+        "Use this data only:\n"
+        f"{rows_to_show.head(10).to_string(index=False)}\n\n"
+        "Return only the requested short format."
+    )
+    return system_prompt, user_prompt
+
+
+def _extract_requested_top_n(question: str, default_n: int = 5, max_n: int = 50) -> int:
+    q = (question or "").lower()
+    match = re.search(r"\b(top|best|leading)\s+(\d{1,3})\b", q)
+    if not match:
+        return default_n
+    try:
+        n = int(match.group(2))
+    except Exception:
+        return default_n
+    if n < 1:
+        return default_n
+    return min(n, max_n)
+
+
+def _extract_season_reference_text(question: str) -> Optional[str]:
+    q = (question or "").lower()
+    is_playoffs = "playoff" in q or "postseason" in q
+
+    range_match = re.search(r"\b(19\d{2}|20\d{2})\s*[-/]\s*(\d{2,4})\b", q)
+    if range_match:
+        start = int(range_match.group(1))
+        end_raw = range_match.group(2)
+        if len(end_raw) == 2:
+            end = int(f"{str(start)[:2]}{end_raw}")
+        else:
+            end = int(end_raw)
+        if is_playoffs:
+            return f"{start}-{str(end)[-2:]} playoffs"
+        return f"{start}-{str(end)[-2:]} season"
+
+    year_match = re.search(r"\b(19\d{2}|20\d{2})\b", q)
+    if year_match:
+        year = int(year_match.group(1))
+        if is_playoffs:
+            start = year - 1
+            end = year
+            return f"{start}-{str(end)[-2:]} playoffs"
+        start = year
+        end = year + 1
+        return f"{start}-{str(end)[-2:]} season"
+
+    if "this season" in q or "current season" in q:
+        return "2024-25 season"
+    if "this playoff" in q or "current playoff" in q:
+        return "2024-25 playoffs"
+    if "last season" in q:
+        return "2024-25 season"
+    if "last playoff" in q:
+        return "2024-25 playoffs"
+
+    return None
+
+
+def _is_single_player_stats_question(question: str, df: pd.DataFrame) -> bool:
+    q = (question or "").lower()
+    if df is None or df.empty:
+        return False
+    if "player_name" not in df.columns:
+        return False
+    if "game_date" in df.columns:
+        return False
+    if any(k in q for k in ["top ", "best ", "leading ", "leaderboard", "rank leaders", "compare", "versus", " vs ", "between"]):
+        return False
+    if not any(k in q for k in [" stats", "stat ", "stat?", "what were", "show", "profile"]):
+        return False
+    try:
+        unique_players = df["player_name"].dropna().astype(str).str.strip().nunique()
+    except Exception:
+        unique_players = 0
+    return unique_players == 1
+
+
+def _format_single_player_stats_profile(df: pd.DataFrame, question: str) -> str:
+    def _is_missing(v: Any) -> bool:
+        try:
+            return pd.isna(v)
+        except Exception:
+            return v is None
+
+    def _fmt_num(v: Any, digits: int = 1) -> str:
+        if _is_missing(v):
+            return "N/A"
+        try:
+            return f"{float(v):.{digits}f}"
+        except Exception:
+            return "N/A"
+
+    def _fmt_int(v: Any) -> str:
+        if _is_missing(v):
+            return "N/A"
+        try:
+            return str(int(float(v)))
+        except Exception:
+            return "N/A"
+
+    def _fmt_pct(v: Any, digits: int = 1) -> str:
+        if _is_missing(v):
+            return "N/A"
+        try:
+            num = float(v)
+            if 0 <= num <= 1:
+                num *= 100.0
+            return f"{num:.{digits}f}%"
+        except Exception:
+            return "N/A"
+
+    def _v(row: pd.Series, key: str, default: str = "N/A") -> Any:
+        return row.get(key, default)
+
+    working = df.copy()
+    if "player_name" in working.columns:
+        working = working.dropna(subset=["player_name"])
+        if "gp" in working.columns:
+            working = working.sort_values(by=["gp"], ascending=[False], na_position="last")
+        working = working.drop_duplicates(subset=["player_name"], keep="first")
+    if working.empty:
+        return "\nNo player stats were available for this question."
+
+    row = working.iloc[0]
+    name = str(_v(row, "player_name")) if not _is_missing(_v(row, "player_name")) else "N/A"
+    team = str(_v(row, "team_abbreviation")) if not _is_missing(_v(row, "team_abbreviation")) else "N/A"
+    age = _fmt_num(_v(row, "age"), digits=1)
+    gp = _fmt_int(_v(row, "gp"))
+    w_pct = _fmt_pct(_v(row, "w_pct"), digits=1)
+    mins = _fmt_num(_v(row, "min"), digits=1)
+    season_text = _extract_season_reference_text(question)
+
+    heading = f"## **{name}** ({team})"
+    if season_text:
+        heading = f"## **{name}** ({team}, {season_text})"
+
+    ranked_stat_candidates = [
+        ("fgm_rank", "fgm", "FGM"),
+        ("fg3m_rank", "fg3m", "3PM"),
+        ("fg3a_rank", "fg3a", "3PA"),
+        ("fg_pct_rank", "fg_pct", "FG%"),
+        ("fg3_pct_rank", "fg3_pct", "3P%"),
+        ("ftm_rank", "ftm", "FTM"),
+        ("fta_rank", "fta", "FTA"),
+        ("ft_pct_rank", "ft_pct", "FT%"),
+        ("stl_rank", "stl", "STL"),
+        ("blk_rank", "blk", "BLK"),
+        ("oreb_rank", "oreb", "OREB"),
+        ("dreb_rank", "dreb", "DREB"),
+        ("dd2_rank", "dd2", "DD2"),
+        ("td3_rank", "td3", "TD3"),
+        ("min_rank", "min", "MIN"),
+    ]
+
+    best_extra: Optional[tuple[str, str, str, int]] = None
+    for rank_col, value_col, label in ranked_stat_candidates:
+        rank_val_raw = _v(row, rank_col)
+        if _is_missing(rank_val_raw):
+            continue
+        try:
+            rank_val = int(float(rank_val_raw))
+        except Exception:
+            continue
+        if rank_val <= 0:
+            continue
+        if best_extra is None or rank_val < best_extra[3]:
+            best_extra = (label, value_col, rank_col, rank_val)
+
+    extra_label = "Best Extra (Rank)"
+    extra_value = "N/A"
+    if best_extra is not None:
+        label, value_col, rank_col, rank_val = best_extra
+        raw_value = _v(row, value_col)
+        if label.endswith("%"):
+            value_text = _fmt_pct(raw_value)
+        else:
+            value_text = _fmt_num(raw_value)
+        extra_label = f"{label} (Rank)"
+        extra_value = f"{value_text} (#{rank_val})"
+
+    lines = [
+        heading,
+        "",
+        f"_Age: {age} | Minutes: {mins} | W%: {w_pct} | Games Played: {gp}_",
+        "",
+        f"| PPG | REB | AST | Plus/Minus | {extra_label} |",
+        "|---:|---:|---:|---:|---:|",
+        f"| {_fmt_num(_v(row, 'pts'))} | {_fmt_num(_v(row, 'reb'))} | {_fmt_num(_v(row, 'ast'))} | {_fmt_num(_v(row, 'plus_minus'))} | {extra_value} |",
+        "",
+        "### Scoring",
+        "| PTS | FG% | 3P% | FT% | PTS Rank | FG% Rank | 3P% Rank | FT% Rank |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|",
+        f"| {_fmt_num(_v(row, 'pts'))} | {_fmt_pct(_v(row, 'fg_pct'))} | {_fmt_pct(_v(row, 'fg3_pct'))} | {_fmt_pct(_v(row, 'ft_pct'))} | {_fmt_int(_v(row, 'pts_rank'))} | {_fmt_int(_v(row, 'fg_pct_rank'))} | {_fmt_int(_v(row, 'fg3_pct_rank'))} | {_fmt_int(_v(row, 'ft_pct_rank'))} |",
+        "",
+        "### Rebounding",
+        "| REB | DREB | OREB | REB Rank | DREB Rank | OREB Rank |",
+        "|---:|---:|---:|---:|---:|---:|",
+        f"| {_fmt_num(_v(row, 'reb'))} | {_fmt_num(_v(row, 'dreb'))} | {_fmt_num(_v(row, 'oreb'))} | {_fmt_int(_v(row, 'reb_rank'))} | {_fmt_int(_v(row, 'dreb_rank'))} | {_fmt_int(_v(row, 'oreb_rank'))} |",
+        "",
+        "### Assists & Ball Security",
+        "| AST | TOV | AST Rank | TOV Rank |",
+        "|---:|---:|---:|---:|",
+        f"| {_fmt_num(_v(row, 'ast'))} | {_fmt_num(_v(row, 'tov'))} | {_fmt_int(_v(row, 'ast_rank'))} | {_fmt_int(_v(row, 'tov_rank'))} |",
+        "",
+        "### Defense",
+        "| STL | BLK | PF | STL Rank | BLK Rank | PF Rank |",
+        "|---:|---:|---:|---:|---:|---:|",
+        f"| {_fmt_num(_v(row, 'stl'))} | {_fmt_num(_v(row, 'blk'))} | {_fmt_num(_v(row, 'pf'))} | {_fmt_int(_v(row, 'stl_rank'))} | {_fmt_int(_v(row, 'blk_rank'))} | {_fmt_int(_v(row, 'pf_rank'))} |",
+        "",
+        "### Double-Double / Triple-Double",
+        "| DD2 | TD3 | DD2 Rank | TD3 Rank |",
+        "|---:|---:|---:|---:|",
+        f"| {_fmt_num(_v(row, 'dd2'))} | {_fmt_num(_v(row, 'td3'))} | {_fmt_int(_v(row, 'dd2_rank'))} | {_fmt_int(_v(row, 'td3_rank'))} |",
+        "",
+        "Want me to break down his season profile further?",
+    ]
+    return "\n" + "\n".join(lines)
+
+
+def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
+    def _is_missing(v: Any) -> bool:
+        try:
+            return pd.isna(v)
+        except Exception:
+            return v is None
+
+    def _fmt_ppg(v: Any) -> str:
+        if _is_missing(v):
+            return "N/A"
+        try:
+            return f"{float(v):.1f}"
+        except Exception:
+            return "N/A"
+
+    def _fmt_pct(v: Any) -> str:
+        if _is_missing(v):
+            return "N/A"
+        try:
+            num = float(v)
+            if 0 <= num <= 1:
+                num *= 100.0
+            return f"{num:.1f}%"
+        except Exception:
+            return "N/A"
+
+    def _fmt_games(v: Any) -> str:
+        if _is_missing(v):
+            return "N/A"
+        try:
+            return str(int(float(v)))
+        except Exception:
+            return "N/A"
+
+    if df is None or df.empty:
+        return "\nNo scorer data was available for this question."
+
+    working = df.copy()
+    cols = set(working.columns)
+
+    if "pts_rank" in cols:
+        working = working.sort_values(by=["pts_rank", "pts"], ascending=[True, False], na_position="last")
+    elif "pts" in cols:
+        working = working.sort_values(by=["pts"], ascending=[False], na_position="last")
+
+    if "player_name" in cols:
+        working = working.dropna(subset=["player_name"])
+        working = working.drop_duplicates(subset=["player_name"], keep="first")
+    else:
+        working = working.drop_duplicates(keep="first")
+
+    requested_n = _extract_requested_top_n(question, default_n=5, max_n=50)
+    top = working.head(requested_n)
+    if top.empty:
+        return "\nNo scorer data was available for this question."
+
+    lead_row = top.iloc[0]
+    lead_name = str(lead_row.get("player_name", "N/A")) if not _is_missing(lead_row.get("player_name")) else "N/A"
+    lead_ppg = _fmt_ppg(lead_row.get("pts"))
+    lead_fg = _fmt_pct(lead_row.get("fg_pct"))
+    season_text = _extract_season_reference_text(question)
+    if season_text:
+        lead_line = f"In {season_text}, {lead_name} led the league at {lead_ppg} PPG on {lead_fg} FG."
+    else:
+        lead_line = f"{lead_name} led the league at {lead_ppg} PPG on {lead_fg} FG."
+
+    lines = [lead_line, "", "| # | Player | PPG | FG | 3P | Games |", "|---|---|---:|---:|---:|---:|"]
+
+    for idx, (_, row) in enumerate(top.iterrows(), start=1):
+        name = str(row.get("player_name", "N/A")) if not _is_missing(row.get("player_name")) else "N/A"
+        team = str(row.get("team_abbreviation", "N/A")) if not _is_missing(row.get("team_abbreviation")) else "N/A"
+        ppg = _fmt_ppg(row.get("pts"))
+        fg = _fmt_pct(row.get("fg_pct"))
+        three = _fmt_pct(row.get("fg3_pct"))
+        games = _fmt_games(row.get("gp"))
+        lines.append(f"| {idx} | **{name}** ({team}) | {ppg} ppg | {fg} fg | {three} 3p | {games} |")
+
+    lines.append("")
+    lines.append("Want me to break down each player's scoring profile further?")
+    return "\n" + "\n".join(lines)
+
+
 def analyze_dataframe() -> str:
     if query_bot_module is None:
         return (
@@ -419,7 +776,14 @@ def analyze_dataframe() -> str:
     # Check if we are using the game logs table by looking for game_id
     is_game_log = "game_id" in df_output.columns
 
-    if score_table is not None and not score_table.empty:
+    is_simple_top_scorers = _is_simple_top_scorers_question(user_input, domain)
+    is_single_player_stats = _is_single_player_stats_question(user_input, df_output)
+
+    if is_single_player_stats:
+        return _format_single_player_stats_profile(df_output, user_input)
+    elif is_simple_top_scorers:
+        return _format_simple_top_scorers_response(df_output, user_input)
+    elif score_table is not None and not score_table.empty:
         score_text = score_table.to_string(index=True)
         system_prompt = (
             "You are an expert NBA analyst providing insightful, narrative-driven analysis.\n\n"
@@ -554,7 +918,14 @@ def analyze_question(question: str) -> str:
     # Check if we are using the game logs table by looking for game_id
     is_game_log = "game_id" in df.columns 
 
-    if score_table is not None and not score_table.empty:
+    is_simple_top_scorers = _is_simple_top_scorers_question(question, domain)
+    is_single_player_stats = _is_single_player_stats_question(question, df)
+
+    if is_single_player_stats:
+        return _format_single_player_stats_profile(df, question)
+    elif is_simple_top_scorers:
+        return _format_simple_top_scorers_response(df, question)
+    elif score_table is not None and not score_table.empty:
         score_text = score_table.to_string(index=True)
         system_prompt = (
             "You are an expert NBA analyst providing insightful, narrative-driven analysis.\n\n"
@@ -674,7 +1045,14 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
         "rebounding": "Prioritize trb_pct and trb_per_game, then oreb_pct and dreb_pct. Discuss contested rebounds and positioning.",
     }
 
-    if score_table is not None and not score_table.empty:
+    is_simple_top_scorers = _is_simple_top_scorers_question(question, domain)
+    is_single_player_stats = _is_single_player_stats_question(question, df)
+
+    if is_single_player_stats:
+        return _format_single_player_stats_profile(df, question)
+    elif is_simple_top_scorers:
+        return _format_simple_top_scorers_response(df, question)
+    elif score_table is not None and not score_table.empty:
         score_text = score_table.to_string(index=True)
         system_prompt = (
             "You are an expert NBA analyst providing insightful, narrative-driven analysis.\n\n"

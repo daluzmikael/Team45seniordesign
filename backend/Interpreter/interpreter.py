@@ -135,7 +135,18 @@ def _ensure_profile_columns_in_sql(sql_query: str, user_input: str) -> str:
 
     select_part = select_match.group("select_part")
     start, end = select_match.span("select_part")
-    required_columns = ["min", "fg3m_rank", "fg3a_rank", "ftm_rank", "fta_rank", "min_rank"]
+    required_columns = [
+        "min",
+        "fgm",
+        "fga",
+        "fgm_rank",
+        "fga_rank",
+        "fg3m_rank",
+        "fg3a_rank",
+        "ftm_rank",
+        "fta_rank",
+        "min_rank",
+    ]
     missing = []
     for col in required_columns:
         if not re.search(rf"(?i)\b{re.escape(col)}\b", select_part):
@@ -412,9 +423,9 @@ RULE 11 — SINGLE PLAYER GENERAL STATS PROFILE (season summary):
   → Do NOT use SUM(), GROUP BY, or UNION
   → Return a broad stat set for downstream profile tables:
      player_name, team_abbreviation, age, gp, min, w_pct,
-     pts, reb, ast, tov, stl, blk, pf, plus_minus,
+     pts, reb, ast, tov, stl, blk, pf, plus_minus, fgm, fga,
      fg_pct, fg3_pct, ft_pct, fg3m, fg3a, ftm, fta,
-     pts_rank, fg_pct_rank, fg3_pct_rank, ft_pct_rank, fg3m_rank, fg3a_rank, ftm_rank, fta_rank, min_rank,
+     pts_rank, fg_pct_rank, fg3_pct_rank, ft_pct_rank, fgm_rank, fga_rank, fg3m_rank, fg3a_rank, ftm_rank, fta_rank, min_rank,
      reb_rank, dreb_rank, oreb_rank, ast_rank, tov_rank, stl_rank, blk_rank, pf_rank,
      dreb, oreb, dd2, td3, dd2_rank, td3_rank
   → Use DISTINCT if needed to avoid duplicate player rows
@@ -645,9 +656,9 @@ GROUP BY player_name LIMIT 50;
 Q: "What were Kevin Durant's stats 2015"
 → RULE 4 + RULE 11. Single-player season profile, no aggregation.
 SELECT DISTINCT player_name, team_abbreviation, age, gp, min, w_pct,
-  pts, reb, ast, tov, stl, blk, pf, plus_minus,
+  pts, reb, ast, tov, stl, blk, pf, plus_minus, fgm, fga,
   fg_pct, fg3_pct, ft_pct, fg3m, fg3a, ftm, fta,
-  pts_rank, fg_pct_rank, fg3_pct_rank, ft_pct_rank, fg3m_rank, fg3a_rank, ftm_rank, fta_rank, min_rank,
+  pts_rank, fg_pct_rank, fg3_pct_rank, ft_pct_rank, fgm_rank, fga_rank, fg3m_rank, fg3a_rank, ftm_rank, fta_rank, min_rank,
   reb_rank, dreb_rank, oreb_rank, ast_rank, tov_rank, stl_rank, blk_rank, pf_rank,
   dreb, oreb, dd2, td3, dd2_rank, td3_rank
 FROM all_players_regular_2015_2016

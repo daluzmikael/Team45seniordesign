@@ -496,7 +496,76 @@ def _is_single_player_stats_question(question: str, df: pd.DataFrame) -> bool:
     return unique_players == 1
 
 
-def _format_single_player_stats_profile(df: pd.DataFrame, question: str) -> str:
+def _generate_natural_player_season_summary(
+    row: pd.Series, question: str, season_text: Optional[str], client: Optional[Any]
+) -> Optional[str]:
+    if client is None:
+        return None
+
+    def _safe(v: Any) -> str:
+        try:
+            if pd.isna(v):
+                return "N/A"
+        except Exception:
+            if v is None:
+                return "N/A"
+        return str(v)
+
+    payload = {
+        "player_name": _safe(row.get("player_name")),
+        "team_abbreviation": _safe(row.get("team_abbreviation")),
+        "season_text": season_text or "requested season",
+        "gp": _safe(row.get("gp")),
+        "pts": _safe(row.get("pts")),
+        "pts_rank": _safe(row.get("pts_rank")),
+        "fg_pct": _safe(row.get("fg_pct")),
+        "fg3_pct": _safe(row.get("fg3_pct")),
+        "fga": _safe(row.get("fga")),
+        "fga_rank": _safe(row.get("fga_rank")),
+        "fg3a": _safe(row.get("fg3a")),
+        "fg3a_rank": _safe(row.get("fg3a_rank")),
+        "reb": _safe(row.get("reb")),
+        "reb_rank": _safe(row.get("reb_rank")),
+        "ast": _safe(row.get("ast")),
+        "ast_rank": _safe(row.get("ast_rank")),
+        "stl": _safe(row.get("stl")),
+        "stl_rank": _safe(row.get("stl_rank")),
+        "blk": _safe(row.get("blk")),
+        "blk_rank": _safe(row.get("blk_rank")),
+        "plus_minus": _safe(row.get("plus_minus")),
+    }
+
+    system_prompt = (
+        "You are an NBA analyst. Write a short, natural season review in 2-3 sentences.\n"
+        "Tone must be neutral and direct, not robotic and not overhyped.\n"
+        "Do not use a rigid template like 'X averaged ... top Y ...'.\n"
+        "Use the provided stats together to explain scoring + efficiency + volume context.\n"
+        "Always mention games played and note sample-size caution if games are low (around <50).\n"
+        "Return plain text only."
+    )
+    user_prompt = (
+        f"Question: {question}\n"
+        f"Season profile data: {payload}\n"
+        "Write the 2-3 sentence review now."
+    )
+
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.3,
+            max_tokens=180,
+        )
+        txt = (resp.choices[0].message.content or "").strip()
+        return txt if txt else None
+    except Exception:
+        return None
+
+
+def _format_single_player_stats_profile(df: pd.DataFrame, question: str, client: Optional[Any]) -> str:
     def _is_missing(v: Any) -> bool:
         try:
             return pd.isna(v)
@@ -599,6 +668,56 @@ def _format_single_player_stats_profile(df: pd.DataFrame, question: str) -> str:
         extra_label = f"{label} (Rank)"
         extra_value = f"{value_text} (#{rank_val})"
 
+    pts_rank = _fmt_int(_v(row, "pts_rank"))
+    fg_text = _fmt_pct(_v(row, "fg_pct"))
+    fga_rank = _fmt_int(_v(row, "fga_rank"))
+    fg3a_rank = _fmt_int(_v(row, "fg3a_rank"))
+    fg3_text = _fmt_pct(_v(row, "fg3_pct"))
+    reb_rank = _fmt_int(_v(row, "reb_rank"))
+    ast_rank = _fmt_int(_v(row, "ast_rank"))
+    stl_rank = _fmt_int(_v(row, "stl_rank"))
+    blk_rank = _fmt_int(_v(row, "blk_rank"))
+    plus_minus_text = _fmt_num(_v(row, "plus_minus"))
+
+    def _rank_to_int(rank_text: str) -> Optional[int]:
+        if rank_text == "N/A":
+            return None
+        try:
+            return int(rank_text)
+        except Exception:
+            return None
+
+    stl_rank_i = _rank_to_int(stl_rank)
+    blk_rank_i = _rank_to_int(blk_rank)
+    reb_rank_i = _rank_to_int(reb_rank)
+    ast_rank_i = _rank_to_int(ast_rank)
+    fga_rank_i = _rank_to_int(fga_rank)
+    fg3a_rank_i = _rank_to_int(fg3a_rank)
+    gp_i = _rank_to_int(gp)
+
+    def _top_or_rank(rank_i: Optional[int]) -> str:
+        if rank_i is None:
+            return "among league scorers"
+        if rank_i <= 10:
+            return f"top {rank_i} in the league"
+        return f"ranked {rank_i}th in the league"
+
+    season_summary = _generate_natural_player_season_summary(row, question, season_text, client)
+    if not season_summary:
+        summary_sentences = []
+        summary_sentences.append(
+            f"{name} averaged {_fmt_num(_v(row, 'pts'))} points per game, {_top_or_rank(_rank_to_int(pts_rank))}, while shooting {fg_text} from the field."
+        )
+        if fga_rank_i is not None and fg3a_rank_i is not None:
+            summary_sentences.append(
+                f"He did that on {_fmt_num(_v(row, 'fga'))} field-goal attempts per game (#{fga_rank}) and {_fmt_num(_v(row, 'fg3a'))} three-point attempts per game (#{fg3a_rank}), which adds context to his {fg_text} FG and {fg3_text} 3P efficiency."
+            )
+        if gp_i is not None and gp_i < 50:
+            summary_sentences.append(
+                f"He played {gp} games, so this season line comes from a relatively small sample."
+            )
+        season_summary = " ".join(summary_sentences)
+
     lines = [
         heading,
         "",
@@ -632,6 +751,8 @@ def _format_single_player_stats_profile(df: pd.DataFrame, question: str) -> str:
         "| DD2 | TD3 | DD2 Rank | TD3 Rank |",
         "|---:|---:|---:|---:|",
         f"| {_fmt_num(_v(row, 'dd2'))} | {_fmt_num(_v(row, 'td3'))} | {_fmt_int(_v(row, 'dd2_rank'))} | {_fmt_int(_v(row, 'td3_rank'))} |",
+        "",
+        season_summary,
         "",
         "Want me to break down his season profile further?",
     ]
@@ -780,7 +901,7 @@ def analyze_dataframe() -> str:
     is_single_player_stats = _is_single_player_stats_question(user_input, df_output)
 
     if is_single_player_stats:
-        return _format_single_player_stats_profile(df_output, user_input)
+        return _format_single_player_stats_profile(df_output, user_input, client)
     elif is_simple_top_scorers:
         return _format_simple_top_scorers_response(df_output, user_input)
     elif score_table is not None and not score_table.empty:
@@ -922,7 +1043,7 @@ def analyze_question(question: str) -> str:
     is_single_player_stats = _is_single_player_stats_question(question, df)
 
     if is_single_player_stats:
-        return _format_single_player_stats_profile(df, question)
+        return _format_single_player_stats_profile(df, question, client)
     elif is_simple_top_scorers:
         return _format_simple_top_scorers_response(df, question)
     elif score_table is not None and not score_table.empty:
@@ -1049,7 +1170,7 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
     is_single_player_stats = _is_single_player_stats_question(question, df)
 
     if is_single_player_stats:
-        return _format_single_player_stats_profile(df, question)
+        return _format_single_player_stats_profile(df, question, client)
     elif is_simple_top_scorers:
         return _format_simple_top_scorers_response(df, question)
     elif score_table is not None and not score_table.empty:

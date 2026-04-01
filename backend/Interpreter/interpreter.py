@@ -42,7 +42,30 @@ def _is_single_player_profile_request(user_input: str) -> bool:
         k in q for k in ["what were", " stats", "stat ", "show", "profile", "season stats"]
     )
     has_exclusions = any(
-        k in q for k in ["top ", "best ", "leading ", "compare", "versus", " vs ", "between", "leaderboard"]
+        k in q
+        for k in [
+            "top ",
+            "best ",
+            "highest",
+            "most ",
+            "leading ",
+            "compare",
+            "versus",
+            " vs ",
+            "between",
+            "leaderboard",
+            "by season",
+            "per season",
+            "trend",
+            "over time",
+            "over the years",
+            "through the years",
+            "decade",
+            "rookie year",
+            "from ",
+            " to ",
+            "career",
+        ]
     )
     return has_profile_intent and not has_exclusions
 
@@ -289,6 +312,8 @@ def _is_over_time_request(question_text: str) -> bool:
         return True
     if re.search(r"\b(19\d{2}|20\d{2})s\b", q) or "decade" in q:
         return True
+    if re.search(r"\b(highest|best|most|peak)\b.+\bseason\b", q):
+        return True
     return re.search(r"\b(19\d{2}|20\d{2})\s*(to|through|thru|-)\s*(19\d{2}|20\d{2})\b", q) is not None
 
 
@@ -363,13 +388,8 @@ def _rewrite_career_aggregate_to_by_season(sql_query: str, user_input: str) -> s
             f"player_name, {col_sql} FROM {table_name} WHERE {where_clause}"
         )
 
+    # For trend slices, always return enough seasons for analyzer to reason over period.
     limit = 50
-    lim_match = re.search(r"(?i)\blimit\s+(\d+)", q)
-    if lim_match:
-        try:
-            limit = max(1, min(200, int(lim_match.group(1))))
-        except Exception:
-            limit = 50
 
     rebuilt = (
         f"SELECT DISTINCT season_start, season_label, player_name, {col_sql} "
@@ -435,6 +455,9 @@ def _ensure_all_players_broad_columns(sql_query: str, user_input: str) -> str:
     q_lower = q.lower()
     # Restrict to simple single-season season-summary selects.
     if "all_players_regular_" not in q_lower and "all_players_playoffs_" not in q_lower:
+        return q
+    # Never inject base-table columns into derived/subquery shapes like by_season.
+    if " as by_season" in q_lower or re.search(r"(?is)\bfrom\s*\(", q):
         return q
     if any(k in q_lower for k in [" sum(", " avg(", " count(", " group by ", " union all "]):
         return q

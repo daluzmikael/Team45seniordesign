@@ -572,7 +572,8 @@ def _is_single_player_season_trend_question(question: str, df: pd.DataFrame) -> 
         ]
     ) or has_career_phrase or has_decade_phrase or has_from_to_phrase or ("rookie year" in q)
     has_year_range_phrase = re.search(r"\b(19\d{2}|20\d{2})\s*(to|through|thru|-)\s*(19\d{2}|20\d{2})\b", q) is not None
-    if not (has_over_time_phrase or has_year_range_phrase):
+    has_peak_season_phrase = re.search(r"\b(highest|best|most|peak)\b.+\bseason\b", q) is not None
+    if not (has_over_time_phrase or has_year_range_phrase or has_peak_season_phrase):
         return False
     if not any(c in df.columns for c in ["season_start", "season_label", "season", "season_year", "season_id"]):
         return False
@@ -704,6 +705,20 @@ def _format_single_player_season_trend_response(df: pd.DataFrame, question: str,
             lines.append("|---|---:|")
             for m, v in avg_metrics[:8]:
                 lines.append(f"| {m} | {v} |")
+
+    asks_peak = any(k in q for k in ["highest", "best", "most", "peak"])
+    if asks_peak and not working.empty:
+        metric_candidates = ["pts", "ast", "reb", "blk", "stl", "fg3m", "fg_pct", "fg3_pct", "ft_pct"]
+        chosen = next((c for c in metric_candidates if c in working.columns), None)
+        if chosen is not None:
+            numeric = pd.to_numeric(working[chosen], errors="coerce")
+            if numeric.notna().any():
+                max_idx = int(numeric.idxmax())
+                max_row = working.loc[max_idx]
+                peak_season = str(max_row.get(season_col, "N/A"))
+                peak_val = _fmt_pct(max_row.get(chosen)) if "pct" in chosen else _fmt_num(max_row.get(chosen))
+                metric_label = chosen.upper().replace("_PCT", "%").replace("FG3M", "3PM")
+                summary = f"His peak {metric_label} season in this span was {peak_season} at {peak_val}."
 
     if not summary:
         summary = "This table shows the season-by-season trend so you can see how his production and efficiency changed over time."

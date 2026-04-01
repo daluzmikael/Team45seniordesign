@@ -124,6 +124,16 @@ def check_query_cost(conn, sql_query, max_cost=100000):
 # Query execution function
 def execute_query(conn, sql_query, max_cost=100000, timeout_ms=3000):
     logger.info("Executing SQL Query:\n%s", sql_query)
+    table_refs = sorted(
+        set(
+            re.findall(
+                r'(?i)\b(?:from|join)\s+(?:public\.)?"?([a-zA-Z_][a-zA-Z0-9_]*)"?',
+                sql_query or "",
+            )
+        )
+    )
+    if table_refs:
+        logger.info("Source tables referenced: %s", ", ".join(table_refs))
     
     # CRITICAL: Clear any previous failed transactions before starting
     conn.rollback() 
@@ -139,6 +149,7 @@ def execute_query(conn, sql_query, max_cost=100000, timeout_ms=3000):
         cursor.execute(sql_query)
         rows = cursor.fetchall()
         colnames = [desc[0] for desc in cursor.description]
+        df_result = pd.DataFrame(rows, columns=colnames)
         
         conn.commit() # Save changes
         logger.info(
@@ -146,7 +157,11 @@ def execute_query(conn, sql_query, max_cost=100000, timeout_ms=3000):
             len(rows),
             total_cost
         )
-        return pd.DataFrame(rows, columns=colnames)
+        if df_result.empty:
+            logger.info("Query result table: [empty]")
+        else:
+            logger.info("Query result table:\n%s", df_result.to_string(index=False))
+        return df_result
 
     except Exception as e:
         conn.rollback() # Ensure we clean up if this attempt fails

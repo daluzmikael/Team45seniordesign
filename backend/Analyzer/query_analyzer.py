@@ -507,6 +507,9 @@ def _is_single_player_stats_question(question: str, df: pd.DataFrame) -> bool:
         return False
     if any(k in q for k in ["top ", "best ", "leading ", "leaderboard", "rank leaders", "compare", "versus", " vs ", "between"]):
         return False
+    has_career_phrase = re.search(r"\bcaree+r\b", q) is not None
+    has_decade_phrase = re.search(r"\b(19\d{2}|20\d{2})s\b", q) is not None or "decade" in q
+    has_from_to_phrase = re.search(r"\bfrom\b.+\bto\b", q) is not None
     if any(
         k in q
         for k in [
@@ -527,7 +530,7 @@ def _is_single_player_stats_question(question: str, df: pd.DataFrame) -> bool:
             "trend",
             "over time",
         ]
-    ):
+    ) or has_career_phrase or has_decade_phrase or has_from_to_phrase or ("rookie year" in q):
         return False
     if not any(k in q for k in [" stats", "stat ", "stat?", "what were", "show", "profile"]):
         return False
@@ -544,6 +547,9 @@ def _is_single_player_season_trend_question(question: str, df: pd.DataFrame) -> 
         return False
     if len(df) < 1:
         return False
+    has_career_phrase = re.search(r"\bcaree+r\b", q) is not None
+    has_decade_phrase = re.search(r"\b(19\d{2}|20\d{2})s\b", q) is not None or "decade" in q
+    has_from_to_phrase = re.search(r"\bfrom\b.+\bto\b", q) is not None
     has_over_time_phrase = any(
         k in q
         for k in [
@@ -564,7 +570,7 @@ def _is_single_player_season_trend_question(question: str, df: pd.DataFrame) -> 
             "trend",
             "over time",
         ]
-    )
+    ) or has_career_phrase or has_decade_phrase or has_from_to_phrase or ("rookie year" in q)
     has_year_range_phrase = re.search(r"\b(19\d{2}|20\d{2})\s*(to|through|thru|-)\s*(19\d{2}|20\d{2})\b", q) is not None
     if not (has_over_time_phrase or has_year_range_phrase):
         return False
@@ -674,6 +680,30 @@ def _format_single_player_season_trend_response(df: pd.DataFrame, question: str,
             summary = ""
     else:
         summary = ""
+
+    wants_average = any(k in q for k in ["average", "averages", "avg"])
+    if wants_average:
+        avg_metrics = []
+        for label, col in available:
+            if col == "gp" or "rank" in col:
+                continue
+            try:
+                numeric = pd.to_numeric(working[col], errors="coerce")
+                mean_val = float(numeric.mean())
+                if pd.isna(mean_val):
+                    continue
+                if "%" in label:
+                    avg_metrics.append((f"Avg {label}", f"{mean_val*100.0:.1f}%" if mean_val <= 1 else f"{mean_val:.1f}%"))
+                else:
+                    avg_metrics.append((f"Avg {label}", f"{mean_val:.2f}"))
+            except Exception:
+                continue
+        if avg_metrics:
+            lines.append("")
+            lines.append("| Metric | Value |")
+            lines.append("|---|---:|")
+            for m, v in avg_metrics[:8]:
+                lines.append(f"| {m} | {v} |")
 
     if not summary:
         summary = "This table shows the season-by-season trend so you can see how his production and efficiency changed over time."

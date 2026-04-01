@@ -276,18 +276,55 @@ def _is_over_time_request(question_text: str) -> bool:
     ]
     if any(p in q for p in phrases):
         return True
+    # Handle slight misspellings like "careeer" and flexible "over ... career" phrasing.
+    if re.search(r"\bover\b.*\bcaree+r\b", q):
+        return True
+    if re.search(r"\bthroughout\b.*\bcaree+r\b", q):
+        return True
+    if re.search(r"\b(per\s+game|per-game)\b.*\bcaree+r\b", q) or re.search(r"\bcaree+r\b.*\b(per\s+game|per-game)\b", q):
+        return True
+    if "rookie year" in q:
+        return True
+    if re.search(r"\bfrom\b.+\bto\b\s*(19\d{2}|20\d{2})\b", q):
+        return True
+    if re.search(r"\b(19\d{2}|20\d{2})s\b", q) or "decade" in q:
+        return True
     return re.search(r"\b(19\d{2}|20\d{2})\s*(to|through|thru|-)\s*(19\d{2}|20\d{2})\b", q) is not None
+
+
+def _is_explicit_total_request(question_text: str) -> bool:
+    q = (question_text or "").lower()
+    total_terms = [
+        "total",
+        "totals",
+        "sum",
+        "combined",
+        "overall number",
+        "career total",
+        "how many in his career",
+        "how many in her career",
+        "how many in their career",
+    ]
+    return any(t in q for t in total_terms)
 
 
 def _rewrite_career_aggregate_to_by_season(sql_query: str, user_input: str) -> str:
     question_text = _extract_current_question_text(user_input)
     q_input = question_text.lower()
     asks_over_time = _is_over_time_request(question_text)
+    mentions_career = re.search(r"\bcaree+r\b", q_input) is not None
+    wants_total = _is_explicit_total_request(question_text)
+    q = sql_query or ""
+    q_lower = q.lower()
+    has_union_sum_rollup = ("union all" in q_lower) and ("sum(" in q_lower) and ("group by player_name" in q_lower)
+    # Default non-total career asks to by-season rows rather than SUM rollups.
+    if mentions_career and not wants_total:
+        asks_over_time = True
+    if has_union_sum_rollup and not wants_total:
+        asks_over_time = True
     if not asks_over_time:
         return sql_query
 
-    q = sql_query or ""
-    q_lower = q.lower()
     if "all_players_regular_" not in q_lower and "all_players_playoffs_" not in q_lower:
         return q
 
@@ -738,9 +775,10 @@ RULE 5B — OVER-TIME / BY-SEASON TRENDS (NOT CAREER AGGREGATE):
   Trigger phrases: "by season", "per season", "season by season", "over the years",
                    "through the years", "year by year", "across seasons", "trend over time",
                    "over his career" / "throughout his career" when asking for rate stats,
-                   or explicit ranges like "from 2012 to 2024"
+                   "rookie year to YYYY", "2010s decade", or explicit ranges like "from 2012 to 2024"
   → Use UNION ALL across relevant season tables, but return ONE ROW PER SEASON (no rollup).
   → Do NOT use SUM(), AVG(), COUNT(*), or GROUP BY player_name for this intent.
+  → If model produced SUM()+GROUP BY over UNION for these asks, rewrite to per-season direct columns.
   → Pull per-season columns directly from each season table (including gp for games played).
   Example question: "Show me LeBron's blocks per season"
   → Return season_start, season_label, player_name, blk, blk_rank, gp by season order.

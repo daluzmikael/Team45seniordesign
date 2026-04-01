@@ -1,38 +1,102 @@
 "use client"
 
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
 import { Send } from "lucide-react"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
+import { useAuth } from "@/context/auth-context"
 
 export default function Home() {
+  const { user } = useAuth()
   const [message, setMessage] = useState("")
   const [messages, setMessages] = useState<
     Array<{ role: "user" | "assistant"; content: string }>
   >([])
   const [isLoading, setIsLoading] = useState(false)
+  const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
+  const DEFAULT_CONVERSATION_ID = "default"
+
+  const saveMessageToHistory = async (
+    role: "user" | "assistant",
+    content: string
+  ) => {
+    if (!user?.token) return
+    await fetch(`${API_URL}/api/history/message`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${user.token}`,
+      },
+      body: JSON.stringify({
+        conversationId: DEFAULT_CONVERSATION_ID,
+        role,
+        content,
+      }),
+    })
+  }
+
+  useEffect(() => {
+    const loadHistory = async () => {
+      if (!user?.token) return
+
+      try {
+        const response = await fetch(
+          `${API_URL}/api/history/${DEFAULT_CONVERSATION_ID}`,
+          {
+            headers: {
+              Authorization: `Bearer ${user.token}`,
+            },
+          }
+        )
+        if (!response.ok) return
+
+        const data = await response.json()
+        const historyMessages: Array<{ role: "user" | "assistant"; content: string }> =
+          Array.isArray(data.messages)
+            ? data.messages
+                .filter((m: { role?: string; content?: string }) =>
+                  (m.role === "user" || m.role === "assistant") && typeof m.content === "string"
+                )
+                .map((m: { role: "user" | "assistant"; content: string }) => ({
+                  role: m.role,
+                  content: m.content,
+                }))
+            : []
+        setMessages(historyMessages)
+      } catch (error) {
+        console.error("Failed to load history:", error)
+      }
+    }
+
+    loadHistory()
+  }, [API_URL, user?.token])
 
   const handleSend = async () => {
     if (!message.trim()) return
 
-    const userMessage = message
-    setMessages([...messages, { role: "user", content: userMessage }])
+    const userMessage = message.trim()
+    setMessages((prev) => [...prev, { role: "user", content: userMessage }])
     setMessage("")
     setIsLoading(true)
+    void saveMessageToHistory("user", userMessage)
 
     try {
-      // ✅ Use environment variable instead of localhost
-      const API_URL =
-        process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
+      const analysisHeaders: HeadersInit = {
+        "Content-Type": "application/json",
+      }
+      if (user?.token) {
+        analysisHeaders.Authorization = `Bearer ${user.token}`
+      }
 
       const response = await fetch(`${API_URL}/api/analysis`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ question: userMessage }),
+        headers: analysisHeaders,
+        body: JSON.stringify({
+          question: userMessage,
+          conversationId: DEFAULT_CONVERSATION_ID,
+        }),
       })
 
       if (!response.ok) {
@@ -41,28 +105,33 @@ export default function Home() {
       }
 
       const data = await response.json()
+      const assistantContent = data.analysis || "No analysis available."
 
       setMessages((prev) => [
         ...prev,
         {
           role: "assistant",
-          content: data.analysis || "No analysis available.",
+          content: assistantContent,
         },
       ])
+      void saveMessageToHistory("assistant", assistantContent)
     } catch (error) {
       console.error("Error:", error)
 
+      const assistantContent = `Error: ${
+        error instanceof Error
+          ? error.message
+          : "Failed to connect to backend"
+      }`
+
       setMessages((prev) => [
         ...prev,
         {
           role: "assistant",
-          content: `Error: ${
-            error instanceof Error
-              ? error.message
-              : "Failed to connect to backend"
-          }`,
+          content: assistantContent,
         },
       ])
+      void saveMessageToHistory("assistant", assistantContent)
     } finally {
       setIsLoading(false)
     }

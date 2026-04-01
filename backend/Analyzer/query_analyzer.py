@@ -366,17 +366,35 @@ def infer_domain(user_q: str, cols: List[str]) -> str:
 
 def _is_simple_top_scorers_question(question: str, domain: str) -> bool:
     q = (question or "").lower()
-    if domain != "scoring":
+    asks_for_top_list = any(k in q for k in ["top ", "best ", "leading ", "leaders", "leaderboard"])
+    if not asks_for_top_list:
         return False
 
-    asks_for_scorers = (
-        ("scorer" in q)
-        or ("scoring" in q and "leader" in q)
-        or ("points leader" in q)
-        or ("top points" in q)
-        or ("top" in q and "points" in q)
-    )
-    if not asks_for_scorers:
+    # Avoid hijacking single-player follow-ups like "what is his best skill".
+    if any(k in q for k in ["best skill", "his best", "her best", "their best", "break down", "profile"]):
+        return False
+
+    if domain == "overall_impact":
+        return False
+
+    leaderboard_entity_markers = [
+        "scorer",
+        "scoring",
+        "points",
+        "rebound",
+        "boards",
+        "assist",
+        "steal",
+        "block",
+        "shoot",
+        "3pt",
+        "3-point",
+        "leaders",
+        "leaderboard",
+    ]
+    has_entity = any(k in q for k in leaderboard_entity_markers)
+    has_top_number = re.search(r"\b(top|best|leading)\s+\d{1,2}\b", q) is not None
+    if not (has_entity or has_top_number):
         return False
 
     complex_markers = [
@@ -483,9 +501,33 @@ def _is_single_player_stats_question(question: str, df: pd.DataFrame) -> bool:
         return False
     if "player_name" not in df.columns:
         return False
+    if len(df) != 1:
+        return False
     if "game_date" in df.columns:
         return False
     if any(k in q for k in ["top ", "best ", "leading ", "leaderboard", "rank leaders", "compare", "versus", " vs ", "between"]):
+        return False
+    if any(
+        k in q
+        for k in [
+            "by season",
+            "per season",
+            "each season",
+            "season by season",
+            "over the years",
+            "through the years",
+            "across seasons",
+            "year by year",
+            "over his career",
+            "over her career",
+            "over their career",
+            "throughout his career",
+            "throughout her career",
+            "throughout their career",
+            "trend",
+            "over time",
+        ]
+    ):
         return False
     if not any(k in q for k in [" stats", "stat ", "stat?", "what were", "show", "profile"]):
         return False
@@ -494,6 +536,150 @@ def _is_single_player_stats_question(question: str, df: pd.DataFrame) -> bool:
     except Exception:
         unique_players = 0
     return unique_players == 1
+
+
+def _is_single_player_season_trend_question(question: str, df: pd.DataFrame) -> bool:
+    q = (question or "").lower()
+    if df is None or df.empty or "player_name" not in df.columns:
+        return False
+    if len(df) < 1:
+        return False
+    has_over_time_phrase = any(
+        k in q
+        for k in [
+            "by season",
+            "per season",
+            "each season",
+            "season by season",
+            "over the years",
+            "through the years",
+            "across seasons",
+            "year by year",
+            "over his career",
+            "over her career",
+            "over their career",
+            "throughout his career",
+            "throughout her career",
+            "throughout their career",
+            "trend",
+            "over time",
+        ]
+    )
+    has_year_range_phrase = re.search(r"\b(19\d{2}|20\d{2})\s*(to|through|thru|-)\s*(19\d{2}|20\d{2})\b", q) is not None
+    if not (has_over_time_phrase or has_year_range_phrase):
+        return False
+    if not any(c in df.columns for c in ["season_start", "season_label", "season", "season_year", "season_id"]):
+        return False
+    try:
+        unique_players = df["player_name"].dropna().astype(str).str.strip().nunique()
+    except Exception:
+        unique_players = 0
+    return unique_players <= 2
+
+
+def _format_single_player_season_trend_response(df: pd.DataFrame, question: str, client: Optional[Any]) -> str:
+    q = (question or "").lower()
+    working = df.copy()
+    player_name = str(working.iloc[0].get("player_name", "N/A")) if not working.empty else "N/A"
+
+    season_col = None
+    for cand in ["season_label", "season", "season_year", "season_start", "season_id"]:
+        if cand in working.columns:
+            season_col = cand
+            break
+
+    if season_col is None:
+        return ""
+
+    if "season_start" in working.columns:
+        try:
+            working = working.sort_values(by=["season_start"], ascending=[True], na_position="last")
+        except Exception:
+            pass
+    elif season_col in working.columns:
+        try:
+            working = working.sort_values(by=[season_col], ascending=[True], na_position="last")
+        except Exception:
+            pass
+
+    def _fmt_num(v: Any, digits: int = 1) -> str:
+        try:
+            if pd.isna(v):
+                return "N/A"
+            return f"{float(v):.{digits}f}"
+        except Exception:
+            return "N/A"
+
+    def _fmt_pct(v: Any) -> str:
+        try:
+            if pd.isna(v):
+                return "N/A"
+            num = float(v)
+            if 0 <= num <= 1:
+                num *= 100.0
+            return f"{num:.1f}%"
+        except Exception:
+            return "N/A"
+
+    # Remove duplicate rows for the same season/player if source tables contain repeats.
+    dedupe_keys = [k for k in ["player_name", "season_start", "season_label"] if k in working.columns]
+    if dedupe_keys:
+        working = working.drop_duplicates(subset=dedupe_keys, keep="first")
+
+    is_shooting = any(k in q for k in ["shoot", "fg%", "3 point", "3p", "percentage"])
+    is_rebounding = any(k in q for k in ["rebound", "boards", "glass"])
+    is_defense = any(k in q for k in ["block", "blk", "steal", "stl", "defense"])
+
+    if is_shooting:
+        columns = [("FG%", "fg_pct"), ("3P%", "fg3_pct"), ("FT%", "ft_pct"), ("FGM", "fgm"), ("FGA", "fga"), ("3PM", "fg3m"), ("3PA", "fg3a")]
+    elif is_rebounding:
+        columns = [("REB", "reb"), ("OREB", "oreb"), ("DREB", "dreb"), ("REB Rank", "reb_rank"), ("OREB Rank", "oreb_rank"), ("DREB Rank", "dreb_rank")]
+    elif is_defense:
+        columns = [("BLK", "blk"), ("STL", "stl"), ("BLK Rank", "blk_rank"), ("STL Rank", "stl_rank"), ("Games", "gp")]
+    else:
+        columns = [("PTS", "pts"), ("REB", "reb"), ("AST", "ast"), ("FG%", "fg_pct"), ("3P%", "fg3_pct")]
+
+    available = [(label, col) for label, col in columns if col in working.columns]
+    if not available:
+        return ""
+
+    header = "| Season | " + " | ".join(label for label, _ in available) + " |"
+    divider = "|---|" + "|".join(["---:" for _ in available]) + "|"
+    lines = [f"## **{player_name}**", "", header, divider]
+
+    for _, row in working.iterrows():
+        season_text = str(row.get(season_col, "N/A"))
+        vals = []
+        for label, col in available:
+            if "%" in label:
+                vals.append(_fmt_pct(row.get(col)))
+            else:
+                vals.append(_fmt_num(row.get(col)))
+        lines.append("| " + season_text + " | " + " | ".join(vals) + " |")
+
+    if client is not None:
+        try:
+            sample = working[[season_col] + [c for _, c in available]].head(8).to_dict(orient="records")
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "Write 2 concise sentences summarizing the trend in these season-by-season stats. Use plain language and include at least one concrete stat reference."},
+                    {"role": "user", "content": f"Question: {question}\nPlayer: {player_name}\nSeason rows: {sample}"},
+                ],
+                temperature=0.2,
+                max_tokens=140,
+            )
+            summary = (resp.choices[0].message.content or "").strip()
+        except Exception:
+            summary = ""
+    else:
+        summary = ""
+
+    if not summary:
+        summary = "This table shows the season-by-season trend so you can see how his production and efficiency changed over time."
+
+    lines.extend(["", summary, "", "Want me to break down any specific season further?"])
+    return "\n" + "\n".join(lines)
 
 
 def _generate_natural_player_season_summary(
@@ -766,11 +952,11 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
         except Exception:
             return v is None
 
-    def _fmt_ppg(v: Any) -> str:
+    def _fmt_num(v: Any, digits: int = 1) -> str:
         if _is_missing(v):
             return "N/A"
         try:
-            return f"{float(v):.1f}"
+            return f"{float(v):.{digits}f}"
         except Exception:
             return "N/A"
 
@@ -793,16 +979,118 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
         except Exception:
             return "N/A"
 
+    def _first_present(candidates: List[str], available_cols: set[str]) -> Optional[str]:
+        for col in candidates:
+            if col in available_cols:
+                return col
+        return None
+
     if df is None or df.empty:
-        return "\nNo scorer data was available for this question."
+        return "\nNo leaderboard data was available for this question."
 
     working = df.copy()
     cols = set(working.columns)
+    q = (question or "").lower()
 
-    if "pts_rank" in cols:
-        working = working.sort_values(by=["pts_rank", "pts"], ascending=[True, False], na_position="last")
-    elif "pts" in cols:
-        working = working.sort_values(by=["pts"], ascending=[False], na_position="last")
+    metric_configs = [
+        {
+            "intent_terms": ["rebound", "boards", "glass", "rebounding"],
+            "metric_candidates": ["reb", "trb_per_game", "trb_pct"],
+            "rank_col": "reb_rank",
+            "metric_label": "REB",
+            "lead_phrase": "led the league on the glass",
+            "table_header": "| # | Player | REB | OREB | DREB | Games |",
+            "table_divider": "|---|---|---:|---:|---:|---:|",
+            "row_builder": lambda idx, row, name, team: (
+                f"| {idx} | **{name}** ({team}) | {_fmt_num(row.get('reb'))} reb | "
+                f"{_fmt_num(row.get('oreb'))} oreb | {_fmt_num(row.get('dreb'))} dreb | {_fmt_games(row.get('gp'))} |"
+            ),
+        },
+        {
+            "intent_terms": ["assist", "playmaker", "passing"],
+            "metric_candidates": ["ast", "ast_per_game", "ast_pct"],
+            "rank_col": "ast_rank",
+            "metric_label": "AST",
+            "lead_phrase": "led the league in playmaking",
+            "table_header": "| # | Player | AST | TOV | Games |",
+            "table_divider": "|---|---|---:|---:|---:|",
+            "row_builder": lambda idx, row, name, team: (
+                f"| {idx} | **{name}** ({team}) | {_fmt_num(row.get('ast'))} ast | "
+                f"{_fmt_num(row.get('tov'))} tov | {_fmt_games(row.get('gp'))} |"
+            ),
+        },
+        {
+            "intent_terms": ["steal", "steals"],
+            "metric_candidates": ["stl", "stl_per_game"],
+            "rank_col": "stl_rank",
+            "metric_label": "STL",
+            "lead_phrase": "led the league in steals",
+            "table_header": "| # | Player | STL | BLK | Games |",
+            "table_divider": "|---|---|---:|---:|---:|",
+            "row_builder": lambda idx, row, name, team: (
+                f"| {idx} | **{name}** ({team}) | {_fmt_num(row.get('stl'))} stl | "
+                f"{_fmt_num(row.get('blk'))} blk | {_fmt_games(row.get('gp'))} |"
+            ),
+        },
+        {
+            "intent_terms": ["block", "blocks", "rim protection"],
+            "metric_candidates": ["blk", "blk_per_game"],
+            "rank_col": "blk_rank",
+            "metric_label": "BLK",
+            "lead_phrase": "led the league in blocks",
+            "table_header": "| # | Player | BLK | STL | Games |",
+            "table_divider": "|---|---|---:|---:|---:|",
+            "row_builder": lambda idx, row, name, team: (
+                f"| {idx} | **{name}** ({team}) | {_fmt_num(row.get('blk'))} blk | "
+                f"{_fmt_num(row.get('stl'))} stl | {_fmt_games(row.get('gp'))} |"
+            ),
+        },
+        {
+            "intent_terms": ["three", "3pt", "3-point", "3pm", "threes"],
+            "metric_candidates": ["fg3m", "three_pm", "fg3_pct"],
+            "rank_col": "fg3m_rank",
+            "metric_label": "3PM",
+            "lead_phrase": "led the league from deep",
+            "table_header": "| # | Player | 3PM | 3PA | 3P | Games |",
+            "table_divider": "|---|---|---:|---:|---:|---:|",
+            "row_builder": lambda idx, row, name, team: (
+                f"| {idx} | **{name}** ({team}) | {_fmt_num(row.get('fg3m'))} 3pm | "
+                f"{_fmt_num(row.get('fg3a'))} 3pa | {_fmt_pct(row.get('fg3_pct'))} 3p | {_fmt_games(row.get('gp'))} |"
+            ),
+        },
+    ]
+
+    selected = None
+    for cfg in metric_configs:
+        if any(term in q for term in cfg["intent_terms"]):
+            selected = cfg
+            break
+
+    if selected is None:
+        selected = {
+            "metric_candidates": ["pts", "ppg", "ts_pct"],
+            "rank_col": "pts_rank",
+            "metric_label": "PPG",
+            "lead_phrase": "led the league",
+            "table_header": "| # | Player | PPG | FG | 3P | Games |",
+            "table_divider": "|---|---|---:|---:|---:|---:|",
+            "row_builder": lambda idx, row, name, team: (
+                f"| {idx} | **{name}** ({team}) | {_fmt_num(row.get('pts'))} ppg | "
+                f"{_fmt_pct(row.get('fg_pct'))} fg | {_fmt_pct(row.get('fg3_pct'))} 3p | {_fmt_games(row.get('gp'))} |"
+            ),
+        }
+
+    rank_col = selected["rank_col"]
+    metric_col = _first_present(selected["metric_candidates"], cols)
+    if metric_col is None:
+        metric_col = "pts" if "pts" in cols else ("reb" if "reb" in cols else "")
+
+    if rank_col in cols and metric_col in cols:
+        working = working.sort_values(by=[rank_col, metric_col], ascending=[True, False], na_position="last")
+    elif rank_col in cols:
+        working = working.sort_values(by=[rank_col], ascending=[True], na_position="last")
+    elif metric_col in cols:
+        working = working.sort_values(by=[metric_col], ascending=[False], na_position="last")
 
     if "player_name" in cols:
         working = working.dropna(subset=["player_name"])
@@ -813,31 +1101,28 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
     requested_n = _extract_requested_top_n(question, default_n=5, max_n=50)
     top = working.head(requested_n)
     if top.empty:
-        return "\nNo scorer data was available for this question."
+        return "\nNo leaderboard data was available for this question."
 
     lead_row = top.iloc[0]
     lead_name = str(lead_row.get("player_name", "N/A")) if not _is_missing(lead_row.get("player_name")) else "N/A"
-    lead_ppg = _fmt_ppg(lead_row.get("pts"))
-    lead_fg = _fmt_pct(lead_row.get("fg_pct"))
+    lead_metric = _fmt_num(lead_row.get(metric_col))
     season_text = _extract_season_reference_text(question)
     if season_text:
-        lead_line = f"In {season_text}, {lead_name} led the league at {lead_ppg} PPG on {lead_fg} FG."
+        lead_line = (
+            f"In {season_text}, {lead_name} {selected['lead_phrase']} at {lead_metric} {selected['metric_label']}."
+        )
     else:
-        lead_line = f"{lead_name} led the league at {lead_ppg} PPG on {lead_fg} FG."
+        lead_line = f"{lead_name} {selected['lead_phrase']} at {lead_metric} {selected['metric_label']}."
 
-    lines = [lead_line, "", "| # | Player | PPG | FG | 3P | Games |", "|---|---|---:|---:|---:|---:|"]
+    lines = [lead_line, "", selected["table_header"], selected["table_divider"]]
 
     for idx, (_, row) in enumerate(top.iterrows(), start=1):
         name = str(row.get("player_name", "N/A")) if not _is_missing(row.get("player_name")) else "N/A"
         team = str(row.get("team_abbreviation", "N/A")) if not _is_missing(row.get("team_abbreviation")) else "N/A"
-        ppg = _fmt_ppg(row.get("pts"))
-        fg = _fmt_pct(row.get("fg_pct"))
-        three = _fmt_pct(row.get("fg3_pct"))
-        games = _fmt_games(row.get("gp"))
-        lines.append(f"| {idx} | **{name}** ({team}) | {ppg} ppg | {fg} fg | {three} 3p | {games} |")
+        lines.append(selected["row_builder"](idx, row, name, team))
 
     lines.append("")
-    lines.append("Want me to break down each player's scoring profile further?")
+    lines.append("Want me to break down each player's profile further?")
     return "\n" + "\n".join(lines)
 
 
@@ -898,8 +1183,13 @@ def analyze_dataframe() -> str:
     is_game_log = "game_id" in df_output.columns
 
     is_simple_top_scorers = _is_simple_top_scorers_question(user_input, domain)
+    is_single_player_trend = _is_single_player_season_trend_question(user_input, df_output)
     is_single_player_stats = _is_single_player_stats_question(user_input, df_output)
 
+    if is_single_player_trend:
+        trend_text = _format_single_player_season_trend_response(df_output, user_input, client)
+        if trend_text:
+            return trend_text
     if is_single_player_stats:
         return _format_single_player_stats_profile(df_output, user_input, client)
     elif is_simple_top_scorers:
@@ -1040,8 +1330,13 @@ def analyze_question(question: str) -> str:
     is_game_log = "game_id" in df.columns 
 
     is_simple_top_scorers = _is_simple_top_scorers_question(question, domain)
+    is_single_player_trend = _is_single_player_season_trend_question(question, df)
     is_single_player_stats = _is_single_player_stats_question(question, df)
 
+    if is_single_player_trend:
+        trend_text = _format_single_player_season_trend_response(df, question, client)
+        if trend_text:
+            return trend_text
     if is_single_player_stats:
         return _format_single_player_stats_profile(df, question, client)
     elif is_simple_top_scorers:
@@ -1167,8 +1462,13 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
     }
 
     is_simple_top_scorers = _is_simple_top_scorers_question(question, domain)
+    is_single_player_trend = _is_single_player_season_trend_question(question, df)
     is_single_player_stats = _is_single_player_stats_question(question, df)
 
+    if is_single_player_trend:
+        trend_text = _format_single_player_season_trend_response(df, question, client)
+        if trend_text:
+            return trend_text
     if is_single_player_stats:
         return _format_single_player_stats_profile(df, question, client)
     elif is_simple_top_scorers:

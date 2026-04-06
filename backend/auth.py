@@ -20,14 +20,24 @@ db = firebase.database()
 def sign_up(email: str, password: str):
     try:
         user = auth.create_user_with_email_and_password(email, password)
-        return {"success": True, "uid": user['localId'], "token": user['idToken']}
+        return {
+            "success": True,
+            "uid": user['localId'],
+            "token": user['idToken'],
+            "refreshToken": user['refreshToken'],
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 def log_in(email: str, password: str):
     try:
         user = auth.sign_in_with_email_and_password(email, password)
-        return {"success": True, "uid": user['localId'], "token": user['idToken']}
+        return {
+            "success": True,
+            "uid": user['localId'],
+            "token": user['idToken'],
+            "refreshToken": user['refreshToken'],
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -56,6 +66,16 @@ def save_history_message(uid: str, conversation_id: str, role: str, content: str
             "createdAt": int(time.time() * 1000),
         }
         db.child("histories").child(uid).child(conversation_id).child("messages").push(payload)
+
+        # users first message will be the convo title, before it was a seperate mix
+        if role == "user":
+            existing_title = (
+                db.child("histories").child(uid).child(conversation_id).child("title").get().val()
+            )
+            if not existing_title:
+                title = content[:60] + ("..." if len(content) > 60 else "")
+                db.child("histories").child(uid).child(conversation_id).child("title").set(title)
+
         return {"success": True}
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -100,7 +120,9 @@ def list_conversations(uid: str):
         conversations = []
         for conversation_id, conversation_data in data.items():
             latest = 0
+            title = None
             if isinstance(conversation_data, dict):
+                title = conversation_data.get("title")
                 messages = conversation_data.get("messages", {})
                 if isinstance(messages, dict):
                     for item in messages.values():
@@ -110,6 +132,7 @@ def list_conversations(uid: str):
                 {
                     "conversationId": conversation_id,
                     "latestMessageAt": latest,
+                    "title": title,
                 }
             )
 

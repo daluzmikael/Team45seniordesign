@@ -1,5 +1,7 @@
 "use client"
 
+import { useEffect, useState, useCallback } from "react"
+import { useRouter, useParams } from "next/navigation"
 import {
   MessageSquarePlus,
   Search,
@@ -27,63 +29,143 @@ import {
   SidebarSeparator,
 } from "@/components/ui/sidebar"
 import { Button } from "@/components/ui/button"
-import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu"
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu"
 import { Avatar, AvatarFallback } from "@/components/ui/avatar"
 import Link from "next/link"
 import { useAuth } from "@/context/auth-context"
+import { guestStorage, type GuestConversationMeta } from "@/lib/guest-storage"
 
-// Just for showcase, dud code
-const chatHistory = [
-  {
-    id: "1",
-    title: "Who is a better 3 point shooter between Jordan Poole and Dalton Knecht?",
-    date: "Today",
-  },
-  {
-    id: "2",
-    title: "How many assists did Derrick Rose have at his last game?",
-    date: "Today",
-  },
-  {
-    id: "3",
-    title: "Is Brian Scalabrine better than Lebron James?",
-    date: "Yesterday",
-  },
-  {
-    id: "4",
-    title: "All time GSW Team",
-    date: "Yesterday",
-  },
-  {
-    id: "5",
-    title: "Which Lakers year had the best stats",
-    date: "Previous 7 Days",
-  },
-]
+// types
+type ConversationMeta = {
+  conversationId: string
+  latestMessageAt: number
+  title?: string
+}
 
-const groupedChats = chatHistory.reduce(
-  (acc, chat) => {
-    if (!acc[chat.date]) {
-      acc[chat.date] = []
-    }
-    acc[chat.date].push(chat)
-    return acc
-  },
-  {} as Record<string, typeof chatHistory>,
-)
-
-// Get initials from email e.g. "john@gmail.com" -> "JO"
+// helpers 
 function getInitials(email: string) {
   return email.slice(0, 2).toUpperCase()
 }
 
+function groupByDate(conversations: ConversationMeta[]): Record<string, ConversationMeta[]> {
+  const now = Date.now()
+  const ONE_DAY = 86_400_000
+  const SEVEN_DAYS = 7 * ONE_DAY
+
+  const groups: Record<string, ConversationMeta[]> = {}
+  for (const conv of conversations) {
+    const age = now - (conv.latestMessageAt || 0)
+    const label =
+      age < ONE_DAY ? "Today" : age < 2 * ONE_DAY ? "Yesterday" : age < SEVEN_DAYS ? "Previous 7 Days" : "Older"
+    if (!groups[label]) groups[label] = []
+    groups[label].push(conv)
+  }
+  return groups
+}
+
+const DATE_ORDER = ["Today", "Yesterday", "Previous 7 Days", "Older"]
+
+// component
 export function AppSidebar() {
   const { user, logout } = useAuth()
+  const router = useRouter()
+  const params = useParams<{ id?: string }>()
+  const activeId = params?.id
+
+  const [conversations, setConversations] = useState<ConversationMeta[]>([])
+  const [loadingHistory, setLoadingHistory] = useState(false)
+
+  const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
+
+  // loads conversation list from backend firebase/sessionStorage 
+  const loadConversations = useCallback(async () => {
+    if (user?.token) {
+      setLoadingHistory(true)
+      try {
+        const res = await fetch(`${API_URL}/api/history`, {
+          headers: { Authorization: `Bearer ${user.token}` },
+        })
+        if (res.ok) {
+          const data = await res.json()
+          // Backend now returns title from the first user message
+          const list: ConversationMeta[] = Array.isArray(data.conversations)
+            ? data.conversations.map((c: { conversationId: string; latestMessageAt: number; title?: string }) => ({
+                conversationId: c.conversationId,
+                latestMessageAt: c.latestMessageAt,
+                title: c.title,
+              }))
+            : []
+          setConversations(list)
+        }
+      } catch (e) {
+        console.error("Failed to load conversation list:", e)
+      } finally {
+        setLoadingHistory(false)
+      }
+    } else {
+      // for guests, list conversations from sessionStorage
+      const list: ConversationMeta[] = guestStorage.listConversations().map(
+        (c: GuestConversationMeta) => ({
+          conversationId: c.conversationId,
+          latestMessageAt: c.latestMessageAt,
+          title: c.title,
+        })
+      )
+      setConversations(list)
+    }
+  }, [user?.token, API_URL])
+
+  useEffect(() => {
+    loadConversations()
+  }, [loadConversations])
+
+  // reload conversation list when user logs in/out
+  useEffect(() => {
+    if (!user) {
+      loadConversations()
+    }
+  }, [activeId, user, loadConversations])
+
+  // start a new chat with empty history
+  const handleNewChat = () => {
+    router.push("/")
+  }
+
+  // delete conversation (for anyone who looks at this, its just frontend for now, need to add delete endpoint for backend eventually firebase)
+  const handleDelete = async (conversationId: string, e: React.MouseEvent) => {
+    e.stopPropagation()
+    if (user?.token) {
+      // TODO: add a DELETE /api/history/:id endpoint on the backend
+      // For now, just remove it from local state
+      console.warn("backend delete hasn't been implemented yet")
+    } else {
+      guestStorage.deleteConversation(conversationId)
+    }
+    setConversations((prev) => prev.filter((c) => c.conversationId !== conversationId))
+    if (activeId === conversationId) {
+      router.push("/")
+    }
+  }
+
+  // chat display title
+  const getTitle = (conv: ConversationMeta) =>
+    conv.title || `Chat ${conv.conversationId.slice(0, 8)}`
+
+  const grouped = groupByDate(conversations)
 
   return (
     <Sidebar>
       <SidebarHeader className="border-b border-sidebar-border p-4">
-        <Button className="w-full justify-start gap-2 bg-transparent" variant="outline">
+        <Button
+          className="w-full justify-start gap-2 bg-transparent"
+          variant="outline"
+          onClick={handleNewChat}
+        >
           <MessageSquarePlus className="h-4 w-4" />
           New Chat
         </Button>
@@ -128,16 +210,39 @@ export function AppSidebar() {
 
         <SidebarSeparator />
 
-        {Object.entries(groupedChats).map(([date, chats]) => (
-          <SidebarGroup key={date}>
-            <SidebarGroupLabel>{date}</SidebarGroupLabel>
+        {loadingHistory && (
+          <SidebarGroup>
+            <SidebarGroupContent>
+              <p className="text-xs text-muted-foreground px-4 py-2 animate-pulse">
+                Loading history…
+              </p>
+            </SidebarGroupContent>
+          </SidebarGroup>
+        )}
+
+        {!loadingHistory && conversations.length === 0 && (
+          <SidebarGroup>
+            <SidebarGroupContent>
+              <p className="text-xs text-muted-foreground px-4 py-2">No chats yet.</p>
+            </SidebarGroupContent>
+          </SidebarGroup>
+        )}
+
+        {DATE_ORDER.filter((label) => grouped[label]?.length).map((label) => (
+          <SidebarGroup key={label}>
+            <SidebarGroupLabel>{label}</SidebarGroupLabel>
             <SidebarGroupContent>
               <SidebarMenu>
-                {chats.map((chat) => (
-                  <SidebarMenuItem key={chat.id}>
-                    <SidebarMenuButton>
-                      <MessageSquarePlus className="h-4 w-4" />
-                      <span className="truncate">{chat.title}</span>
+                {grouped[label].map((conv) => (
+                  <SidebarMenuItem key={conv.conversationId}>
+                    <SidebarMenuButton
+                      asChild
+                      isActive={activeId === conv.conversationId}
+                    >
+                      <Link href={`/chat/${conv.conversationId}`}>
+                        <MessageSquarePlus className="h-4 w-4 shrink-0" />
+                        <span className="truncate">{getTitle(conv)}</span>
+                      </Link>
                     </SidebarMenuButton>
                     <DropdownMenu>
                       <DropdownMenuTrigger asChild>
@@ -147,7 +252,10 @@ export function AppSidebar() {
                         </SidebarMenuAction>
                       </DropdownMenuTrigger>
                       <DropdownMenuContent side="right" align="start">
-                        <DropdownMenuItem>
+                        <DropdownMenuItem
+                          onClick={(e) => handleDelete(conv.conversationId, e)}
+                          className="text-destructive focus:text-destructive"
+                        >
                           <Trash2 className="h-4 w-4 mr-2" />
                           Delete
                         </DropdownMenuItem>
@@ -165,12 +273,13 @@ export function AppSidebar() {
         <SidebarMenu>
           <SidebarMenuItem>
             {user ? (
-              // Logged in state
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <SidebarMenuButton className="w-full">
                     <Avatar className="h-6 w-6">
-                      <AvatarFallback className="text-xs">{getInitials(user.email)}</AvatarFallback>
+                      <AvatarFallback className="text-xs">
+                        {getInitials(user.email)}
+                      </AvatarFallback>
                     </Avatar>
                     <span className="flex-1 text-left truncate">{user.email}</span>
                     <MoreHorizontal className="h-4 w-4" />
@@ -185,14 +294,16 @@ export function AppSidebar() {
                     <Settings className="h-4 w-4 mr-2" />
                     Settings
                   </DropdownMenuItem>
-                  <DropdownMenuItem onClick={logout} className="text-destructive focus:text-destructive">
+                  <DropdownMenuItem
+                    onClick={logout}
+                    className="text-destructive focus:text-destructive"
+                  >
                     <LogOut className="h-4 w-4 mr-2" />
                     Sign Out
                   </DropdownMenuItem>
                 </DropdownMenuContent>
               </DropdownMenu>
             ) : (
-              // Guest state
               <SidebarMenuButton asChild>
                 <Link href="/login">
                   <LogIn className="h-4 w-4" />

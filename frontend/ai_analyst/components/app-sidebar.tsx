@@ -131,6 +131,13 @@ export function AppSidebar() {
     }
   }, [activeId, user, loadConversations])
 
+  // listen for new messages from the chat page and reload the sidebar live
+  useEffect(() => {
+    const handler = () => loadConversations()
+    window.addEventListener("conversation-updated", handler)
+    return () => window.removeEventListener("conversation-updated", handler)
+  }, [loadConversations])
+
   // start a new chat with empty history
   const handleNewChat = () => {
     router.push("/")

@@ -71,7 +71,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     const stored = localStorage.getItem("auth_user")
     if (stored) {
       try {
-        setUser(JSON.parse(stored))
+        const parsed = JSON.parse(stored)
+        // If stored user is missing new fields, force re-login
+        if (!parsed.refreshToken || !parsed.tokenExpiresAt) {
+          localStorage.removeItem("auth_user")
+        } else {
+          setUser(parsed)
+        }
       } catch {
         localStorage.removeItem("auth_user")
       }

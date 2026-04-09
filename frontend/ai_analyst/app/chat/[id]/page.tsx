@@ -34,6 +34,8 @@ export default function ChatPage() {
       },
       body: JSON.stringify({ conversationId, role, content }),
     })
+    // notify sidebar to refresh after every save so new chats appear immediately
+    window.dispatchEvent(new Event("conversation-updated"))
   }, [user?.token, conversationId, API_URL])
 
   // handles sending a query and receiving the response
@@ -131,6 +133,7 @@ export default function ChatPage() {
   useEffect(() => {
     if (!user && conversationId && messages.length > 0) {
       guestStorage.saveConversation(conversationId, messages)
+      window.dispatchEvent(new Event("conversation-updated"))
     }
   }, [messages, user, conversationId])
 

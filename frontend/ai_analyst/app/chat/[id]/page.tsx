@@ -4,7 +4,7 @@ import { useEffect, useRef, useState, useCallback } from "react"
 import { useParams } from "next/navigation"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
-import { Send, Basketball } from "lucide-react"
+import { Send } from "lucide-react"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
 import { useAuth } from "@/context/auth-context"
@@ -194,7 +194,22 @@ export default function ChatPage() {
         {isLoading && (
           <div className="flex justify-start">
             <div className="rounded-lg px-4 py-2 bg-muted">
-              <Basketball className="h-6 w-6 animate-spin text-primary" />
+              <svg
+                className="h-6 w-6 animate-spin text-primary"
+                viewBox="0 0 24 24"
+                fill="none"
+                xmlns="http://www.w3.org/2000/svg"
+              >
+                <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="2" fill="currentColor" opacity="0.2"/>
+                <path d="M12 2C13.1 2 14 2.9 14 4V8C14 9.1 13.1 10 12 10C10.9 10 10 9.1 10 8V4C10 2.9 10.9 2 12 2Z" fill="currentColor"/>
+                <path d="M12 14C13.1 14 14 14.9 14 16V20C14 21.1 13.1 22 12 22C10.9 22 10 21.1 10 20V16C10 14.9 10.9 14 12 14Z" fill="currentColor"/>
+                <path d="M20 12C21.1 12 22 12.9 22 14H18C18 12.9 18.9 12 20 12Z" fill="currentColor"/>
+                <path d="M4 12C5.1 12 6 12.9 6 14H2C2 12.9 2.9 12 4 12Z" fill="currentColor"/>
+                <path d="M16.24 7.76C17.07 8.59 17.07 9.93 16.24 10.76L14.83 9.35C15.22 8.96 15.22 8.35 14.83 7.96L16.24 7.76Z" fill="currentColor"/>
+                <path d="M7.76 16.24C8.59 17.07 9.93 17.07 10.76 16.24L9.35 14.83C8.96 15.22 8.35 15.22 7.96 14.83L7.76 16.24Z" fill="currentColor"/>
+                <path d="M16.24 16.24C15.41 17.07 14.07 17.07 13.24 16.24L14.65 14.83C15.04 15.22 15.65 15.22 16.04 14.83L16.24 16.24Z" fill="currentColor"/>
+                <path d="M7.76 7.76C8.59 6.93 9.93 6.93 10.76 7.76L9.35 9.17C8.96 8.78 8.35 8.78 7.96 9.17L7.76 7.76Z" fill="currentColor"/>
+              </svg>
             </div>
           </div>
         )}

@@ -608,6 +608,10 @@ Do NOT include any additional text or markdown.
 # 6. Convert natural language → SQL
 def natural_language_to_sql(user_input_param: str):
 
+    user_input_lower = user_input_param.strip().lower()
+    if user_input_lower.startswith(('select ', 'with ', 'insert ', 'update ', 'delete ', 'create ', 'drop ', 'alter ')):
+        raise ValueError("Error")
+
     conn = get_connection()
     schema_description = get_db_schema(conn)
 

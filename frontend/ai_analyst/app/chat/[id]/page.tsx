@@ -43,8 +43,11 @@ export default function ChatPage() {
 
     setMessages((prev) => [...prev, { role: "user", content: userMessage }])
     setMessage("")
-    setLoadingState("waiting")
+    setLoadingState("analyzing")
     void saveToBackend("user", userMessage)
+
+    // delay for analyzing stage
+    await new Promise(resolve => setTimeout(resolve, 600))
 
     try {
       const headers: HeadersInit = { "Content-Type": "application/json" }
@@ -67,7 +70,7 @@ export default function ChatPage() {
       const assistantContent = data.analysis || "No analysis available."
       
       // delay
-      await new Promise(resolve => setTimeout(resolve, 500))
+      await new Promise(resolve => setTimeout(resolve, 600))
       
       setMessages((prev) => [...prev, { role: "assistant", content: assistantContent }])
       void saveToBackend("assistant", assistantContent)
@@ -201,7 +204,8 @@ export default function ChatPage() {
           <div className="flex justify-start">
             <div className="rounded-lg px-4 py-2 bg-muted">
               <p className="animate-pulse">
-                {loadingState === "waiting" && "Analyzing..."}
+                {loadingState === "analyzing" && "Analyzing query..."}
+                {loadingState === "waiting" && "Getting response..."}
                 {loadingState === "processing" && "Processing results..."}
               </p>
             </div>

@@ -4,7 +4,7 @@ import { useEffect, useRef, useState, useCallback } from "react"
 import { useParams } from "next/navigation"
 import { Button } from "@/components/ui/button"
 import { Textarea } from "@/components/ui/textarea"
-import { Send } from "lucide-react"
+import { Send, Basketball } from "lucide-react"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
 import { useAuth } from "@/context/auth-context"
@@ -194,7 +194,7 @@ export default function ChatPage() {
         {isLoading && (
           <div className="flex justify-start">
             <div className="rounded-lg px-4 py-2 bg-muted">
-              <p className="animate-pulse">Analyzing...</p>
+              <Basketball className="h-6 w-6 animate-spin text-primary" />
             </div>
           </div>
         )}

@@ -1,7 +1,6 @@
 flask
 flask-cors
 requests
-psycopg2
 psycopg2-binary
 python-dotenv
 openai

@@ -8,7 +8,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 
 import SinglePlayerStat from "@/components/recharts/SinglePlayerStat"
 import CompareStats from "@/components/recharts/CompareStats"
-import CategoricalBreakdown from "@/components/recharts/CategoricalBreakdown" 
+import CategoricalBreakdown from "@/components/recharts/CategoricalBreakdown"
 import CompareCategoricalBreakdown from "@/components/recharts/CompareCategoricalBreakdown"
 import Leaderboard from "@/components/recharts/Leaderboard"
 
@@ -18,8 +18,8 @@ interface AnalysisResult {
   data: any[]
   config: {
     statKey?: string
-    playerNames?: string[] 
-    playerName?: string   
+    playerNames?: string[]
+    playerName?: string
     xAxisKey?: string
     timeFrame?: string
     statDisplayName?: string
@@ -38,10 +38,13 @@ export default function DashboardsPage() {
 
     setIsLoading(true)
     setError(null)
-    setResult(null) 
+    setResult(null)
 
     try {
-      const response = await fetch("http://127.0.0.1:8000/api/dashboards", {
+      const API_URL =
+        process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"
+
+      const response = await fetch(`${API_URL}/api/dashboards`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ question: searchQuery }),
@@ -50,18 +53,18 @@ export default function DashboardsPage() {
       const data = await response.json()
 
       if (!response.ok || !data.success) {
-        throw new Error(data.error || "Failed to analyze data")
+        throw new Error(data.error || data.detail || "Failed to analyze data")
       }
-      
+
       // makes sure playerNames is always an array for consistency
       if (data.config && data.config.playerName && !data.config.playerNames) {
-        data.config.playerNames = [data.config.playerName];
+        data.config.playerNames = [data.config.playerName]
       }
 
       setResult(data)
     } catch (err: any) {
       console.error(err)
-      setError(err.message || "Was not able to connect to serber")
+      setError(err.message || "Was not able to connect to server")
     } finally {
       setIsLoading(false)
     }
@@ -126,7 +129,7 @@ export default function DashboardsPage() {
                 data={result.data}
                 config={{
                   statDisplayName: result.config.statDisplayName || "Comparison",
-                  xAxisKey: result.config.xAxisKey
+                  xAxisKey: result.config.xAxisKey,
                 }}
               />
             </div>
@@ -145,7 +148,7 @@ export default function DashboardsPage() {
                   data={result.data}
                   config={{
                     playerName: result.config.playerNames?.[0] || "Player",
-                    statDisplayName: "Skill Profile"
+                    statDisplayName: "Skill Profile",
                   }}
                 />
               )}
@@ -159,7 +162,7 @@ export default function DashboardsPage() {
                 data={result.data}
                 config={{
                   statDisplayName: result.config.statDisplayName || "Value",
-                  timeFrame: result.config.timeFrame
+                  timeFrame: result.config.timeFrame,
                 }}
               />
             </div>

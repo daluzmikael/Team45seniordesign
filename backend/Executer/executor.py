@@ -5,7 +5,12 @@ import sqlglot
 from sqlglot import parse_one
 from sqlglot.errors import ParseError
 import json
+import logging
+import os
 
+if not logging.getLogger().hasHandlers():
+    logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 # 2. Connect to PostgreSQL (AWS RDS)
 def get_connection():
     """Get a fresh database connection"""
@@ -21,6 +26,7 @@ def get_connection():
 
 # 3. Read DB schema (for GPT prompt)
 def get_db_schema(conn):
+    logger.debug("Fetching database schema...")
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -51,6 +57,7 @@ def get_db_schema(conn):
 # 4. SQL safety checker
 # replaced the function is_sql_safe()
 def validate_and_normalize_sql(sql_query: str) -> str:
+    logger.debug("Validating SQL:\n%s", sql_query)
     try:
         # parse SQL to ensure validity
         parsed = parse_one(sql_query, read="postgres")
@@ -68,7 +75,7 @@ def validate_and_normalize_sql(sql_query: str) -> str:
 
     # normalize SQL 
     normalized_sql = parsed.sql(dialect="postgres")
-
+    logger.debug("Normalized SQL:\n%s", normalized_sql)
     return normalized_sql
 
 # 5. Add LIMIT automatically
@@ -83,9 +90,14 @@ def limit_rows(sql_query, limit=50):
         return f"SELECT * FROM ({sql_query}) AS combined_results LIMIT {limit};"
 
     sql_query = sql_query.rstrip(";")
-    return f"{sql_query} LIMIT {limit};"
+    final_query = f"{sql_query} LIMIT {limit};"
+
+    logger.debug("SQL after LIMIT enforcement:\n%s", final_query)
+
+    return final_query
 
 def set_query_timeout(conn, timeout_ms=3000):
+    logger.debug("Setting query timeout to %d ms", timeout_ms)
     cursor = conn.cursor()
     cursor.execute(f"SET LOCAL statement_timeout = {timeout_ms};")
 
@@ -100,7 +112,7 @@ def check_query_cost(conn, sql_query, max_cost=100000):
 
     total_cost = explain_json["Plan"]["Total Cost"]
 
-    print(f"[DEBUG] Estimated Query Cost: {total_cost}")
+    logger.info("Estimated Query Cost: %s", total_cost)
 
     if total_cost > max_cost:
         raise ValueError(
@@ -111,15 +123,47 @@ def check_query_cost(conn, sql_query, max_cost=100000):
 
 # Query execution function
 def execute_query(conn, sql_query, max_cost=100000, timeout_ms=3000):
+    logger.info("Executing SQL Query:\n%s", sql_query)
+    table_refs = sorted(
+        set(
+            re.findall(
+                r'(?i)\b(?:from|join)\s+(?:public\.)?"?([a-zA-Z_][a-zA-Z0-9_]*)"?',
+                sql_query or "",
+            )
+        )
+    )
+    if table_refs:
+        logger.info("Source tables referenced: %s", ", ".join(table_refs))
+    
+    # CRITICAL: Clear any previous failed transactions before starting
+    conn.rollback() 
+    
     cursor = conn.cursor()
-    cursor.execute("BEGIN;")
+    try:
+        cursor.execute("BEGIN;") # Start a fresh transaction
+        set_query_timeout(conn, timeout_ms)
 
-    set_query_timeout(conn, timeout_ms)
-    check_query_cost(conn, sql_query, max_cost)
+        # Check cost before running the full query
+        total_cost = check_query_cost(conn, sql_query, max_cost)
+        
+        cursor.execute(sql_query)
+        rows = cursor.fetchall()
+        colnames = [desc[0] for desc in cursor.description]
+        df_result = pd.DataFrame(rows, columns=colnames)
+        
+        conn.commit() # Save changes
+        logger.info(
+            "Query executed successfully | Rows: %d | Cost: %s",
+            len(rows),
+            total_cost
+        )
+        if df_result.empty:
+            logger.info("Query result table: [empty]")
+        else:
+            logger.info("Query result table:\n%s", df_result.to_string(index=False))
+        return df_result
 
-    cursor.execute(sql_query)
-    rows = cursor.fetchall()
-    colnames = [desc[0] for desc in cursor.description]
-
-    conn.commit()
-    return pd.DataFrame(rows, columns=colnames)
+    except Exception as e:
+        conn.rollback() # Ensure we clean up if this attempt fails
+        logger.error("Query execution failed: %s", e)
+        raise

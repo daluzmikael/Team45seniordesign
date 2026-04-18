@@ -27,6 +27,7 @@ Team45seniordesign/
     DashboardBackend/
     Analyzer/
     Executer/
+    Interpreter/
   frontend/
     ai_analyst/             # Next.js app (App Router)
   scrap2/                   # scratch work

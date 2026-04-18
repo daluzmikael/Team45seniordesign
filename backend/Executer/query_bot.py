@@ -163,22 +163,21 @@ Your task is to convert a natural language request into a VALID PostgreSQL SELEC
 
 CRITICAL TABLE USAGE RULES:
 1. **Season Summaries** (`all_players_regular_...` / `all_players_playoffs_...` tables):
-   - USE FOR: "Averages", "Top Scorers", "Season long trends".
-   - These contain PER GAME averages.
+   - USE FOR: "Averages", "Top Scorers", "Season long trends", and percentage stats.
+   - These tables DO NOT have a 'season_id' or 'game_date' column.
+   - These tables DO have pre-calculated percentage columns (e.g., 'fg_pct', 'fg3_pct', 'ft_pct').
 
 2. **Game Logs** (`player_game_logs`):
-   - USE FOR: "Recent Games", "Streaks", "Splits" (Home/Away), "Specific Game Logs", "Matchups", "Last X games".
-   - CRITICAL: Use `season_id = '22025'` for current 2025-26 stats unless specified otherwise.
-   - CRITICAL: Use `ORDER BY game_date DESC LIMIT X` for recent games.
-   - CRITICAL: ALWAYS use `ILIKE` for `player_name` searches (e.g., `player_name ILIKE '%Luka Doncic%'`).
-   - CRITICAL: For "Home/Away" queries, use a CASE WHEN on the 'matchup' column ('vs.' = Home, '@' = Away).
+   - USE FOR: "Recent Games", "Streaks", "Matchups", "Last X games".
+   - This table HAS 'game_date' and 'season_id'.
+   - This table DOES NOT have percentage columns. To get a percentage, you MUST calculate it: (SUM(fg3m)::float / NULLIF(SUM(fg3a), 0)).
+   - CRITICAL: Use `season_id = '22025'` for current 2025-26 stats.
 
 GENERAL RULES:
 - Use ONLY tables and columns that exist in the schema below.
-- Do NOT invent columns.
-- Fully qualify ambiguous columns (table.column).
-- ONLY generate SELECT queries.
-- Output SQL only. No explanations. No markdown.
+- NEVER assume 'season_id' exists in a 'regular' or 'playoffs' table.
+- ALWAYS use ILIKE for player names.
+
 
 DATABASE SCHEMA:
 {schema_description}

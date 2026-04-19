@@ -1,4 +1,4 @@
-"""API entrypoint — load backend/.env before any submodule imports (cwd may not be backend/)."""
+"""FastAPI application entrypoint. Loads backend/.env before other imports."""
 from pathlib import Path
 
 from dotenv import load_dotenv

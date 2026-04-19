@@ -40,7 +40,7 @@ htmlcov/
 .mypy_cache/
 .ruff_cache/
 
-# Cursor / local IDE (optional; safe if teammates use different editors)
+# Local IDE / editor metadata
 .cursor/
 
 # OS junk (extra patterns)

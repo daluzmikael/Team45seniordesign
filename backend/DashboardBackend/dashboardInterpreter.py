@@ -4,22 +4,34 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from openai import OpenAI
 from typing import Dict, List, Any, Tuple, Optional
+from pathlib import Path
+
 from dotenv import load_dotenv
 import re
 
-load_dotenv()
+from sql_postprocess import normalize_game_log_wl_column
+
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 # Setting up OpenAI client
-print("API Key Loaded:", os.getenv("OPENAI_API_KEY"))
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# AWS postgres database info
+# AWS postgres — default database name is `postgres` (override with POSTGRES_DB in .env).
+def _postgres_password() -> str:
+    pw = os.getenv("POSTGRES_PASSWORD")
+    if not pw:
+        raise RuntimeError(
+            "POSTGRES_PASSWORD is not set. Copy backend/.env.example to backend/.env and add credentials."
+        )
+    return pw
+
+
 DB_CONFIG = {
     "host": "nba-sdp-project.cs1c0smw8vqa.us-east-1.rds.amazonaws.com",
     "port": 5432,
-    "dbname": "NBA-STATS",
+    "dbname": os.getenv("POSTGRES_DB", "postgres"),
     "user": "VonLindenthal",
-    "password": "Vlindenthal1!",
-    "sslmode": "require"
+    "password": _postgres_password(),
+    "sslmode": "require",
 }
 
 # Database schema info for GPT
@@ -28,25 +40,14 @@ You have access to a PostgreSQL database on AWS RDS with two types of tables.
 
 1. **Season Summaries** (`all_players_regular_YYYY_YYYY`):
    - **USE FOR:** "Trends" (Year-over-Year), "Career", "Averages", "Top Scorers", "Profiles".
-   - **COLUMNS:** `player_name`, `pts`, `ast`, `reb`, `stl`, `blk`, `gp`, `min` (All are PER GAME averages).
+   - **COLUMNS:** `pts`, `ast`, `reb`, `gp`, `min` (All are PER GAME averages).
    - **CRITICAL:** This table DOES NOT have a 'season' column. You must SELECT it as a string literal (e.g., `'2023-24'`).
-   - **TABLE NAME FORMAT:** `all_players_regular_YYYY_YYYY` where the two years span the season.
-     Examples: 2023-24 season → `all_players_regular_2023_2024`, 2016-17 season → `all_players_regular_2016_2017`.
-   - **DUPLICATE ROWS:** Players traded mid-season may appear multiple times in the same table (once per team). For Leaderboards and profiles, ALWAYS deduplicate by grouping: `GROUP BY player_name` with aggregated stats, or use a subquery with `DISTINCT ON (player_name)` ordered by `gp DESC` to keep the row with the most games played.
 
 2. **Game Logs** (`player_game_logs`):
    - **USE FOR:** "Last 10 games", "Vs Lakers", "March 2024", "Playoffs".
    - **COLUMNS:** `game_date`, `matchup`, `season_type` ('Regular Season' or 'Playoffs').
+   - **Win/Loss:** `wl` is 'W' or 'L' — **never** use a column named `result` (it does not exist).
    - **STATS:** `pts`, `ast`, `reb` are TOTALS for that single game.
-
-3. **Shot Chart Data** (`court_shots`):
-   - **USE FOR:** "Heat map", "Shot chart", "Shot selection", "Shooting zones".
-   - **COLUMNS:** `player_id`, `player_name`, `team_name`, `game_date`, `action_type`, `shot_type`,
-     `shot_zone_basic`, `shot_zone_area`, `shot_zone_range`, `shot_distance`,
-     `loc_x`, `loc_y`, `shot_attempted_flag`, `shot_made_flag`, `htm`, `vtm`, `period`.
-   - **CRITICAL:** Always SELECT at minimum: `loc_x`, `loc_y`, `shot_made_flag`.
-   - Optionally include `shot_attempted_flag`, `action_type`, `shot_type` for filtering.
-   - `htm` = home team, `vtm` = visiting team. To filter vs a team, use: `htm ILIKE '%LAL%' OR vtm ILIKE '%LAL%'`.
 
 IMPORTANT SQL RULES:
 1. **Ordering (CRITICAL)**:
@@ -61,32 +62,16 @@ IMPORTANT SQL RULES:
 3. **Leaderboard Filters**:
    - "Top Scorer" / Averages -> `WHERE gp > 40` (Remove outliers).
    - "Total Points" -> `ORDER BY (pts * gp) DESC`.
-   - **ALWAYS use DISTINCT ON (player_name) or GROUP BY to avoid duplicate rows for traded players.**
 
 4. **Name Matching**:
    - Always use `ILIKE '%First%Last%'` to be safe.
 
-5. **Retired / Historical Players**:
-   - If the user asks about a player with NO specific season and the player may be retired (e.g., Kobe Bryant, Tim Duncan, Kevin Garnett, Manu Ginobili), do NOT just query the latest season table.
-   - Instead, try their most likely peak/final season table. Common examples:
-     * Kobe Bryant → `all_players_regular_2015_2016` (last season)
-     * Tim Duncan → `all_players_regular_2015_2016` (last season)
-     * Kevin Garnett → `all_players_regular_2015_2016` (last season)
-     * Manu Ginobili → `all_players_regular_2017_2018` (last season)
-   - If you are unsure of the exact season, pick a reasonable one from their career. It is better to try a season they likely played than to default to the current season and get no results.
-
 OUTPUT SHAPE RULES (VERY IMPORTANT):
 - Always alias numeric y-values as `stat_value` for line/bar charts.
-- For CompareStats (bar chart), include a player identifier column as `full_name` (or `player_name`) PLUS a time column: `season` OR `game_date`.
-- For SinglePlayerStat (line/area chart), include: `stat_value` and time column: `season` OR `game_date`.
-- **Multi-player trend lines** also use CompareStats. When the user asks for a "trend line" or "trend" for MULTIPLE players over time, use CompareStats — it will show side-by-side bars per season.
-- For Leaderboard, include: `player_name`, optional `team_abbreviation`, and `stat_value`. **Must have exactly one row per player.**
-- For CategoricalBreakdown / CompareCategoricalBreakdown (radar):
-  * ALWAYS include `player_name` in your SELECT (even for single player).
-  * Select raw columns: `pts, ast, reb, stl, blk`.
-  * If comparing across different seasons, include a `season` column as a string literal.
-  * The radar labels will automatically combine player_name + season when season is present.
-- For ShotChart, always select: `loc_x, loc_y, shot_made_flag` from `court_shots`.
+- For CompareStats, include a player identifier column as `full_name` (or `player_name`) PLUS a time column: `season` OR `game_date`.
+- For SinglePlayerStat, include: `stat_value` and time column: `season` OR `game_date`.
+- For Leaderboard, include: `player_name`, optional `team_abbreviation`, and `stat_value`.
+- For CategoricalBreakdown / CompareCategoricalBreakdown (radar), select raw columns: `pts, ast, reb, stl, blk` (can be aliases), plus a `player_name`/`full_name` column for multi-player.
 """
 
 
@@ -96,14 +81,13 @@ def build_system_prompt() -> str:
 
 Return JSON with this structure:
 {{
-  "chartType": "Leaderboard|CategoricalBreakdown|CompareCategoricalBreakdown|SinglePlayerStat|CompareStats|ShotChart",
+  "chartType": "Leaderboard|CategoricalBreakdown|CompareCategoricalBreakdown|SinglePlayerStat|CompareStats",
   "sqlQuery": "SELECT ...",
   "chartConfig": {{
       "statKey": "stat_value",
       "playerNames": [],
       "xAxisKey": "season",
-      "statDisplayName": "Points",
-      "mode": "volume|accuracy|hotspots|coldspots"
+      "statDisplayName": "Points"
   }}
 }}
 
@@ -113,125 +97,46 @@ EXAMPLES:
    - Type: "SinglePlayerStat"
    - SQL: "SELECT * FROM (SELECT '2023-24' as season, fg3_pct as stat_value FROM all_players_regular_2023_2024 WHERE player_name ILIKE '%Steph%Curry%' UNION ALL SELECT '2022-23' as season, fg3_pct as stat_value FROM all_players_regular_2022_2023 WHERE player_name ILIKE '%Steph%Curry%' UNION ALL SELECT '2021-22' as season, fg3_pct as stat_value FROM all_players_regular_2021_2022 WHERE player_name ILIKE '%Steph%Curry%' UNION ALL SELECT '2020-21' as season, fg3_pct as stat_value FROM all_players_regular_2020_2021 WHERE player_name ILIKE '%Steph%Curry%') as career_trend ORDER BY season ASC"
 
-2. **"Compare LeBron and KD points in 2024"** (Comparison — single season bar chart)
+2. **"Compare LeBron and KD points in 2024"** (Comparison)
    - Type: "CompareStats"
    - SQL: "SELECT player_name as full_name, '2023-24' as season, pts as stat_value FROM all_players_regular_2023_2024 WHERE player_name ILIKE '%LeBron%' OR player_name ILIKE '%Durant%'"
 
-3. **"Show me Kyle Kuzma and Stephen Curry points trend from 2019 to 2024"** (Multi-player trend — bar chart over multiple seasons)
-   - Type: "CompareStats"
-   - SQL: "SELECT player_name as full_name, '2019-20' as season, pts as stat_value FROM all_players_regular_2019_2020 WHERE player_name ILIKE '%Kuzma%' OR player_name ILIKE '%Curry%' UNION ALL SELECT player_name as full_name, '2020-21' as season, pts as stat_value FROM all_players_regular_2020_2021 WHERE player_name ILIKE '%Kuzma%' OR player_name ILIKE '%Curry%' UNION ALL SELECT player_name as full_name, '2021-22' as season, pts as stat_value FROM all_players_regular_2021_2022 WHERE player_name ILIKE '%Kuzma%' OR player_name ILIKE '%Curry%' UNION ALL SELECT player_name as full_name, '2022-23' as season, pts as stat_value FROM all_players_regular_2022_2023 WHERE player_name ILIKE '%Kuzma%' OR player_name ILIKE '%Curry%' UNION ALL SELECT player_name as full_name, '2023-24' as season, pts as stat_value FROM all_players_regular_2023_2024 WHERE player_name ILIKE '%Kuzma%' OR player_name ILIKE '%Curry%' ORDER BY season ASC"
-
-4. **"How is Wembanyama performing in his last 10 games?"** (Recent Form)
+3. **"How is Wembanyama performing in his last 10 games?"** (Recent Form)
    - Type: "SinglePlayerStat"
    - SQL: "SELECT * FROM (SELECT game_date, pts as stat_value FROM player_game_logs WHERE player_name ILIKE '%Wembanyama%' ORDER BY game_date DESC LIMIT 10) sub ORDER BY game_date ASC"
    - Config: {{ "xAxisKey": "game_date" }}
 
-5. **"How many points did Curry score vs the Lakers in 2024?"** (Matchup)
+4. **"How many points did Curry score vs the Lakers in 2024?"** (Matchup)
    - Type: "SinglePlayerStat"
    - SQL: "SELECT game_date, pts as stat_value FROM player_game_logs WHERE player_name ILIKE '%Steph%Curry%' AND matchup ILIKE '%LAL%' AND game_date > '2023-10-01' ORDER BY game_date ASC"
    - Config: {{ "xAxisKey": "game_date" }}
 
-6. **"Show me Jimmy Butler's points trend in the 2023 Playoffs"** (Playoffs)
+5. **"Show me Jimmy Butler's points trend in the 2023 Playoffs"** (Playoffs)
    - Type: "SinglePlayerStat"
    - SQL: "SELECT game_date, pts as stat_value FROM player_game_logs WHERE player_name ILIKE '%Jimmy%Butler%' AND season_type = 'Playoffs' AND game_date BETWEEN '2023-04-01' AND '2023-07-01' ORDER BY game_date ASC"
    - Config: {{ "xAxisKey": "game_date" }}
 
-7. **"Who are the top 5 scorers in 2024?"** (Leaderboard Average — deduplicated)
+6. **"Who are the top 5 scorers in 2024?"** (Leaderboard Average)
    - Type: "Leaderboard"
-   - SQL: "SELECT player_name, team_abbreviation, pts as stat_value FROM (SELECT DISTINCT ON (player_name) player_name, team_abbreviation, pts, gp FROM all_players_regular_2023_2024 WHERE gp > 40 ORDER BY player_name, gp DESC) sub ORDER BY stat_value DESC LIMIT 5"
+   - SQL: "SELECT player_name, team_abbreviation, pts as stat_value FROM all_players_regular_2023_2024 WHERE gp > 40 ORDER BY stat_value DESC LIMIT 5"
 
-8. **"Who had the most total assists in 2024?"** (Leaderboard Total — deduplicated)
+7. **"Who had the most total assists in 2024?"** (Leaderboard Total)
    - Type: "Leaderboard"
-   - SQL: "SELECT player_name, team_abbreviation, (ast * gp) as stat_value FROM (SELECT DISTINCT ON (player_name) player_name, team_abbreviation, ast, gp FROM all_players_regular_2023_2024 ORDER BY player_name, gp DESC) sub ORDER BY stat_value DESC LIMIT 10"
+   - SQL: "SELECT player_name, team_abbreviation, (ast * gp) as stat_value FROM all_players_regular_2023_2024 ORDER BY stat_value DESC LIMIT 10"
 
-9. **"Show me the top 10 players with highest apg in 2008"** (Leaderboard — historical, deduplicated)
-   - Type: "Leaderboard"
-   - SQL: "SELECT player_name, team_abbreviation, ast as stat_value FROM (SELECT DISTINCT ON (player_name) player_name, team_abbreviation, ast, gp FROM all_players_regular_2007_2008 ORDER BY player_name, gp DESC) sub ORDER BY stat_value DESC LIMIT 10"
-
-10. **"Show me Luka's skill profile"** (Radar — single player, current/latest season)
+8. **"Show me Luka's skill profile"** (Radar)
    - Type: "CategoricalBreakdown"
-   - SQL: "SELECT player_name, pts, ast, reb, stl, blk FROM (SELECT DISTINCT ON (player_name) player_name, pts, ast, reb, stl, blk, gp FROM all_players_regular_2023_2024 WHERE player_name ILIKE '%Luka%Doncic%' ORDER BY player_name, gp DESC) sub"
+   - SQL: "SELECT pts, ast, reb, stl, blk FROM all_players_regular_2023_2024 WHERE player_name ILIKE '%Luka%Doncic%'"
    - Config: {{ "playerNames": ["Luka Doncic"] }}
 
-11. **"Show me Stephen Curry's skill profile in the 2016-17 season"** (Radar — single player, specific season)
-   - Type: "CategoricalBreakdown"
-   - SQL: "SELECT player_name, '2016-17' as season, pts, ast, reb, stl, blk FROM (SELECT DISTINCT ON (player_name) player_name, pts, ast, reb, stl, blk, gp FROM all_players_regular_2016_2017 WHERE player_name ILIKE '%Stephen%Curry%' ORDER BY player_name, gp DESC) sub"
-   - Config: {{ "playerNames": ["Stephen Curry"], "statDisplayName": "2016-17 Skill Profile" }}
-
-12. **"Show me Kevin Garnett's skill profile"** (Radar — retired player, no year specified)
-   - Type: "CategoricalBreakdown"
-   - SQL: "SELECT player_name, pts, ast, reb, stl, blk FROM (SELECT DISTINCT ON (player_name) player_name, pts, ast, reb, stl, blk, gp FROM all_players_regular_2015_2016 WHERE player_name ILIKE '%Kevin%Garnett%' ORDER BY player_name, gp DESC) sub"
-   - Config: {{ "playerNames": ["Kevin Garnett"], "statDisplayName": "Skill Profile" }}
-
-13. **"Compare Luka vs Shai skill profiles"** (Radar — multi player, same season)
+9. **"Compare Luka vs Shai skill profiles"** (Radar - multi player)
    - Type: "CompareCategoricalBreakdown"
-   - SQL: "SELECT player_name, pts, ast, reb, stl, blk FROM (SELECT DISTINCT ON (player_name) player_name, pts, ast, reb, stl, blk, gp FROM all_players_regular_2023_2024 WHERE player_name ILIKE '%Luka%Doncic%' OR player_name ILIKE '%Shai%Gilgeous%Alexander%' ORDER BY player_name, gp DESC) sub"
+   - SQL: "SELECT player_name, pts, ast, reb, stl, blk FROM all_players_regular_2023_2024 WHERE player_name ILIKE '%Luka%Doncic%' OR player_name ILIKE '%Shai%Gilgeous%Alexander%'"
    - Config: {{ "playerNames": ["Luka Doncic", "Shai Gilgeous-Alexander"] }}
-
-14. **"Compare LeBron's 2012-13 skill profile to Giannis 2020-21 skill profile"** (Radar — cross-season comparison)
-   - Type: "CompareCategoricalBreakdown"
-   - SQL: "SELECT player_name, '2012-13' as season, pts, ast, reb, stl, blk FROM all_players_regular_2012_2013 WHERE player_name ILIKE '%LeBron%James%' UNION ALL SELECT player_name, '2020-21' as season, pts, ast, reb, stl, blk FROM all_players_regular_2020_2021 WHERE player_name ILIKE '%Giannis%Antetokounmpo%'"
-   - Config: {{ "playerNames": ["LeBron James", "Giannis Antetokounmpo"], "statDisplayName": "Cross-Season Comparison" }}
-
-15. **"Compare Curry's 2015-16 profile to his 2023-24 profile"** (Radar — same player, two seasons)
-   - Type: "CompareCategoricalBreakdown"
-   - SQL: "SELECT player_name, '2015-16' as season, pts, ast, reb, stl, blk FROM all_players_regular_2015_2016 WHERE player_name ILIKE '%Stephen%Curry%' UNION ALL SELECT player_name, '2023-24' as season, pts, ast, reb, stl, blk FROM all_players_regular_2023_2024 WHERE player_name ILIKE '%Stephen%Curry%'"
-   - Config: {{ "playerNames": ["Stephen Curry"], "statDisplayName": "Season Comparison" }}
-
-16. **"Show me a heat map of LeBron's shot selection"** (Career Shot Chart)
-   - Type: "ShotChart"
-   - SQL: "SELECT loc_x, loc_y, shot_made_flag FROM court_shots WHERE player_name ILIKE '%LeBron%James%'"
-   - Config: {{ "playerNames": ["LeBron James"], "statDisplayName": "Shot Chart", "mode": "volume" }}
-
-17. **"Show me a heat map of Curry's shots against the Lakers"** (Vs Team)
-   - Type: "ShotChart"
-   - SQL: "SELECT loc_x, loc_y, shot_made_flag FROM court_shots WHERE player_name ILIKE '%Stephen%Curry%' AND (htm ILIKE '%LAL%' OR vtm ILIKE '%LAL%')"
-   - Config: {{ "playerNames": ["Stephen Curry"], "statDisplayName": "Shot Chart vs LAL", "mode": "volume" }}
-
-18. **"Show me a heat map of Curry's 3 point shot selection"** (Filtered by shot type)
-   - Type: "ShotChart"
-   - SQL: "SELECT loc_x, loc_y, shot_made_flag FROM court_shots WHERE player_name ILIKE '%Stephen%Curry%' AND shot_type = '3PT Field Goal'"
-   - Config: {{ "playerNames": ["Stephen Curry"], "statDisplayName": "3PT Shot Chart", "mode": "volume" }}
-
-19. **"Show me Kobe's layups heat map"** (Filtered by zone)
-   - Type: "ShotChart"
-   - SQL: "SELECT loc_x, loc_y, shot_made_flag FROM court_shots WHERE player_name ILIKE '%Kobe%Bryant%' AND shot_zone_basic = 'Restricted Area'"
-   - Config: {{ "playerNames": ["Kobe Bryant"], "statDisplayName": "Layups", "mode": "volume" }}
-
-20. **"Show me LeBron's shooting percentages heat map"** (Accuracy)
-   - Type: "ShotChart"
-   - SQL: "SELECT loc_x, loc_y, shot_made_flag FROM court_shots WHERE player_name ILIKE '%LeBron%James%'"
-   - Config: {{ "playerNames": ["LeBron James"], "statDisplayName": "Shooting Accuracy", "mode": "accuracy" }}
-
-21. **"Show me Curry's best shooting zones"** (Hotspots)
-   - Type: "ShotChart"
-   - SQL: "SELECT loc_x, loc_y, shot_made_flag FROM court_shots WHERE player_name ILIKE '%Stephen%Curry%'"
-   - Config: {{ "playerNames": ["Stephen Curry"], "statDisplayName": "Hot Spots", "mode": "hotspots" }}
-
-22. **"Show me Westbrook's worst shot areas"** (Coldspots)
-   - Type: "ShotChart"
-   - SQL: "SELECT loc_x, loc_y, shot_made_flag FROM court_shots WHERE player_name ILIKE '%Russell%Westbrook%'"
-   - Config: {{ "playerNames": ["Russell Westbrook"], "statDisplayName": "Cold Spots", "mode": "coldspots" }}
-
-23. **"Where does Curry shoot from the most?"** (Volume)
-   - Type: "ShotChart"
-   - SQL: "SELECT loc_x, loc_y, shot_made_flag FROM court_shots WHERE player_name ILIKE '%Stephen%Curry%'"
-   - Config: {{ "playerNames": ["Stephen Curry"], "statDisplayName": "Shot Frequency", "mode": "volume" }}
-
-CRITICAL RULES FOR RADAR CHARTS:
-- ALWAYS include `player_name` in your SELECT — even for single player radars. Without it, multi-player comparisons break.
-- When comparing players from DIFFERENT seasons, use UNION ALL across different season tables and include a `season` string literal column.
-- When comparing the SAME player across seasons, do the same UNION ALL pattern. The season column will be used to distinguish them.
-- The playerNames array in chartConfig should list the player names as they appear in the database.
-- ALWAYS use DISTINCT ON (player_name) to avoid duplicate rows for traded players.
-
-CRITICAL RULES FOR LEADERBOARDS:
-- ALWAYS deduplicate with DISTINCT ON (player_name) ordered by gp DESC inside a subquery.
-- The outer query then sorts by stat_value DESC and applies the LIMIT.
-- This prevents traded players from appearing multiple times.
 """
 
 # Max values for normalizing player stats to 0-100 scale
+# Based on elite NBA performance benchmarks (obv subject to change, but this felt reasonable)
 STAT_BENCHMARKS = {
     "PTS": 35.0,
     "AST": 11.0,
@@ -240,51 +145,8 @@ STAT_BENCHMARKS = {
     "BLK": 2.5
 }
 
-# Column aliases GPT might use instead of the standard short names
-STAT_ALIASES = {
-    "PTS": ["PTS", "POINTS", "PPG"],
-    "AST": ["AST", "ASSISTS", "APG"],
-    "REB": ["REB", "REBOUNDS", "RPG", "TOTAL_REB"],
-    "STL": ["STL", "STEALS", "SPG"],
-    "BLK": ["BLK", "BLOCKS", "BPG"],
-}
-
 def _safe_upper_keys(row: Dict[str, Any]) -> Dict[str, Any]:
     return {str(k).upper(): v for k, v in row.items()}
-
-
-def _find_stat_value(row_upper: Dict[str, Any], category: str) -> float:
-    """Try multiple aliases to find a stat value in the row."""
-    for alias in STAT_ALIASES.get(category, [category]):
-        if alias in row_upper:
-            val = row_upper[alias]
-            try:
-                return float(val or 0)
-            except (ValueError, TypeError):
-                return 0.0
-    return 0.0
-
-
-def _deduplicate_leaderboard(raw_data: List[Dict]) -> List[Dict]:
-    """
-    Safety net: if GPT forgot DISTINCT ON, deduplicate leaderboard data by player_name,
-    keeping the row with the highest gp (or first occurrence if gp not available).
-    """
-    seen: Dict[str, Dict] = {}
-    for row in raw_data:
-        name = (row.get("player_name") or row.get("full_name") or "").strip().lower()
-        if not name:
-            continue
-        if name not in seen:
-            seen[name] = row
-        else:
-            # Keep the row with more games played
-            existing_gp = seen[name].get("gp", 0) or 0
-            new_gp = row.get("gp", 0) or 0
-            if new_gp > existing_gp:
-                seen[name] = row
-    return list(seen.values())
-
 
 def process_comparison_data(raw_data: List[Dict]) -> List[Dict]:
     """
@@ -294,6 +156,7 @@ def process_comparison_data(raw_data: List[Dict]) -> List[Dict]:
     if not raw_data:
         return []
 
+    # Group by time period (season or date)
     seasons: Dict[str, Dict[str, Any]] = {}
     for row in raw_data:
         player = row.get("full_name") or row.get("player_name") or "Unknown"
@@ -304,6 +167,7 @@ def process_comparison_data(raw_data: List[Dict]) -> List[Dict]:
             seasons[season] = {"season": season}
         seasons[season][player] = val
 
+    # Sort chronologically
     return sorted(list(seasons.values()), key=lambda x: x["season"])
 
 
@@ -317,20 +181,13 @@ def process_categorical_data(raw_data: List[Dict], player_count: int) -> List[Di
 
     categories = ["PTS", "AST", "REB", "STL", "BLK"]
 
-    def _build_label(row: Dict) -> str:
-        name = row.get("full_name") or row.get("player_name") or "Unknown"
-        season = row.get("season")
-        if season:
-            return f"{name} ({season})"
-        return name
-
-    # Single player radar (only when 1 row and no cross-season)
-    if player_count <= 1 and len(raw_data) == 1:
-        first_row = raw_data[0]
-        upper = _safe_upper_keys(first_row)
+    # Single player radar
+    if player_count <= 1:
+        first_row = _safe_upper_keys(raw_data[0])
         radar_data: List[Dict[str, Any]] = []
         for cat in categories:
-            raw_val = _find_stat_value(upper, cat)
+            # Find the stat value
+            raw_val = float(first_row.get(cat, 0) or 0)
             max_benchmark = STAT_BENCHMARKS.get(cat, 30)
             normalized = min(100, (raw_val / max_benchmark) * 100) if max_benchmark else 0
             
@@ -341,25 +198,21 @@ def process_categorical_data(raw_data: List[Dict], player_count: int) -> List[Di
             })
         return radar_data
 
-    # Multi player (or multi-season) comparison radar
+    # Multi player comparison radar
     radar_map: Dict[str, Dict[str, Any]] = {cat: {"category": cat} for cat in categories}
-    seen_labels: List[str] = []
-
     for row in raw_data:
-        label = _build_label(row)
+        player = row.get("full_name") or row.get("player_name") or "Unknown"
         upper = _safe_upper_keys(row)
-
-        if label not in seen_labels:
-            seen_labels.append(label)
-
         for cat in categories:
-            raw_val = _find_stat_value(upper, cat)
+            raw_val = float(upper.get(cat, 0) or 0)
             max_benchmark = STAT_BENCHMARKS.get(cat, 30)
             normalized = min(100, (raw_val / max_benchmark) * 100) if max_benchmark else 0
-            radar_map[cat][label] = int(normalized)
+            radar_map[cat][player] = int(normalized)
 
     return list(radar_map.values())
 
+
+# Locking interpreter to known chart types to void error and future mismatches
 
 ALLOWED_CHART_TYPES = {
     "Leaderboard",
@@ -367,17 +220,17 @@ ALLOWED_CHART_TYPES = {
     "CompareCategoricalBreakdown",
     "SinglePlayerStat",
     "CompareStats",
-    "ShotChart",
 }
 
 RADAR_KEYS = {"PTS", "AST", "REB", "STL", "BLK"}
 
 
 def _extract_names_heuristic(q: str) -> List[str]:
+    # This is just for hints; we do NOT depend on it being perfect.
     candidates = re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}\b", q)
+    # Remove common NBA words that are not player names
     blacklist = {"Top", "Show", "Compare", "Vs", "Versus", "Skill", "Profile", "Points", "Assists", "Rebounds",
-                 "Playoffs", "Regular", "Season", "Last", "Games", "Trend", "Leaderboard", "Heat", "Shot", "Chart",
-                 "Map", "Best", "Worst", "Shooting", "Zones", "Selection"}
+                 "Playoffs", "Regular", "Season", "Last", "Games", "Trend", "Leaderboard"}
     cleaned = [c for c in candidates if c not in blacklist]
     seen = set()
     out = []
@@ -392,74 +245,30 @@ def _intent_hint(user_question: str) -> Dict[str, Any]:
     q = user_question.lower()
     hint: Dict[str, Any] = {}
 
-    # Check shot chart FIRST
-    is_shotchart = any(w in q for w in [
-        "heat map", "heatmap", "shot chart", "shot selection", "shot map",
-        "shooting zones", "shot locations", "shot frequency",
-        "shooting percentages", "shooting accuracy"
-    ])
-
-    if is_shotchart:
-        hint["suspectedCompare"] = False
-        hint["suspectedLeaderboard"] = False
-        hint["suspectedProfile"] = False
-        hint["suspectedShotChart"] = True
-        hint["suspectedGameLog"] = False
-        hint["preferredChartType"] = "ShotChart"
-
-        if any(w in q for w in ["best ", "hot spot", "hotspot", "money spot", "most efficient"]):
-            hint["suggestedMode"] = "hotspots"
-        elif any(w in q for w in ["worst ", "cold spot", "coldspot", "struggle", "inefficient"]):
-            hint["suggestedMode"] = "coldspots"
-        elif any(w in q for w in ["percentage", "accuracy", "efficient", "efficiency", "shooting %"]):
-            hint["suggestedMode"] = "accuracy"
-        else:
-            hint["suggestedMode"] = "volume"
-
-        hint["guessedNames"] = _extract_names_heuristic(user_question)[:4]
-        return hint
-
-    # Not a shot chart
+    is_compare = any(w in q for w in [" compare ", " vs ", " versus ", "against "]) or " vs." in q
+    is_leaderboard = any(w in q for w in ["top ", "leaders", "leaderboard", "most ", "rank", "best "])
     is_profile = any(w in q for w in ["skill profile", "profile", "radar", "breakdown", "categories", "categorical"])
-    is_compare = any(w in q for w in [" compare ", " vs ", " versus "]) or " vs." in q
-    is_leaderboard = any(w in q for w in ["top ", "leaders", "leaderboard", "most ", "rank"])
-    is_recent = any(w in q for w in [
-        "last ", "past ", "recent", "game log", "gamelog",
-        "playoffs", "march", "april", "january", "february",
-        "december", "november", "october"
-    ])
+    is_recent = any(w in q for w in ["last ", "past ", "recent", "game log", "gamelog", "vs the", "vs ", "playoffs", "march", "april", "january", "february", "december", "november", "october"])
 
-    # Detect multi-player trend (2+ names + "trend" or year range)
-    guessed_names = _extract_names_heuristic(user_question)[:4]
-    is_multi_player_trend = len(guessed_names) >= 2 and any(w in q for w in ["trend", "from ", " to "])
-
-    if not is_profile and any(w in q for w in ["best "]):
-        is_leaderboard = True
-
-    if any(w in q for w in ["against ", "vs the"]):
-        if is_recent or "game" in q:
-            pass
-        else:
-            is_compare = True
-
-    hint["suspectedCompare"] = is_compare or is_multi_player_trend
+    hint["suspectedCompare"] = is_compare
     hint["suspectedLeaderboard"] = is_leaderboard
     hint["suspectedProfile"] = is_profile
-    hint["suspectedShotChart"] = False
     hint["suspectedGameLog"] = is_recent
 
+    # Prefer profile classification if asked explicitly
     if is_profile and is_compare:
         hint["preferredChartType"] = "CompareCategoricalBreakdown"
     elif is_profile:
         hint["preferredChartType"] = "CategoricalBreakdown"
     elif is_leaderboard:
         hint["preferredChartType"] = "Leaderboard"
-    elif is_compare or is_multi_player_trend:
+    elif is_compare:
         hint["preferredChartType"] = "CompareStats"
     else:
         hint["preferredChartType"] = "SinglePlayerStat"
 
-    hint["guessedNames"] = guessed_names
+    # Names are only a hint
+    hint["guessedNames"] = _extract_names_heuristic(user_question)[:4]
     return hint
 
 
@@ -475,46 +284,30 @@ def _columns_present(raw_data: List[Dict]) -> set:
 def _looks_like_radar(raw_data: List[Dict]) -> bool:
     if not raw_data:
         return False
-    if len(raw_data) > 5:
-        return False
     upper = set(_safe_upper_keys(raw_data[0]).keys())
-    if "STAT_VALUE" in upper:
-        return False
+    # If it has most radar keys, treat as radar
     return len(RADAR_KEYS.intersection(upper)) >= 3
 
 
 def _validate_and_autofix(chart_type: str, raw_data: List[Dict], chart_config: Dict[str, Any]) -> Tuple[bool, str, str]:
+    """
+    Returns (ok, fixed_chart_type, reason).
+    If it's obviously mismatched, we either fix chart_type or mark invalid.
+    """
     if chart_type not in ALLOWED_CHART_TYPES:
         return False, chart_type, f"chartType '{chart_type}' not allowed"
 
     cols = _columns_present(raw_data)
 
-    # ShotChart validation
-    if chart_type == "ShotChart":
-        if "loc_x" in cols and "loc_y" in cols and "shot_made_flag" in cols:
-            return True, chart_type, "ok"
-        return False, chart_type, "ShotChart requires loc_x, loc_y, shot_made_flag columns"
-
-    # Auto-detect shot chart data
-    if "loc_x" in cols and "loc_y" in cols and "shot_made_flag" in cols:
-        return True, "ShotChart", "Auto-corrected to ShotChart based on loc_x/loc_y columns"
-
-    # Radar detection override
+    # Radar detection override (prevents 'leaderboard' charts with pts/ast/reb columns etc.)
     if _looks_like_radar(raw_data):
         player_names = chart_config.get("playerNames", []) or []
-        unique_players = set()
-        for row in raw_data:
-            p = row.get("player_name") or row.get("full_name")
-            if p:
-                unique_players.add(p.strip().lower())
-
-        is_multi = len(unique_players) > 1 or len(raw_data) > 1 or len(player_names) > 1
-        expected = "CompareCategoricalBreakdown" if is_multi else "CategoricalBreakdown"
-
+        expected = "CompareCategoricalBreakdown" if len(player_names) > 1 or len(raw_data) > 1 else "CategoricalBreakdown"
         if chart_type not in {"CategoricalBreakdown", "CompareCategoricalBreakdown"}:
             return True, expected, "Auto-corrected chartType based on radar-shaped SQL output"
+        # If model picked the wrong radar subtype, fix it
         if expected != chart_type:
-            return True, expected, "Auto-corrected radar subtype based on data shape"
+            return True, expected, "Auto-corrected radar subtype based on playerNames/raw rows"
         return True, chart_type, "ok"
 
     # Leaderboard requirements
@@ -528,6 +321,7 @@ def _validate_and_autofix(chart_type: str, raw_data: List[Dict], chart_config: D
         if "stat_value" not in cols:
             return False, chart_type, "SinglePlayerStat requires 'stat_value'"
         if "season" not in cols and "game_date" not in cols:
+            # Sometimes xAxisKey is a custom alias - accept if it exists
             xk = chart_config.get("xAxisKey", "season")
             if xk and str(xk).lower() in cols:
                 return True, chart_type, "ok"
@@ -544,15 +338,8 @@ def _validate_and_autofix(chart_type: str, raw_data: List[Dict], chart_config: D
             return False, chart_type, "CompareStats requires 'full_name' or 'player_name'"
         return True, chart_type, "ok"
 
-    # CategoricalBreakdown requires radar columns
+    # CategoricalBreakdown requires radar columns (handled above by _looks_like_radar)
     if chart_type in {"CategoricalBreakdown", "CompareCategoricalBreakdown"}:
-        if "stat_value" in cols:
-            if ("season" in cols or "game_date" in cols):
-                if "full_name" in cols or "player_name" in cols:
-                    return True, "CompareStats", "Auto-recovered: radar requested but data shaped for CompareStats"
-                return True, "SinglePlayerStat", "Auto-recovered: radar requested but data shaped for SinglePlayerStat"
-            if "player_name" in cols or "full_name" in cols:
-                return True, "Leaderboard", "Auto-recovered: radar requested but data shaped for Leaderboard"
         return False, chart_type, "Radar chart type selected but SQL output does not look like radar stats"
 
     return True, chart_type, "ok"
@@ -561,6 +348,7 @@ def _validate_and_autofix(chart_type: str, raw_data: List[Dict], chart_config: D
 def _call_gpt_for_interpretation(user_question: str, hint: Dict[str, Any], repair_message: Optional[str] = None) -> Dict[str, Any]:
     messages = [{"role": "system", "content": build_system_prompt()}]
 
+    # Provide a small hint message (does not force, just guides)
     messages.append({
         "role": "system",
         "content": f"""Extra hint (not mandatory, but try to follow it if it matches the question):
@@ -568,8 +356,6 @@ def _call_gpt_for_interpretation(user_question: str, hint: Dict[str, Any], repai
 - suspectedCompare: {hint.get('suspectedCompare')}
 - suspectedLeaderboard: {hint.get('suspectedLeaderboard')}
 - suspectedProfile: {hint.get('suspectedProfile')}
-- suspectedShotChart: {hint.get('suspectedShotChart')}
-- suggestedMode: {hint.get('suggestedMode', 'N/A')}
 - guessedNames: {hint.get('guessedNames')}
 
 Still follow the main schema exactly, and only output valid JSON."""
@@ -589,6 +375,7 @@ Still follow the main schema exactly, and only output valid JSON."""
 
     interpretation = json.loads(response.choices[0].message.content)
 
+    # Basic sanitization / defaults
     chart_type = interpretation.get("chartType")
     if chart_type and isinstance(chart_type, str):
         interpretation["chartType"] = chart_type.strip()
@@ -596,6 +383,7 @@ Still follow the main schema exactly, and only output valid JSON."""
     if "chartConfig" not in interpretation or not isinstance(interpretation["chartConfig"], dict):
         interpretation["chartConfig"] = {}
 
+    # Ensure expected keys exist
     interpretation["chartConfig"].setdefault("statKey", "stat_value")
     interpretation["chartConfig"].setdefault("playerNames", [])
     interpretation["chartConfig"].setdefault("xAxisKey", "season")
@@ -605,12 +393,20 @@ Still follow the main schema exactly, and only output valid JSON."""
 
 
 def interpret_question(user_question: str) -> Dict[str, Any]:
+    """
+    Main function that:
+    1. Sends question to GPT to get SQL + chart type
+    2. Runs the SQL query
+    3. Validates + auto-fixes the chart type when possible
+    4. Formats the data for the frontend (with a single automatic retry on schema mismatch)
+    """
     conn = None
     try:
         print(f"Analyzing question: {user_question}")
 
         hint = _intent_hint(user_question)
 
+        # 1) First attempt
         interpretation = _call_gpt_for_interpretation(user_question, hint)
 
         chart_type = interpretation.get("chartType", "")
@@ -620,22 +416,21 @@ def interpret_question(user_question: str) -> Dict[str, Any]:
         print(f"Chart Type: {chart_type}")
         print(f"Generated SQL: {sql_query}")
 
+        sql_query = normalize_game_log_wl_column(sql_query)
+
+        # Connect to database and run the query
         conn = psycopg2.connect(**DB_CONFIG)
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute(sql_query)
             raw_data = cursor.fetchall()
 
-        if not raw_data:
-            return {
-                "success": False,
-                "error": "No data found. The player may not exist in the selected table or time period. Try checking the spelling or adjusting the season/year."
-            }
-
+        # Validate + auto-fix chartType when we can
         ok, fixed_type, reason = _validate_and_autofix(chart_type, raw_data, chart_config)
         if fixed_type != chart_type:
             print(f"[AutoFix] chartType {chart_type} -> {fixed_type} ({reason})")
             chart_type = fixed_type
 
+        # If invalid, do ONE repair attempt (re-ask GPT with concrete failure reason)
         if not ok:
             repair_msg = (
                 "Your previous output caused a schema mismatch when executing the SQL. "
@@ -652,15 +447,11 @@ def interpret_question(user_question: str) -> Dict[str, Any]:
             print(f"[Retry] Chart Type: {chart_type}")
             print(f"[Retry] Generated SQL: {sql_query}")
 
+            sql_query = normalize_game_log_wl_column(sql_query)
+
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute(sql_query)
                 raw_data = cursor.fetchall()
-
-            if not raw_data:
-                return {
-                    "success": False,
-                    "error": "No data found after retry. The player may not exist in the database or the time period is incorrect."
-                }
 
             ok, fixed_type, reason = _validate_and_autofix(chart_type, raw_data, chart_config)
             if fixed_type != chart_type:
@@ -668,47 +459,31 @@ def interpret_question(user_question: str) -> Dict[str, Any]:
                 chart_type = fixed_type
 
             if not ok:
+                # Give up after one retry, but return a structured error
                 return {"success": False, "error": f"Interpreter mismatch after retry: {reason}"}
 
         # Format data based on chart type
         final_data = raw_data
 
-        if chart_type == "Leaderboard":
-            # Safety net: deduplicate even if GPT forgot DISTINCT ON
-            final_data = _deduplicate_leaderboard(raw_data)
-
-        elif chart_type == "CompareStats":
+        if chart_type == "CompareStats":
             final_data = process_comparison_data(raw_data)
-
         elif chart_type in {"CategoricalBreakdown", "CompareCategoricalBreakdown"}:
             player_names = chart_config.get("playerNames", []) or []
-            unique_labels = set()
-            for row in raw_data:
-                name = row.get("player_name") or row.get("full_name") or "Unknown"
-                season = row.get("season")
-                label = f"{name} ({season})" if season else name
-                unique_labels.add(label)
-
-            inferred_count = max(len(unique_labels), len(player_names), len(raw_data))
-
+            # If playerNames missing but SQL returned multiple rows, treat as multi player radar
+            inferred_count = max(len(player_names), len(raw_data))
+            # Normalize chart subtype
             if inferred_count > 1:
                 chart_type = "CompareCategoricalBreakdown"
             else:
                 chart_type = "CategoricalBreakdown"
             final_data = process_categorical_data(raw_data, inferred_count)
 
-        elif chart_type == "ShotChart":
-            final_data = raw_data
-
-        if not final_data:
-            return {
-                "success": False,
-                "error": "Query returned data but it could not be formatted for the requested chart type. Try rephrasing your question."
-            }
-            
+        
+        # For SinglePlayerStat and Leaderboard we keep raw_data (frontend expects it)
+        frontend_chart_type = "CategoricalBreakdown" if chart_type == "CompareCategoricalBreakdown" else chart_type
         return {
             "success": True,
-            "chartType": chart_type,
+            "chartType": frontend_chart_type,
             "data": final_data,
             "config": chart_config,
         }

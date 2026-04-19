@@ -9,27 +9,43 @@ from openai import OpenAI
 import os 
 
 # 1. OpenAI client
+from pathlib import Path
+
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
+from sql_postprocess import normalize_game_log_wl_column
+
 # Setting up OpenAI client
-print("API Key Loaded:", os.getenv("OPENAI_API_KEY"))
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # 2. Connect to PostgreSQL (AWS RDS)
 def get_connection():
     """Get a fresh database connection"""
+    pw = os.getenv("POSTGRES_PASSWORD")
+    if not pw:
+        raise RuntimeError(
+            "POSTGRES_PASSWORD is not set. Copy backend/.env.example to backend/.env and add credentials."
+        )
     return psycopg2.connect(
         host="nba-sdp-project.cs1c0smw8vqa.us-east-1.rds.amazonaws.com",
         port=5432,
-        dbname="NBA-STATS",
+        dbname=os.getenv("POSTGRES_DB", "postgres"),
         user="VonLindenthal",
-        password="Vlindenthal1!",
-        sslmode="require"
+        password=pw,
+        sslmode="require",
     )
 
-conn = get_connection()
-cursor = conn.cursor()
+conn = None
+cursor = None
+
+
+def _ensure_conn():
+    global conn, cursor
+    if conn is None:
+        conn = get_connection()
+        cursor = conn.cursor()
 
 # Analyzer bridge globals
 df_output = None
@@ -39,6 +55,7 @@ user_input = None
 # 3. Read DB schema (for GPT prompt)
 def get_db_schema():
     global conn, cursor
+    _ensure_conn()
     try:
         cursor.execute("""
             SELECT table_name
@@ -211,6 +228,8 @@ Generate the SQL"""
         print(f"[ERROR] Unsafe SQL generated: {sql_query}")
         return None
 
+    sql_query = normalize_game_log_wl_column(sql_query)
+
     # Execution with self query repair loop
     max_attempts = 3
 
@@ -247,6 +266,7 @@ Generate the SQL"""
                 )
 
                 sql_query = limit_rows(sql_query)
+                sql_query = normalize_game_log_wl_column(sql_query)
 
                 if not is_safe_sql(sql_query):
                     print("[ERROR] Repaired SQL is unsafe.")

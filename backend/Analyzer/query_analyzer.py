@@ -272,9 +272,6 @@ DOMAIN_CONFIGS: Dict[str, ScoreConfig] = {
     "rebounding": REBOUNDING_CONFIG,
 }
 
-# Kept for possible future experimentation, but disabled for production chat output.
-ENABLE_COMPOSITE_SCORING = False
-
 
 
 def _minmax(series: pd.Series) -> np.ndarray:
@@ -373,11 +370,12 @@ def _is_simple_top_scorers_question(question: str, domain: str) -> bool:
     if not asks_for_top_list:
         return False
 
-    # Avoid hijacking single-player follow-ups like "what is his best skill".
-    if any(k in q for k in ["best skill", "his best", "her best", "their best", "break down", "profile"]):
+    # This path uses a PPG-only template; only use it for clear scoring leader questions.
+    if domain != "scoring":
         return False
 
-    if domain == "overall_impact":
+    # Avoid hijacking single-player follow-ups like "what is his best skill".
+    if any(k in q for k in ["best skill", "his best", "her best", "their best", "break down", "profile"]):
         return False
 
     leaderboard_entity_markers = [
@@ -852,17 +850,7 @@ def _format_single_player_stats_profile(df: pd.DataFrame, question: str, client:
     gp = _fmt_int(_v(row, "gp"))
     w_pct = _fmt_pct(_v(row, "w_pct"), digits=1)
     mins = _fmt_num(_v(row, "min"), digits=1)
-    season_text = None
-    if "season_label" in working.columns and not _is_missing(_v(row, "season_label")):
-        season_text = str(_v(row, "season_label")) + " season"
-    elif "season_start" in working.columns and not _is_missing(_v(row, "season_start")):
-        try:
-            start = int(float(_v(row, "season_start")))
-            season_text = f"{start}-{str(start + 1)[-2:]} season"
-        except Exception:
-            season_text = None
-    if not season_text:
-        season_text = _extract_season_reference_text(question)
+    season_text = _extract_season_reference_text(question)
 
     heading = f"## **{name}** ({team})"
     if season_text:
@@ -1001,153 +989,6 @@ def _format_single_player_stats_profile(df: pd.DataFrame, question: str, client:
         "Want me to break down his season profile further?",
     ]
     return "\n" + "\n".join(lines)
-
-
-def _is_games_played_question(question: str, df: pd.DataFrame) -> bool:
-    q = (question or "").lower()
-    if "gp" not in df.columns:
-        return False
-    return any(
-        phrase in q
-        for phrase in [
-            "how many games",
-            "games did he play",
-            "games did she play",
-            "games played",
-            "did he play that year",
-            "did she play that year",
-        ]
-    )
-
-
-def _is_concise_single_player_season_lookup_question(question: str, df: pd.DataFrame) -> bool:
-    q = (question or "").lower()
-    asks_year_or_season = any(k in q for k in ["what year", "which year", "what season", "which season"])
-    asks_ordinal = re.search(
-        r"\b(\d{1,2}(st|nd|rd|th)|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+(season|year)\b",
-        q,
-    ) is not None
-    is_comparison = any(k in q for k in ["compare", "versus", " vs ", "better than", "between"])
-    unique_players = df["player_name"].dropna().nunique() if "player_name" in df.columns else 0
-    return (asks_year_or_season or asks_ordinal) and not is_comparison and unique_players <= 1 and len(df) <= 3
-
-
-def _format_games_played_response(df: pd.DataFrame, question: str) -> str:
-    row = df.iloc[0]
-    player = str(row.get("player_name", "He")) if "player_name" in df.columns else "He"
-    gp_raw = row.get("gp", None)
-    season_text = None
-    if "season_label" in df.columns and not pd.isna(row.get("season_label")):
-        season_text = f"{row.get('season_label')} season"
-    elif "season_start" in df.columns and not pd.isna(row.get("season_start")):
-        try:
-            start = int(float(row.get("season_start")))
-            season_text = f"{start}-{str(start + 1)[-2:]} season"
-        except Exception:
-            season_text = None
-    if season_text is None:
-        season_text = _extract_season_reference_text(question)
-
-    try:
-        gp_text = str(int(float(gp_raw))) if gp_raw is not None and not pd.isna(gp_raw) else "N/A"
-    except Exception:
-        gp_text = "N/A"
-
-    if season_text:
-        return f"\n{player} played **{gp_text}** games in the **{season_text}**."
-    return f"\n{player} played **{gp_text}** games."
-
-
-def _format_concise_single_player_season_lookup_response(df: pd.DataFrame, question: str) -> str:
-    row = df.iloc[0]
-    player = str(row.get("player_name", "Player")) if "player_name" in df.columns else "Player"
-    season_text = None
-    if "season_label" in df.columns and not pd.isna(row.get("season_label")):
-        season_text = f"{row.get('season_label')} season"
-    elif "season_start" in df.columns and not pd.isna(row.get("season_start")):
-        try:
-            start = int(float(row.get("season_start")))
-            season_text = f"{start}-{str(start + 1)[-2:]} season"
-        except Exception:
-            season_text = None
-    if season_text is None:
-        season_text = _extract_season_reference_text(question) or "requested season"
-
-    def _num(v: Any, digits: int = 1) -> str:
-        if v is None or pd.isna(v):
-            return "N/A"
-        try:
-            return f"{float(v):.{digits}f}"
-        except Exception:
-            return "N/A"
-
-    def _pct(v: Any) -> str:
-        if v is None or pd.isna(v):
-            return "N/A"
-        try:
-            num = float(v)
-            if 0 <= num <= 1:
-                num *= 100
-            return f"{num:.1f}%"
-        except Exception:
-            return "N/A"
-
-    gp = _num(row.get("gp"), 0)
-    pts = _num(row.get("pts"))
-    reb = _num(row.get("reb"))
-    ast = _num(row.get("ast"))
-    fg = _pct(row.get("fg_pct"))
-
-    def _rank_int(v: Any) -> Optional[int]:
-        if v is None or pd.isna(v):
-            return None
-        try:
-            r = int(float(v))
-            return r if r > 0 else None
-        except Exception:
-            return None
-
-    scorer_rank = _rank_int(row.get("pts_rank"))
-    passer_rank = _rank_int(row.get("ast_rank"))
-    rebound_rank = _rank_int(row.get("reb_rank"))
-
-    strengths: List[str] = []
-    if scorer_rank is not None and scorer_rank <= 15:
-        strengths.append(f"a strong scorer (#{scorer_rank} in points)")
-    if passer_rank is not None and passer_rank <= 20:
-        strengths.append(f"a reliable playmaker (#{passer_rank} in assists)")
-    if rebound_rank is not None and rebound_rank <= 20:
-        strengths.append(f"an impactful rebounder (#{rebound_rank} in rebounds)")
-
-    efficiency_line = ""
-    fg_raw = row.get("fg_pct")
-    try:
-        fg_num = float(fg_raw) if fg_raw is not None and not pd.isna(fg_raw) else None
-    except Exception:
-        fg_num = None
-    if fg_num is not None:
-        if fg_num >= 0.50:
-            efficiency_line = "He scored very efficiently for his volume."
-        elif fg_num >= 0.47:
-            efficiency_line = "He was an efficient scorer overall."
-
-    if strengths:
-        if len(strengths) == 1:
-            profile_line = f"He was {strengths[0]} that season."
-        else:
-            profile_line = f"He was {', '.join(strengths[:-1])}, and {strengths[-1]} that season."
-    else:
-        profile_line = "He had a solid all-around season."
-
-    detail_line = profile_line if not efficiency_line else f"{profile_line} {efficiency_line}"
-
-    return (
-        f"\n{player}'s requested season was **{season_text}**.\n"
-        f"- Games played: **{gp}**\n"
-        f"- Key stats: **{pts} PPG**, **{reb} REB**, **{ast} AST**, **{fg} FG**\n"
-        f"{detail_line}\n\n"
-        "Want me to break his season down further?"
-    )
 
 
 def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
@@ -1357,7 +1198,7 @@ def analyze_dataframe() -> str:
 
     # Skip the scoring/ranking engine entirely if it's just a player's game logs
     score_table: Optional[pd.DataFrame] = None
-    if ENABLE_COMPOSITE_SCORING and not is_game_log:
+    if not is_game_log:
         try:
             cfg = DOMAIN_CONFIGS[domain]
             score_table = compute_scores(df_output, cfg)
@@ -1390,13 +1231,6 @@ def analyze_dataframe() -> str:
     is_simple_top_scorers = _is_simple_top_scorers_question(user_input, domain)
     is_single_player_trend = _is_single_player_season_trend_question(user_input, df_output)
     is_single_player_stats = _is_single_player_stats_question(user_input, df_output)
-    is_games_played_q = _is_games_played_question(user_input, df_output)
-    is_concise_season_lookup = _is_concise_single_player_season_lookup_question(user_input, df_output)
-
-    if is_games_played_q:
-        return _format_games_played_response(df_output, user_input)
-    if is_concise_season_lookup:
-        return _format_concise_single_player_season_lookup_response(df_output, user_input)
 
     if is_single_player_trend:
         trend_text = _format_single_player_season_trend_response(df_output, user_input, client)
@@ -1406,7 +1240,7 @@ def analyze_dataframe() -> str:
         return _format_single_player_stats_profile(df_output, user_input, client)
     elif is_simple_top_scorers:
         return _format_simple_top_scorers_response(df_output, user_input)
-    elif ENABLE_COMPOSITE_SCORING and score_table is not None and not score_table.empty:
+    elif score_table is not None and not score_table.empty:
         score_text = score_table.to_string(index=True)
         system_prompt = (
             "You are an expert NBA analyst providing insightful, narrative-driven analysis.\n\n"
@@ -1512,12 +1346,11 @@ def analyze_question(question: str) -> str:
     domain = infer_domain(question, df.columns.tolist())
 
     score_table: Optional[pd.DataFrame] = None
-    if ENABLE_COMPOSITE_SCORING:
-        try:
-            cfg = DOMAIN_CONFIGS[domain]
-            score_table = compute_scores(df, cfg)
-        except Exception:
-            score_table = None
+    try:
+        cfg = DOMAIN_CONFIGS[domain]
+        score_table = compute_scores(df, cfg)
+    except Exception:
+        score_table = None
 
     is_comparison = len(df) <= 5 and any(
         k in question.lower() for k in ["compare", "better", "versus", "vs", "between", "who"]
@@ -1545,13 +1378,6 @@ def analyze_question(question: str) -> str:
     is_simple_top_scorers = _is_simple_top_scorers_question(question, domain)
     is_single_player_trend = _is_single_player_season_trend_question(question, df)
     is_single_player_stats = _is_single_player_stats_question(question, df)
-    is_games_played_q = _is_games_played_question(question, df)
-    is_concise_season_lookup = _is_concise_single_player_season_lookup_question(question, df)
-
-    if is_games_played_q:
-        return _format_games_played_response(df, question)
-    if is_concise_season_lookup:
-        return _format_concise_single_player_season_lookup_response(df, question)
 
     if is_single_player_trend:
         trend_text = _format_single_player_season_trend_response(df, question, client)
@@ -1561,7 +1387,7 @@ def analyze_question(question: str) -> str:
         return _format_single_player_stats_profile(df, question, client)
     elif is_simple_top_scorers:
         return _format_simple_top_scorers_response(df, question)
-    elif ENABLE_COMPOSITE_SCORING and score_table is not None and not score_table.empty:
+    elif score_table is not None and not score_table.empty:
         score_text = score_table.to_string(index=True)
         system_prompt = (
             "You are an expert NBA analyst providing insightful, narrative-driven analysis.\n\n"
@@ -1653,7 +1479,7 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
 
     # Only run composite scoring for season summary data, not game logs
     score_table: Optional[pd.DataFrame] = None
-    if ENABLE_COMPOSITE_SCORING and not is_game_log:
+    if not is_game_log:
         try:
             cfg = DOMAIN_CONFIGS[domain]
             score_table = compute_scores(df, cfg)
@@ -1684,13 +1510,6 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
     is_simple_top_scorers = _is_simple_top_scorers_question(question, domain)
     is_single_player_trend = _is_single_player_season_trend_question(question, df)
     is_single_player_stats = _is_single_player_stats_question(question, df)
-    is_games_played_q = _is_games_played_question(question, df)
-    is_concise_season_lookup = _is_concise_single_player_season_lookup_question(question, df)
-
-    if is_games_played_q:
-        return _format_games_played_response(df, question)
-    if is_concise_season_lookup:
-        return _format_concise_single_player_season_lookup_response(df, question)
 
     if is_single_player_trend:
         trend_text = _format_single_player_season_trend_response(df, question, client)
@@ -1700,7 +1519,7 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
         return _format_single_player_stats_profile(df, question, client)
     elif is_simple_top_scorers:
         return _format_simple_top_scorers_response(df, question)
-    elif ENABLE_COMPOSITE_SCORING and score_table is not None and not score_table.empty:
+    elif score_table is not None and not score_table.empty:
         score_text = score_table.to_string(index=True)
         system_prompt = (
             "You are an expert NBA analyst providing insightful, narrative-driven analysis.\n\n"

@@ -1,9 +1,11 @@
 import os
 import time
+from pathlib import Path
+
 from dotenv import load_dotenv
 import pyrebase
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 firebase_config = {
     "apiKey": os.getenv("FIREBASE_API_KEY"),

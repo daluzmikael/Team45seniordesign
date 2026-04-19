@@ -59,12 +59,7 @@ export default function ChatPage() {
       const res = await fetch(`${API_URL}/api/analysis`, {
         method: "POST",
         headers,
-        body: JSON.stringify({
-          question: userMessage,
-          conversationId,
-          // Send prior turns so continuation works for both auth and guest chats.
-          history: messages,
-        }),
+        body: JSON.stringify({ question: userMessage, conversationId }),
       })
 
       if (!res.ok) {

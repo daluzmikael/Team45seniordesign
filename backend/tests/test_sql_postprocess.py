@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
+import sys
 import unittest
+from pathlib import Path
+
+# Allow `python -m unittest` from repo root or from backend/
+_backend = Path(__file__).resolve().parent.parent
+if str(_backend) not in sys.path:
+    sys.path.insert(0, str(_backend))
 
 from sql_postprocess import normalize_game_log_wl_column
 

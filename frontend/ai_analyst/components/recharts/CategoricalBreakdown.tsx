@@ -51,7 +51,7 @@ export default function CategoricalBreakdown({ data, config }: CategoricalBreakd
             <ChartTooltip cursor={false} content={<ChartTooltipContent />} />
             <PolarGrid className="fill-[--color-desktop] opacity-100" />
             <PolarAngleAxis dataKey="category" tick={{fontSize: 14 }} />
-            <PolarRadiusAxis angle={30} domain={[0, 'auto']} tick={false} axisLine={false} />
+            <PolarRadiusAxis angle={30} domain={[0, 100]} tick={false} axisLine={false} />
             
             <Radar
               dataKey="value"

@@ -164,13 +164,20 @@ export function AppSidebar() {
     conv.title || `Chat ${conv.conversationId.slice(0, 8)}`
 
   const grouped = groupByDate(conversations)
+  const tabClass =
+    "border-0 bg-red-400 text-zinc-900 hover:bg-red-300 font-medium data-[active=true]:bg-red-400 data-[active=true]:text-zinc-900 data-[active=true]:hover:bg-red-300"
+  const activeTabClass = "bg-red-400 text-zinc-900"
+  const searchClass =
+    "border-0 bg-[#bcc1c9] text-zinc-900 hover:bg-[#aeb4be] dark:bg-[#16171b] dark:text-zinc-100 dark:hover:bg-[#23252b]"
+  const savedChatClass =
+    "border-0 bg-[#bcc1c9] text-zinc-900 hover:bg-[#aeb4be] dark:bg-[#16171b] dark:text-zinc-100 dark:hover:bg-[#23252b] data-[active=true]:bg-[#bcc1c9] data-[active=true]:text-zinc-900 data-[active=true]:hover:bg-[#aeb4be] dark:data-[active=true]:bg-[#16171b] dark:data-[active=true]:text-zinc-100 dark:data-[active=true]:hover:bg-[#23252b]"
 
   return (
-    <Sidebar>
-      <SidebarHeader className="border-b border-sidebar-border p-4">
+    <Sidebar className="[&_[data-sidebar=sidebar]]:bg-[#2f3136] [&_[data-sidebar=sidebar]]:text-zinc-100">
+      <SidebarHeader className="p-2">
         <Button
-          className="w-full justify-start gap-2 bg-transparent"
-          variant="outline"
+          className={`w-full justify-start gap-2 ${tabClass}`}
+          variant="default"
           onClick={handleNewChat}
         >
           <MessageSquarePlus className="h-4 w-4" />
@@ -183,7 +190,7 @@ export function AppSidebar() {
           <SidebarGroupContent>
             <SidebarMenu>
               <SidebarMenuItem>
-                <SidebarMenuButton>
+                <SidebarMenuButton className={searchClass}>
                   <Search className="h-4 w-4" />
                   <span>Search</span>
                 </SidebarMenuButton>
@@ -196,7 +203,7 @@ export function AppSidebar() {
           <SidebarGroupContent>
             <SidebarMenu>
               <SidebarMenuItem>
-                <SidebarMenuButton asChild>
+                <SidebarMenuButton asChild className={tabClass}>
                   <Link href="/dashboards">
                     <LayoutDashboard className="h-4 w-4" />
                     <span>Dashboards</span>
@@ -204,7 +211,7 @@ export function AppSidebar() {
                 </SidebarMenuButton>
               </SidebarMenuItem>
               <SidebarMenuItem>
-                <SidebarMenuButton asChild>
+                <SidebarMenuButton asChild className={tabClass}>
                   <Link href="/">
                     <MessageCircle className="h-4 w-4" />
                     <span>Analyst</span>
@@ -214,8 +221,6 @@ export function AppSidebar() {
             </SidebarMenu>
           </SidebarGroupContent>
         </SidebarGroup>
-
-        <SidebarSeparator />
 
         {loadingHistory && (
           <SidebarGroup>
@@ -245,6 +250,7 @@ export function AppSidebar() {
                     <SidebarMenuButton
                       asChild
                       isActive={activeId === conv.conversationId}
+                      className={savedChatClass}
                     >
                       <Link href={`/chat/${conv.conversationId}`}>
                         <MessageSquarePlus className="h-4 w-4 shrink-0" />
@@ -276,13 +282,13 @@ export function AppSidebar() {
         ))}
       </SidebarContent>
 
-      <SidebarFooter className="border-t border-sidebar-border p-4">
+      <SidebarFooter className="p-4">
         <SidebarMenu>
           <SidebarMenuItem>
             {user ? (
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
-                  <SidebarMenuButton className="w-full">
+                  <SidebarMenuButton className={`w-full ${tabClass}`}>
                     <Avatar className="h-6 w-6">
                       <AvatarFallback className="text-xs">
                         {getInitials(user.email)}
@@ -311,7 +317,7 @@ export function AppSidebar() {
                 </DropdownMenuContent>
               </DropdownMenu>
             ) : (
-              <SidebarMenuButton asChild>
+              <SidebarMenuButton asChild className={tabClass}>
                 <Link href="/login">
                   <LogIn className="h-4 w-4" />
                   <span>Sign In</span>

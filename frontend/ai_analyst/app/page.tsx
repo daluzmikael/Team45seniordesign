@@ -36,7 +36,7 @@ export default function Home() {
           ].map((example) => (
             <div
               key={example}
-              className="rounded-lg border bg-card p-4 hover:bg-accent cursor-pointer transition-colors"
+              className="cursor-pointer rounded-lg border border-red-300 bg-red-400 p-4 text-zinc-900 transition-colors hover:bg-red-300"
               onClick={() => setMessage(example)}
             >
               <p className="text-sm">{example}</p>
@@ -45,8 +45,8 @@ export default function Home() {
         </div>
       </div>
 
-      <div className="border-t bg-background p-4">
-        <div className="flex gap-2 max-w-4xl mx-auto">
+      <div className="border-t border-zinc-500 bg-[#c7cad1] p-4 dark:border-zinc-800 dark:bg-[#1c1d21]">
+        <div className="mx-auto flex max-w-4xl gap-2">
           <Textarea
             value={message}
             onChange={(e) => setMessage(e.target.value)}
@@ -57,15 +57,15 @@ export default function Home() {
               }
             }}
             placeholder="Ask about basketball stats..."
-            className="min-h-[60px] resize-none"
+            className="min-h-[60px] resize-none border-zinc-500 bg-[#c7cad1] text-zinc-900 placeholder:text-zinc-600 dark:border-zinc-700 dark:bg-[#1c1d21] dark:text-zinc-100 dark:placeholder:text-zinc-400"
           />
           <Button
             onClick={() => startChat()}
             size="icon"
-            className="h-[60px] w-[60px]"
+            className="h-[60px] w-[60px] border border-red-300 bg-red-400 text-zinc-900 hover:bg-red-300"
             disabled={!message.trim()}
           >
-            <Send className="h-5 w-5" />
+            <Send className="h-5 w-5 text-zinc-600" />
           </Button>
         </div>
       </div>

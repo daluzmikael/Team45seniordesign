@@ -9,11 +9,12 @@ from openai import OpenAI
 import os 
 
 # 1. OpenAI client
+from pathlib import Path
+
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 # Setting up OpenAI client
-print("API Key Loaded:", os.getenv("OPENAI_API_KEY"))
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # 2. Connect to PostgreSQL (AWS RDS)
@@ -33,8 +34,15 @@ def get_connection():
         sslmode="require",
     )
 
-conn = get_connection()
-cursor = conn.cursor()
+conn = None
+cursor = None
+
+
+def _ensure_conn():
+    global conn, cursor
+    if conn is None:
+        conn = get_connection()
+        cursor = conn.cursor()
 
 # Analyzer bridge globals
 df_output = None
@@ -44,6 +52,7 @@ user_input = None
 # 3. Read DB schema (for GPT prompt)
 def get_db_schema():
     global conn, cursor
+    _ensure_conn()
     try:
         cursor.execute("""
             SELECT table_name

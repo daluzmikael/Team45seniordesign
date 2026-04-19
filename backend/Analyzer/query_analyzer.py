@@ -370,11 +370,12 @@ def _is_simple_top_scorers_question(question: str, domain: str) -> bool:
     if not asks_for_top_list:
         return False
 
-    # Avoid hijacking single-player follow-ups like "what is his best skill".
-    if any(k in q for k in ["best skill", "his best", "her best", "their best", "break down", "profile"]):
+    # This path uses a PPG-only template; only use it for clear scoring leader questions.
+    if domain != "scoring":
         return False
 
-    if domain == "overall_impact":
+    # Avoid hijacking single-player follow-ups like "what is his best skill".
+    if any(k in q for k in ["best skill", "his best", "her best", "their best", "break down", "profile"]):
         return False
 
     leaderboard_entity_markers = [

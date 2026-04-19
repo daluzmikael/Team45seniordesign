@@ -3,3 +3,5 @@ FIREBASE_API_KEY=your-firebase-web-api-key
 
 # Database that contains NBA tables (often `postgres` or a dedicated name like NBA-STATS).
 POSTGRES_DB=postgres
+# Password for RDS user VonLindenthal (same as for: psql -U VonLindenthal -h nba-sdp-project.cs1c0smw8vqa.us-east-1.rds.amazonaws.com -d postgres)
+POSTGRES_PASSWORD=

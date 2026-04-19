@@ -1,3 +1,10 @@
+"""API entrypoint — load backend/.env before any submodule imports (cwd may not be backend/)."""
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
+
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel

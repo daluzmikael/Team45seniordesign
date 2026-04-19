@@ -4,12 +4,13 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 from openai import OpenAI
 from typing import Dict, List, Any, Tuple, Optional
+from pathlib import Path
+
 from dotenv import load_dotenv
 import re
 
-load_dotenv()
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 # Setting up OpenAI client
-print("API Key Loaded:", os.getenv("OPENAI_API_KEY"))
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # AWS postgres — default database name is `postgres` (override with POSTGRES_DB in .env).
@@ -43,6 +44,7 @@ You have access to a PostgreSQL database on AWS RDS with two types of tables.
 2. **Game Logs** (`player_game_logs`):
    - **USE FOR:** "Last 10 games", "Vs Lakers", "March 2024", "Playoffs".
    - **COLUMNS:** `game_date`, `matchup`, `season_type` ('Regular Season' or 'Playoffs').
+   - **Win/Loss:** `wl` is 'W' or 'L' — **never** use a column named `result` (it does not exist).
    - **STATS:** `pts`, `ast`, `reb` are TOTALS for that single game.
 
 IMPORTANT SQL RULES:
@@ -388,6 +390,21 @@ Still follow the main schema exactly, and only output valid JSON."""
     return interpretation
 
 
+def _normalize_game_log_wl_column(sql_query: str) -> str:
+    """
+    player_game_logs uses `wl` for win/loss; models sometimes emit `result`.
+    Only touch queries that reference player_game_logs.
+    """
+    if not sql_query or "player_game_logs" not in sql_query.lower():
+        return sql_query
+    out = sql_query
+    out = re.sub(r"(?i)CASE\s+WHEN\s+result\s*=", "CASE WHEN wl =", out)
+    out = re.sub(r"(?i)\bAND\s+result\s*=", "AND wl =", out)
+    out = re.sub(r"(?i)\bOR\s+result\s*=", "OR wl =", out)
+    out = re.sub(r"(?i)\bWHERE\s+result\s*=", "WHERE wl =", out)
+    return out
+
+
 def interpret_question(user_question: str) -> Dict[str, Any]:
     """
     Main function that:
@@ -411,6 +428,8 @@ def interpret_question(user_question: str) -> Dict[str, Any]:
 
         print(f"Chart Type: {chart_type}")
         print(f"Generated SQL: {sql_query}")
+
+        sql_query = _normalize_game_log_wl_column(sql_query)
 
         # Connect to database and run the query
         conn = psycopg2.connect(**DB_CONFIG)
@@ -440,6 +459,8 @@ def interpret_question(user_question: str) -> Dict[str, Any]:
 
             print(f"[Retry] Chart Type: {chart_type}")
             print(f"[Retry] Generated SQL: {sql_query}")
+
+            sql_query = _normalize_game_log_wl_column(sql_query)
 
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute(sql_query)

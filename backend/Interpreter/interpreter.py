@@ -393,6 +393,204 @@ def _extract_requested_season_window(user_input: str):
     return 2024, 2025, is_playoffs
 
 
+def _all_players_full_row_columns() -> list[str]:
+    return [
+        "player_id", "player_name", "nickname", "team_id", "team_abbreviation", "age", "gp", "w", "l", "w_pct",
+        "min", "fgm", "fga", "fg_pct", "fg3m", "fg3a", "fg3_pct", "ftm", "fta", "ft_pct",
+        "oreb", "dreb", "reb", "ast", "tov", "stl", "blk", "blka", "pf", "pfd", "pts", "plus_minus",
+        "gp_rank", "w_rank", "l_rank", "w_pct_rank", "min_rank", "fgm_rank", "fga_rank", "fg_pct_rank",
+        "fg3m_rank", "fg3a_rank", "fg3_pct_rank", "ftm_rank", "fta_rank", "ft_pct_rank", "oreb_rank",
+        "dreb_rank", "reb_rank", "ast_rank", "tov_rank", "stl_rank", "blk_rank", "blka_rank", "pf_rank",
+        "pfd_rank", "pts_rank", "plus_minus_rank", "dd2", "td3", "dd2_rank", "td3_rank", "team_count",
+    ]
+
+
+_PLAYER_ALIAS_MAP = {
+    "steph": ["Stephen Curry", "Steph Curry"],
+    "steph curry": ["Stephen Curry", "Steph Curry"],
+    "bron": ["LeBron James"],
+    "king james": ["LeBron James"],
+    "greek freak": ["Giannis Antetokounmpo", "Giannis"],
+    "kd": ["Kevin Durant"],
+    "ad": ["Anthony Davis"],
+    "kawhi": ["Kawhi Leonard"],
+    "cp3": ["Chris Paul"],
+    "dame": ["Damian Lillard"],
+    "russ": ["Russell Westbrook"],
+    "pg": ["Paul George"],
+    "pg13": ["Paul George"],
+}
+
+
+def _normalize_player_candidate(raw: str) -> str:
+    candidate = (raw or "").strip()
+    candidate = re.sub(
+        r"(?i)^(than|and|vs|versus|between|to|from|was|is|are|were|whether|who|what|show|me|did|does|do)\s+",
+        "",
+        candidate,
+    ).strip()
+    candidate = re.sub(r"(?i)\b(in|during|for|from|through|thru|to|over|by|per|the|playoffs?|postseason)\b.*$", "", candidate).strip()
+    candidate = candidate.strip(" ,.;:!?")
+    if not candidate:
+        return ""
+    parts = [p for p in candidate.split() if p]
+    if parts:
+        last = parts[-1]
+        if last.lower().endswith("s") and last.lower() not in {"james"} and len(last) > 3:
+            parts[-1] = last[:-1]
+    return " ".join(parts).strip()
+
+
+def _extract_player_names_from_question(question_text: str) -> list[str]:
+    q = (question_text or "").strip()
+    if not q:
+        return []
+
+    names: list[str] = []
+    lower_q = q.lower()
+    for alias, expanded in _PLAYER_ALIAS_MAP.items():
+        if re.search(rf"(?i)\b{re.escape(alias)}\b", q):
+            names.extend(expanded)
+
+    possessive_pattern = re.compile(
+        r"(?i)\b([A-Za-z][A-Za-z\.\-]*(?:\s+[A-Za-z][A-Za-z\.\-]*){0,2})(?:['’]s)\b"
+    )
+    for match in possessive_pattern.finditer(q):
+        candidate = _normalize_player_candidate(match.group(1))
+        if candidate:
+            names.append(candidate)
+
+    pair_patterns = [
+        re.compile(r"(?i)\bcompare\s+(.+?)\s+(?:and|vs|versus)\s+(.+?)(?:\bfrom\b|\bin\b|\bduring\b|$)"),
+        re.compile(r"(?i)\bbetween\s+(.+?)\s+and\s+(.+?)(?:\bfrom\b|\bin\b|\bduring\b|$)"),
+        re.compile(r"(?i)\b(.+?)\s+\bthan\b\s+(.+?)(?:\bfrom\b|\bin\b|\bduring\b|$)"),
+    ]
+    for pattern in pair_patterns:
+        match = pattern.search(q)
+        if not match:
+            continue
+        for idx in (1, 2):
+            candidate = _normalize_player_candidate(match.group(idx))
+            if candidate:
+                names.append(candidate)
+
+    capitalized_pattern = re.compile(r"\b([A-Z][a-zA-Z\.\-]+(?:\s+[A-Z][a-zA-Z\.\-]+){1,2})\b")
+    for match in capitalized_pattern.finditer(q):
+        candidate = _normalize_player_candidate(match.group(1))
+        if candidate:
+            names.append(candidate)
+
+    if not names and re.search(r"(?i)\b(player|players)\b", lower_q):
+        return []
+
+    deduped: list[str] = []
+    seen = set()
+    for name in names:
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(name)
+    return deduped
+
+
+def _extract_player_names_from_sql(sql_query: str) -> list[str]:
+    q = sql_query or ""
+    matches = [
+        m.strip()
+        for m in re.findall(r"(?i)player_name\s+ILIKE\s+'%([^%']+)%'", q)
+        if m and m.strip()
+    ]
+    if not matches:
+        return []
+
+    multi_word = [m for m in matches if " " in m.strip()]
+    preferred = multi_word if multi_word else matches
+
+    deduped: list[str] = []
+    seen = set()
+    for name in preferred:
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(name)
+    return deduped
+
+
+def _extract_named_players(user_input: str, sql_query: str) -> list[str]:
+    question_text = _extract_current_question_text(user_input)
+    names = _extract_player_names_from_question(question_text)
+    if not names:
+        names = _extract_player_names_from_sql(sql_query)
+    return names
+
+
+def _player_where_clause_for_names(player_names: list[str]) -> str:
+    clauses: list[str] = []
+    for raw_name in player_names:
+        variants = _PLAYER_ALIAS_MAP.get(raw_name.lower(), [raw_name])
+        expanded_variants = []
+        for variant in variants:
+            if variant not in expanded_variants:
+                expanded_variants.append(variant)
+        subclauses = []
+        for variant in expanded_variants:
+            safe_name = variant.replace("'", "''")
+            subclauses.append(f"player_name ILIKE '%{safe_name}%'")
+        if subclauses:
+            clauses.append("(" + " OR ".join(subclauses) + ")")
+    return " OR ".join(clauses)
+
+
+def _extract_requested_season_start_span(user_input: str):
+    q = _extract_current_question_text(user_input).lower()
+    is_playoffs = ("playoff" in q) or ("postseason" in q)
+
+    explicit_range = re.search(
+        r"\b(19\d{2}|20\d{2})(?:\s+season)?\s*(?:to|through|thru|-)\s*(19\d{2}|20\d{2})(?:\s+season)?\b",
+        q,
+    )
+    if explicit_range:
+        start = int(explicit_range.group(1))
+        end = int(explicit_range.group(2))
+        if start > end:
+            start, end = end, start
+        return start, end, is_playoffs
+
+    prefixed_range = re.search(r"\bfrom\b\s*(19\d{2}|20\d{2})\b.+?\bto\b\s*(19\d{2}|20\d{2})\b", q)
+    if prefixed_range:
+        start = int(prefixed_range.group(1))
+        end = int(prefixed_range.group(2))
+        if start > end:
+            start, end = end, start
+        return start, end, is_playoffs
+
+    decade_match = re.search(r"\b(19\d{2}|20\d{2})s\b", q)
+    if decade_match:
+        start = int(decade_match.group(1))
+        return start, start + 9, is_playoffs
+
+    season_label_match = re.search(r"\b(19\d{2}|20\d{2})\s*[-/]\s*(\d{2})\b", q)
+    if season_label_match:
+        start = int(season_label_match.group(1))
+        return start, start, is_playoffs
+
+    bare = _extract_bare_year_request(user_input)
+    if bare is not None:
+        year, playoffs_flag = bare
+        if playoffs_flag:
+            return year - 1, year - 1, True
+        return year, year, False
+
+    if any(k in q for k in ["this season", "current season", "last season", "this playoff", "current playoff", "last playoff"]):
+        start, end, playoffs_flag = _extract_requested_season_window(user_input)
+        mapped_start = start if not playoffs_flag else start
+        return mapped_start, mapped_start, playoffs_flag
+
+    return None
+
+
 def _advanced_table_name_for_window(start: int, end: int, is_playoffs: bool) -> str:
     yy = str(end)[-2:]
     if is_playoffs:
@@ -569,11 +767,11 @@ def _is_explicit_total_request(question_text: str) -> bool:
     return any(t in q for t in total_terms)
 
 
-def _rewrite_career_aggregate_to_by_season(sql_query: str, user_input: str) -> str:
+def _rewrite_career_aggregate_to_by_season(sql_query: str, user_input: str, conn=None) -> str:
     question_text = _extract_current_question_text(user_input)
-    if _extract_requested_nth_season(question_text):
-        return sql_query
     q_input = question_text.lower()
+    nth_request = _extract_requested_nth_season(question_text)
+    rookie_year_request = "rookie year" in q_input
     asks_over_time = _is_over_time_request(question_text)
     mentions_career = re.search(r"\bcaree+r\b", q_input) is not None
     wants_total = _is_explicit_total_request(question_text)
@@ -585,22 +783,87 @@ def _rewrite_career_aggregate_to_by_season(sql_query: str, user_input: str) -> s
         asks_over_time = True
     if has_union_sum_rollup and not wants_total:
         asks_over_time = True
-    if not asks_over_time:
+
+    named_players = _extract_named_players(user_input, q)
+    requested_span = _extract_requested_season_start_span(user_input)
+    asks_full_row_player_slice = bool(named_players) and (
+        requested_span is not None or nth_request is not None or rookie_year_request
+    )
+    if not asks_over_time and not asks_full_row_player_slice:
         return sql_query
 
     if "all_players_regular_" not in q_lower and "all_players_playoffs_" not in q_lower:
         return q
 
+    table_type = "playoffs" if (("playoff" in q_input) or ("postseason" in q_input) or ("all_players_playoffs_" in q_lower)) else "regular"
+
     # Build from detected season tables directly (no SUM/COUNT) for stable season-trend output.
     table_matches = re.findall(r"(?i)\b(all_players_(?:regular|playoffs)_(\d{4})_(\d{4}))\b", q)
     if not table_matches:
-        return q
+        table_matches = []
     unique_tables: dict[str, tuple[int, int]] = {}
     for table_name, start_s, end_s in table_matches:
         try:
             unique_tables[table_name] = (int(start_s), int(end_s))
         except Exception:
             continue
+    if named_players:
+        full_cols = _all_players_full_row_columns()
+        col_sql = ", ".join(full_cols)
+        available_starts = _available_season_starts(conn, table_type) if conn is not None else []
+        legs = []
+
+        for player_name in named_players:
+            player_where = _player_where_clause_for_names([player_name])
+            if not player_where:
+                continue
+
+            season_starts: list[int] = []
+            if nth_request is not None and conn is not None:
+                first_start = _first_season_start_for_where(conn, table_type, player_where, available_starts)
+                if first_start is not None:
+                    target_start = first_start + (nth_request - 1)
+                    if not available_starts or target_start in available_starts:
+                        season_starts = [target_start]
+            elif rookie_year_request and conn is not None:
+                first_start = _first_season_start_for_where(conn, table_type, player_where, available_starts)
+                if first_start is not None:
+                    if requested_span is not None:
+                        _, end_year, span_playoffs = requested_span
+                        table_type = "playoffs" if span_playoffs else table_type
+                        season_starts = [
+                            season_start
+                            for season_start in range(first_start, end_year + 1)
+                            if not available_starts or season_start in available_starts
+                        ]
+                    else:
+                        season_starts = [first_start]
+            elif requested_span is not None:
+                start_year, end_year, span_playoffs = requested_span
+                table_type = "playoffs" if span_playoffs else table_type
+                season_starts = [
+                    season_start
+                    for season_start in range(start_year, end_year + 1)
+                    if not available_starts or season_start in available_starts
+                ]
+            elif unique_tables:
+                season_starts = sorted({start for start, _ in unique_tables.values()})
+
+            for start in season_starts:
+                end = start + 1
+                table_name = f"all_players_{table_type}_{start}_{end}"
+                season_label = f"{start}-{str(end)[-2:]}"
+                legs.append(
+                    f"SELECT {start} AS season_start, '{season_label}' AS season_label, "
+                    f"{col_sql} FROM {table_name} WHERE {player_where}"
+                )
+
+        if legs:
+            return (
+                "SELECT DISTINCT season_start, season_label, "
+                f"{col_sql} FROM ({' UNION ALL '.join(legs)}) AS by_season LIMIT 500;"
+            )
+
     if not unique_tables:
         return q
 
@@ -626,13 +889,10 @@ def _rewrite_career_aggregate_to_by_season(sql_query: str, user_input: str) -> s
             f"player_name, {col_sql} FROM {table_name} WHERE {where_clause}"
         )
 
-    # For trend slices, always return enough seasons for analyzer to reason over period.
-    limit = 50
-
     rebuilt = (
         f"SELECT DISTINCT season_start, season_label, player_name, {col_sql} "
         f"FROM ({' UNION ALL '.join(legs)}) AS by_season "
-        f"ORDER BY season_start ASC LIMIT {limit};"
+        f"ORDER BY season_start ASC LIMIT 50;"
     )
     return rebuilt
 
@@ -705,15 +965,7 @@ def _ensure_all_players_broad_columns(sql_query: str, user_input: str) -> str:
         return q
     select_part = select_match.group("select_part")
     start, end = select_match.span("select_part")
-    required_columns = [
-        "player_id", "player_name", "nickname", "team_id", "team_abbreviation", "age", "gp", "w", "l", "w_pct",
-        "min", "fgm", "fga", "fg_pct", "fg3m", "fg3a", "fg3_pct", "ftm", "fta", "ft_pct",
-        "oreb", "dreb", "reb", "ast", "tov", "stl", "blk", "blka", "pf", "pfd", "pts", "plus_minus",
-        "gp_rank", "w_rank", "l_rank", "w_pct_rank", "min_rank", "fgm_rank", "fga_rank", "fg_pct_rank",
-        "fg3m_rank", "fg3a_rank", "fg3_pct_rank", "ftm_rank", "fta_rank", "ft_pct_rank", "oreb_rank",
-        "dreb_rank", "reb_rank", "ast_rank", "tov_rank", "stl_rank", "blk_rank", "blka_rank", "pf_rank",
-        "pfd_rank", "pts_rank", "plus_minus_rank", "dd2", "td3", "dd2_rank", "td3_rank", "team_count",
-    ]
+    required_columns = _all_players_full_row_columns()
     missing = [c for c in required_columns if not re.search(rf"(?i)\b{re.escape(c)}\b", select_part)]
     if not missing:
         return q
@@ -1565,7 +1817,7 @@ Generate the SQL:"""
     sql_query = _enforce_nth_season_table_mapping(sql_query, user_input_param, conn)
     sql_query = _rewrite_nth_season_comparison_sql(sql_query, user_input_param, conn)
     sql_query = _enforce_advanced_table_mapping(sql_query, user_input_param, schema_description)
-    sql_query = _rewrite_career_aggregate_to_by_season(sql_query, user_input_param)
+    sql_query = _rewrite_career_aggregate_to_by_season(sql_query, user_input_param, conn)
     sql_query = _ensure_rebounding_leaderboard_columns(sql_query, user_input_param)
     sql_query = _ensure_assist_leaderboard_columns(sql_query, user_input_param)
     sql_query = _ensure_all_players_broad_columns(sql_query, user_input_param)
@@ -1627,7 +1879,7 @@ Generate the SQL:"""
                 sql_query = _enforce_nth_season_table_mapping(sql_query, user_input_param, conn)
                 sql_query = _rewrite_nth_season_comparison_sql(sql_query, user_input_param, conn)
                 sql_query = _enforce_advanced_table_mapping(sql_query, user_input_param, schema_description)
-                sql_query = _rewrite_career_aggregate_to_by_season(sql_query, user_input_param)
+                sql_query = _rewrite_career_aggregate_to_by_season(sql_query, user_input_param, conn)
                 sql_query = _ensure_rebounding_leaderboard_columns(sql_query, user_input_param)
                 sql_query = _ensure_assist_leaderboard_columns(sql_query, user_input_param)
                 sql_query = _ensure_all_players_broad_columns(sql_query, user_input_param)

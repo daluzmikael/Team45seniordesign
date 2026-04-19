@@ -591,6 +591,11 @@ def _format_single_player_season_trend_response(df: pd.DataFrame, question: str,
     q = (question or "").lower()
     working = df.copy()
     player_name = str(working.iloc[0].get("player_name", "N/A")) if not working.empty else "N/A"
+    try:
+        unique_players = working["player_name"].dropna().astype(str).str.strip().unique().tolist()
+    except Exception:
+        unique_players = [player_name] if player_name != "N/A" else []
+    is_multi_player = len(unique_players) > 1
 
     season_col = None
     for cand in ["season_label", "season", "season_year", "season_start", "season_id"]:
@@ -653,9 +658,14 @@ def _format_single_player_season_trend_response(df: pd.DataFrame, question: str,
     if not available:
         return ""
 
-    header = "| Season | " + " | ".join(label for label, _ in available) + " |"
-    divider = "|---|" + "|".join(["---:" for _ in available]) + "|"
-    lines = [f"## **{player_name}**", "", header, divider]
+    if is_multi_player:
+        header = "| Player | Season | " + " | ".join(label for label, _ in available) + " |"
+        divider = "|---|---|" + "|".join(["---:" for _ in available]) + "|"
+        lines = ["## **Season-by-Season Results**", "", header, divider]
+    else:
+        header = "| Season | " + " | ".join(label for label, _ in available) + " |"
+        divider = "|---|" + "|".join(["---:" for _ in available]) + "|"
+        lines = [f"## **{player_name}**", "", header, divider]
 
     for _, row in working.iterrows():
         season_text = str(row.get(season_col, "N/A"))
@@ -665,7 +675,11 @@ def _format_single_player_season_trend_response(df: pd.DataFrame, question: str,
                 vals.append(_fmt_pct(row.get(col)))
             else:
                 vals.append(_fmt_num(row.get(col)))
-        lines.append("| " + season_text + " | " + " | ".join(vals) + " |")
+        if is_multi_player:
+            row_player = str(row.get("player_name", "N/A"))
+            lines.append("| " + row_player + " | " + season_text + " | " + " | ".join(vals) + " |")
+        else:
+            lines.append("| " + season_text + " | " + " | ".join(vals) + " |")
 
     if client is not None:
         try:
@@ -674,7 +688,7 @@ def _format_single_player_season_trend_response(df: pd.DataFrame, question: str,
                 model="gpt-4o-mini",
                 messages=[
                     {"role": "system", "content": "Write 2 concise sentences summarizing the trend in these season-by-season stats. Use plain language and include at least one concrete stat reference."},
-                    {"role": "user", "content": f"Question: {question}\nPlayer: {player_name}\nSeason rows: {sample}"},
+                    {"role": "user", "content": f"Question: {question}\nPlayers: {unique_players or [player_name]}\nSeason rows: {sample}"},
                 ],
                 temperature=0.2,
                 max_tokens=140,
@@ -724,7 +738,10 @@ def _format_single_player_season_trend_response(df: pd.DataFrame, question: str,
                 summary = f"His peak {metric_label} season in this span was {peak_season} at {peak_val}."
 
     if not summary:
-        summary = "This table shows the season-by-season trend so you can see how his production and efficiency changed over time."
+        if is_multi_player:
+            summary = "This table shows the season-by-season rows for each player in the requested span so you can compare their production over time."
+        else:
+            summary = "This table shows the season-by-season trend so you can see how his production and efficiency changed over time."
 
     lines.extend(["", summary, "", "Want me to break down any specific season further?"])
     return "\n" + "\n".join(lines)

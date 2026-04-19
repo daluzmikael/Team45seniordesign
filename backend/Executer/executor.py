@@ -11,6 +11,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+from sql_postprocess import normalize_game_log_wl_column
+
 load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 if not logging.getLogger().hasHandlers():
@@ -399,6 +401,7 @@ def check_query_cost(conn, sql_query, max_cost=100000):
 
 # Query execution function
 def execute_query(conn, sql_query, max_cost=100000, timeout_ms=3000):
+    sql_query = normalize_game_log_wl_column(sql_query)
     sql_query = _normalize_advanced_column_case(sql_query)
     sql_query = _normalize_team_id_abbrev_to_numeric(sql_query)
     sql_query = _normalize_team_advanced_and_standings_case(sql_query)

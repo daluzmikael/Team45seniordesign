@@ -12,8 +12,6 @@ import CategoricalBreakdown from "@/components/recharts/CategoricalBreakdown"
 import CompareCategoricalBreakdown from "@/components/recharts/CompareCategoricalBreakdown"
 import Leaderboard from "@/components/recharts/Leaderboard"
 
-import ShotChart from "@/components/recharts/ShotChart"
-
 interface AnalysisResult {
   success: boolean
   chartType: string
@@ -25,7 +23,6 @@ interface AnalysisResult {
     xAxisKey?: string
     timeFrame?: string
     statDisplayName?: string
-    mode?: "volume" | "accuracy" | "hotspots" | "coldspots"  // for shot chart
   }
   error?: string
 }
@@ -139,7 +136,7 @@ export default function DashboardsPage() {
           )}
 
           {/* Skill Profile (Radar chart) */}
-          {(result.chartType === "CategoricalBreakdown" || result.chartType === "CompareCategoricalBreakdown") && (
+          {result.chartType === "CategoricalBreakdown" && (
             <div className="border rounded-xl p-6 bg-card shadow-sm w-full max-w-lg mx-auto">
               {result.config.playerNames && result.config.playerNames.length > 1 ? (
                 <CompareCategoricalBreakdown
@@ -166,21 +163,6 @@ export default function DashboardsPage() {
                 config={{
                   statDisplayName: result.config.statDisplayName || "Value",
                   timeFrame: result.config.timeFrame,
-                }}
-              />
-            </div>
-          )}
-
-          {/* Shot Chart Heat Map */}
-          {result.chartType === "ShotChart" && (
-            <div className="border rounded-xl p-6 bg-card shadow-sm">
-              <ShotChart
-                data={result.data}
-                config={{
-                  playerName: result.config.playerNames?.[0] || "Player",
-                  statDisplayName: result.config.statDisplayName || "Shot Chart",
-                  timeFrame: result.config.timeFrame,
-                  mode: (result.config as any).mode || "volume",
                 }}
               />
             </div>

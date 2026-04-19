@@ -1,1 +1,5 @@
-OPENAI_API_KEY=OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxx
+OPENAI_API_KEY=sk-xxxxxxxxxxxxxxxxxxxxxxxx
+FIREBASE_API_KEY=your-firebase-web-api-key
+
+# Database that contains NBA tables (often `postgres` or a dedicated name like NBA-STATS).
+POSTGRES_DB=postgres

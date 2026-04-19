@@ -19,13 +19,18 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 # 2. Connect to PostgreSQL (AWS RDS)
 def get_connection():
     """Get a fresh database connection"""
+    pw = os.getenv("POSTGRES_PASSWORD")
+    if not pw:
+        raise RuntimeError(
+            "POSTGRES_PASSWORD is not set. Copy backend/.env.example to backend/.env and add credentials."
+        )
     return psycopg2.connect(
         host="nba-sdp-project.cs1c0smw8vqa.us-east-1.rds.amazonaws.com",
         port=5432,
-        dbname="NBA-STATS",
+        dbname=os.getenv("POSTGRES_DB", "postgres"),
         user="VonLindenthal",
-        password="Vlindenthal1!",
-        sslmode="require"
+        password=pw,
+        sslmode="require",
     )
 
 conn = get_connection()

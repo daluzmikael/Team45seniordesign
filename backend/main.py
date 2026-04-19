@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import os
+import logging
 from DashboardBackend.dashboardInterpreter import interpret_question
 from Analyzer.query_analyzer import analyze_question_with_data
 from auth import (
@@ -13,12 +14,31 @@ from auth import (
     get_conversation_messages,
     list_conversations,
 )
-from Interpreter.interpreter import run_query, debug_query_routing
+from Interpreter.interpreter import natural_language_to_sql, debug_query_routing
 import numpy as np
 import pandas as pd
 import re
 
 app = FastAPI()
+_log = logging.getLogger(__name__)
+
+
+@app.on_event("startup")
+def startup_log_postgres_database():
+    """Confirm which database the API uses (see POSTGRES_DB in .env)."""
+    try:
+        from Executer.executor import get_connection
+
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT current_database();")
+        name = cur.fetchone()[0]
+        cur.close()
+        conn.close()
+        _log.info("PostgreSQL: connected to database %r (POSTGRES_DB in .env)", name)
+    except Exception as exc:
+        _log.warning("PostgreSQL startup check failed: %s", exc)
+
 
 @app.get("/")
 async def root():
@@ -35,7 +55,6 @@ app.add_middleware(
 class QueryRequest(BaseModel):
     question: str
     conversationId: Optional[str] = None
-    history: Optional[List[Dict[str, Any]]] = None
 
 class AuthRequest(BaseModel):
     email: str
@@ -107,45 +126,6 @@ def _build_contextual_question(
     )
 
 
-def _is_affirmative_followup(question: str) -> bool:
-    q = (question or "").strip().lower()
-    return q in {"yes", "yeah", "yep", "yup", "sure", "ok", "okay", "do it", "go ahead"}
-
-
-def _extract_latest_player_and_season_from_history(
-    history_messages: List[Dict[str, Any]]
-) -> tuple[Optional[str], Optional[str]]:
-    player: Optional[str] = None
-    season: Optional[str] = None
-    season_pattern = re.compile(r"\b((?:19|20)\d{2}-\d{2})\s+season\b", re.IGNORECASE)
-    requested_pattern = re.compile(r"([A-Za-z][A-Za-z\.\- ]+?)'s requested season was", re.IGNORECASE)
-    heading_pattern = re.compile(r"\*\*([A-Za-z][A-Za-z\.\- ]+)\*\*")
-
-    for msg in reversed(history_messages or []):
-        content = str(msg.get("content", "")).strip()
-        if not content:
-            continue
-
-        if season is None:
-            season_match = season_pattern.search(content)
-            if season_match:
-                season = season_match.group(1)
-
-        if player is None:
-            requested_match = requested_pattern.search(content)
-            if requested_match:
-                player = requested_match.group(1).strip()
-            else:
-                heading_match = heading_pattern.search(content)
-                if heading_match:
-                    player = heading_match.group(1).strip()
-
-        if player and season:
-            break
-
-    return player, season
-
-
 def _should_apply_history_context(question: str) -> bool:
     q = (question or "").strip().lower()
     if not q:
@@ -169,13 +149,6 @@ def _should_apply_history_context(question: str) -> bool:
         "which one",
         "who is better",
         "who's better",
-        "yes",
-        "yeah",
-        "yep",
-        "yup",
-        "ok",
-        "okay",
-        "sure",
     ]
     if any(marker in q for marker in followup_markers):
         return True
@@ -188,22 +161,6 @@ def _should_apply_history_context(question: str) -> bool:
 def _analysis_debug_enabled() -> bool:
     # Dev-focused: enabled by default; disable by setting ANALYSIS_DEBUG=0
     return os.getenv("ANALYSIS_DEBUG", "1").strip() not in {"0", "false", "False"}
-
-
-def _sanitize_history_messages(history: Optional[List[Dict[str, Any]]]) -> List[Dict[str, str]]:
-    if not isinstance(history, list):
-        return []
-
-    sanitized: List[Dict[str, str]] = []
-    for msg in history:
-        if not isinstance(msg, dict):
-            continue
-        role = str(msg.get("role", "")).strip().lower()
-        content = str(msg.get("content", "")).strip()
-        if role not in {"user", "assistant"} or not content:
-            continue
-        sanitized.append({"role": role, "content": content})
-    return sanitized
 
 @app.post("/api/dashboards")
 async def dashboard_endpoint(request: QueryRequest):
@@ -224,79 +181,82 @@ async def analysis_endpoint(
 
         effective_question = request.question
         history_context_applied = False
-        history_context_reason = "no_history_available"
-        history_messages: List[Dict[str, Any]] = _sanitize_history_messages(request.history)
-
-        # Prefer history passed by the frontend (works for both guest and auth chats).
-        if history_messages and _should_apply_history_context(request.question):
-            effective_question = _build_contextual_question(request.question, history_messages)
-            if _is_affirmative_followup(request.question):
-                player_name, season_label = _extract_latest_player_and_season_from_history(history_messages)
-                if player_name and season_label:
-                    effective_question += (
-                        "\n\nFollow-up constraint: keep the SAME player and SAME season as the last answer. "
-                        f"Use player_name ILIKE '%{player_name}%' and season_label '{season_label}' context "
-                        "(do not advance to a different season)."
-                    )
-            history_context_applied = True
-            history_context_reason = "request_history_used"
-        # Fallback for older clients: load persisted history for authenticated users.
-        elif request.conversationId and authorization and _should_apply_history_context(request.question):
+        history_context_reason = "not_requested_or_not_followup"
+        if request.conversationId and authorization and _should_apply_history_context(request.question):
             try:
                 uid = get_uid_from_authorization(authorization)
                 history_result = get_conversation_messages(uid, request.conversationId.strip())
                 if history_result.get("success"):
-                    fetched_history = history_result.get("messages", [])
-                    if isinstance(fetched_history, list) and fetched_history:
+                    history_messages = history_result.get("messages", [])
+                    if isinstance(history_messages, list) and history_messages:
                         effective_question = _build_contextual_question(
-                            request.question, fetched_history
+                            request.question, history_messages
                         )
-                        if _is_affirmative_followup(request.question):
-                            player_name, season_label = _extract_latest_player_and_season_from_history(fetched_history)
-                            if player_name and season_label:
-                                effective_question += (
-                                    "\n\nFollow-up constraint: keep the SAME player and SAME season as the last answer. "
-                                    f"Use player_name ILIKE '%{player_name}%' and season_label '{season_label}' context "
-                                    "(do not advance to a different season)."
-                                )
                         history_context_applied = True
-                        history_context_reason = "stored_history_used"
+                        history_context_reason = "history_loaded"
                     else:
-                        history_context_reason = "stored_history_empty"
+                        history_context_reason = "no_history_messages"
                 else:
                     history_context_reason = "history_lookup_failed"
             except Exception as history_error:
                 # Keep analysis available even if history lookup fails.
                 print(f"History context skipped: {history_error}")
                 history_context_reason = "history_lookup_exception"
-        elif history_messages:
-            history_context_reason = "history_not_needed_for_standalone_question"
-        elif request.conversationId and authorization:
-            history_context_reason = "stored_history_not_needed_for_standalone_question"
         elif request.conversationId and not authorization:
-            history_context_reason = "guest_without_request_history"
+            history_context_reason = "missing_authorization"
 
         # Run the query ONCE here — do not let query_analyzer run it again
-        query_result = run_query(effective_question)
+        query_result, executed_sql = natural_language_to_sql(effective_question)
+        if _analysis_debug_enabled() and executed_sql:
+            print("---- /api/analysis executed SQL ----\n", executed_sql)
 
         # Handle empty or failed queries with a helpful message instead of crashing
-        if query_result is None or query_result.empty:
+        if query_result is None:
             payload = {
                 "success": True,
                 "analysis": (
-                    "No data was found for this query. This could mean:\n"
-                    "- The player did not participate in the most recent playoffs or season.\n"
-                    "- The player name may be misspelled or not recognized.\n"
-                    "- Try specifying a season year, e.g. 'Giannis 2023 playoff performance'."
+                    "The query could not be completed (SQL generation or validation failed). "
+                    "Check the API terminal logs for details. If this persists, try rephrasing "
+                    "or naming a specific season table year, e.g. 'LeBron James 2023-24 stats'."
                 ),
                 "data": [],
-                "question": request.question
+                "question": request.question,
             }
             if _analysis_debug_enabled():
                 payload["debug"] = {
                     "historyContextApplied": history_context_applied,
                     "historyContextReason": history_context_reason,
                     "conversationId": request.conversationId,
+                    "effectiveQuestion": effective_question,
+                    "executedSql": executed_sql,
+                    "queryFailed": True,
+                }
+            return payload
+
+        if query_result.empty:
+            payload = {
+                "success": True,
+                "analysis": (
+                    "No data was found for this query. This could mean:\n"
+                    "- The player did not participate in the most recent playoffs or season.\n"
+                    "- The player name may be misspelled or not recognized (try full name).\n"
+                    "- Try specifying a season year, e.g. 'Giannis 2023 playoff performance'.\n"
+                    "- Your database may not include the latest season; the app now maps missing "
+                    "season tables to the newest table that exists.\n"
+                    "- True shooting (TS%) usually needs an `nba__advanced__*` table or a computed "
+                    "formula; if you have no advanced tables, ask for FG%/points instead."
+                ),
+                "data": [],
+                "question": request.question,
+            }
+            if _analysis_debug_enabled():
+                payload["debug"] = {
+                    "historyContextApplied": history_context_applied,
+                    "historyContextReason": history_context_reason,
+                    "conversationId": request.conversationId,
+                    "effectiveQuestion": effective_question,
+                    "executedSql": executed_sql,
+                    "emptyResult": True,
                 }
             return payload
 
@@ -318,6 +278,8 @@ async def analysis_endpoint(
                 "historyContextApplied": history_context_applied,
                 "historyContextReason": history_context_reason,
                 "conversationId": request.conversationId,
+                "effectiveQuestion": effective_question,
+                "executedSql": executed_sql,
             }
         return payload
 

@@ -23,3 +23,6 @@ out/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Local smoke / manual API tests (keep out of version control)
+scripts/smoke_test_api.py

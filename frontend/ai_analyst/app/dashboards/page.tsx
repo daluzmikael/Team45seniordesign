@@ -1,16 +1,38 @@
 "use client"
 
+import dynamic from "next/dynamic"
 import { useState } from "react"
 import { Search, Loader2, AlertCircle } from "lucide-react"
 import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 
-import SinglePlayerStat from "@/components/recharts/SinglePlayerStat"
-import CompareStats from "@/components/recharts/CompareStats"
-import CategoricalBreakdown from "@/components/recharts/CategoricalBreakdown"
-import CompareCategoricalBreakdown from "@/components/recharts/CompareCategoricalBreakdown"
-import Leaderboard from "@/components/recharts/Leaderboard"
+const chartLoading = () => (
+  <div className="flex justify-center p-12 text-muted-foreground">
+    <Loader2 className="h-8 w-8 animate-spin" aria-label="Loading chart" />
+  </div>
+)
+
+const SinglePlayerStat = dynamic(
+  () => import("@/components/recharts/SinglePlayerStat"),
+  { ssr: false, loading: chartLoading }
+)
+const CompareStats = dynamic(
+  () => import("@/components/recharts/CompareStats"),
+  { ssr: false, loading: chartLoading }
+)
+const CategoricalBreakdown = dynamic(
+  () => import("@/components/recharts/CategoricalBreakdown"),
+  { ssr: false, loading: chartLoading }
+)
+const CompareCategoricalBreakdown = dynamic(
+  () => import("@/components/recharts/CompareCategoricalBreakdown"),
+  { ssr: false, loading: chartLoading }
+)
+const Leaderboard = dynamic(
+  () => import("@/components/recharts/Leaderboard"),
+  { ssr: false, loading: chartLoading }
+)
 
 interface AnalysisResult {
   success: boolean

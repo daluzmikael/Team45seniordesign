@@ -167,6 +167,21 @@ export default function DashboardsPage() {
               />
             </div>
           )}
+
+          {result.chartType &&
+            ![
+              "SinglePlayerStat",
+              "CompareStats",
+              "CategoricalBreakdown",
+              "Leaderboard",
+            ].includes(result.chartType) && (
+              <Alert>
+                <AlertTitle>Unsupported chart type</AlertTitle>
+                <AlertDescription>
+                  The API returned chart type &quot;{result.chartType}&quot;, which this page does not render yet.
+                </AlertDescription>
+              </Alert>
+            )}
         </div>
       )}
     </div>

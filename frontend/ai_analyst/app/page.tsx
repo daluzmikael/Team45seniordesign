@@ -36,7 +36,7 @@ export default function Home() {
           ].map((example) => (
             <div
               key={example}
-              className="cursor-pointer rounded-lg border border-red-300 bg-red-400 p-4 text-zinc-900 transition-colors hover:bg-red-300"
+              className="cursor-pointer rounded-lg border border-red-400 bg-red-500 p-4 text-zinc-100 transition-colors hover:bg-red-400"
               onClick={() => setMessage(example)}
             >
               <p className="text-sm">{example}</p>
@@ -62,7 +62,7 @@ export default function Home() {
           <Button
             onClick={() => startChat()}
             size="icon"
-            className="h-[60px] w-[60px] border border-red-300 bg-red-400 text-zinc-900 hover:bg-red-300"
+            className="h-[60px] w-[60px] border border-red-400 bg-red-500 text-zinc-100 hover:bg-red-400"
             disabled={!message.trim()}
           >
             <Send className="h-5 w-5 text-zinc-600" />

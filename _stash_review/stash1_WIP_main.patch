@@ -1,0 +1,135 @@
+diff --git a/backend/Analyzer/query_analyzer.py b/backend/Analyzer/query_analyzer.py
+index 8fc599b..c4e3910 100644
+--- a/backend/Analyzer/query_analyzer.py
++++ b/backend/Analyzer/query_analyzer.py
+@@ -39,23 +39,35 @@ def find_query_bot():
+     
+     return None
+ 
+-# Try to import query_bot
+-try:
+-    # First try direct import (if already in path)
+-    import query_bot as query_bot_module
+-except ImportError:
+-    # Find the file dynamically
+-    query_bot_path = find_query_bot()
+-    
+-    if query_bot_path:
+-        # Load it manually using importlib
++def _load_query_bot_module() -> Optional[Any]:
++    global query_bot_module
++    if query_bot_module is not None:
++        return query_bot_module
++
++    # NOTE:
++    # Auto-importing query_bot during module import can block app startup.
++    # Keep it opt-in for CLI/legacy paths that still call analyze()/analyze_question().
++    if os.getenv("ENABLE_QUERY_BOT_AUTOIMPORT", "0") != "1":
++        return None
++
++    try:
++        import query_bot as query_bot_module_local
++        query_bot_module = query_bot_module_local
++        return query_bot_module
++    except ImportError:
++        query_bot_path = find_query_bot()
++        if not query_bot_path:
++            return None
+         try:
+             spec = importlib.util.spec_from_file_location("query_bot", query_bot_path)
+             if spec and spec.loader:
+-                query_bot_module = importlib.util.module_from_spec(spec)
+-                spec.loader.exec_module(query_bot_module)
++                query_bot_module_local = importlib.util.module_from_spec(spec)
++                spec.loader.exec_module(query_bot_module_local)
++                query_bot_module = query_bot_module_local
++                return query_bot_module
+         except Exception as e:
+             print(f"Warning: Failed to load query_bot from {query_bot_path}: {e}")
++    return None
+ 
+ # Optional stub client if query_bot doesn't export one
+ try:
+diff --git a/backend/auth.py b/backend/auth.py
+index 6cd4c79..6032864 100644
+--- a/backend/auth.py
++++ b/backend/auth.py
+@@ -13,12 +13,23 @@ firebase_config = {
+     "storageBucket": "hq-users.firebasestorage.app"
+ }
+ 
+-firebase = pyrebase.initialize_app(firebase_config)
+-auth = firebase.auth()
+-db = firebase.database()
++firebase = None
++auth_client = None
++db_client = None
++
++
++def _ensure_firebase_clients():
++    global firebase, auth_client, db_client
++    if auth_client is not None and db_client is not None:
++        return auth_client, db_client
++    firebase = pyrebase.initialize_app(firebase_config)
++    auth_client = firebase.auth()
++    db_client = firebase.database()
++    return auth_client, db_client
+ 
+ def sign_up(email: str, password: str):
+     try:
++        auth, _ = _ensure_firebase_clients()
+         user = auth.create_user_with_email_and_password(email, password)
+         return {
+             "success": True,
+@@ -31,6 +42,7 @@ def sign_up(email: str, password: str):
+ 
+ def log_in(email: str, password: str):
+     try:
++        auth, _ = _ensure_firebase_clients()
+         user = auth.sign_in_with_email_and_password(email, password)
+         return {
+             "success": True,
+@@ -44,6 +56,7 @@ def log_in(email: str, password: str):
+ 
+ def verify_token(id_token: str):
+     try:
++        auth, _ = _ensure_firebase_clients()
+         info = auth.get_account_info(id_token)
+         users = info.get("users", [])
+         if not users:
+@@ -60,6 +73,7 @@ def verify_token(id_token: str):
+ 
+ def save_history_message(uid: str, conversation_id: str, role: str, content: str):
+     try:
++        _, db = _ensure_firebase_clients()
+         payload = {
+             "role": role,
+             "content": content,
+@@ -83,6 +97,7 @@ def save_history_message(uid: str, conversation_id: str, role: str, content: str
+ 
+ def get_conversation_messages(uid: str, conversation_id: str):
+     try:
++        _, db = _ensure_firebase_clients()
+         data = (
+             db.child("histories")
+             .child(uid)
+@@ -113,6 +128,7 @@ def get_conversation_messages(uid: str, conversation_id: str):
+ 
+ def list_conversations(uid: str):
+     try:
++        _, db = _ensure_firebase_clients()
+         data = db.child("histories").child(uid).get().val()
+         if not data:
+             return {"success": True, "conversations": []}
+diff --git a/backend/requirements.txt b/backend/requirements.txt
+index 347dec5..3386ded 100644
+--- a/backend/requirements.txt
++++ b/backend/requirements.txt
+@@ -1,7 +1,6 @@
+ flask
+ flask-cors
+ requests
+-psycopg2
+ psycopg2-binary
+ python-dotenv
+ openai

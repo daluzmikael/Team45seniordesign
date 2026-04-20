@@ -1,0 +1,84 @@
+diff --git a/frontend/ai_analyst/app/layout.tsx b/frontend/ai_analyst/app/layout.tsx
+index 1a65455..615698e 100644
+--- a/frontend/ai_analyst/app/layout.tsx
++++ b/frontend/ai_analyst/app/layout.tsx
+@@ -1,6 +1,5 @@
+ import type React from "react"
+ import type { Metadata } from "next"
+-import { Geist, Geist_Mono } from "next/font/google"
+ import { Analytics } from "@vercel/analytics/next"
+ import "./globals.css"
+ import { SidebarProvider, SidebarInset, SidebarTrigger } from "@/components/ui/sidebar"
+@@ -9,9 +8,6 @@ import { ThemeProvider } from "next-themes"
+ import { ThemeToggle } from "@/components/theme-toggle"
+ import { AuthProvider } from "@/context/auth-context"
+ 
+-const _geist = Geist({ subsets: ["latin"] })
+-const _geistMono = Geist_Mono({ subsets: ["latin"] })
+-
+ export const metadata: Metadata = {
+   title: "v0 App",
+   description: "Created with v0",
+diff --git a/frontend/ai_analyst/app/page.tsx b/frontend/ai_analyst/app/page.tsx
+index 2287162..1a9ee31 100644
+--- a/frontend/ai_analyst/app/page.tsx
++++ b/frontend/ai_analyst/app/page.tsx
+@@ -4,8 +4,6 @@ import { useEffect, useState } from "react"
+ import { Button } from "@/components/ui/button"
+ import { Textarea } from "@/components/ui/textarea"
+ import { Send } from "lucide-react"
+-import ReactMarkdown from "react-markdown"
+-import remarkGfm from "remark-gfm"
+ import { useAuth } from "@/context/auth-context"
+ 
+ export default function Home() {
+@@ -225,33 +223,7 @@ export default function Home() {
+                     : "bg-muted"
+                 }`}
+               >
+-                {msg.role === "assistant" ? (
+-                  <ReactMarkdown
+-                    remarkPlugins={[remarkGfm]}
+-                    components={{
+-                      table: ({ children }) => (
+-                        <div className="overflow-x-auto my-2">
+-                          <table className="min-w-full border-collapse border border-border text-sm">
+-                            {children}
+-                          </table>
+-                        </div>
+-                      ),
+-                      thead: ({ children }) => <thead className="bg-muted/50">{children}</thead>,
+-                      th: ({ children }) => (
+-                        <th className="border border-border px-2 py-1 text-left font-semibold">{children}</th>
+-                      ),
+-                      td: ({ children }) => <td className="border border-border px-2 py-1">{children}</td>,
+-                      h3: ({ children }) => (
+-                        <h3 className="font-semibold underline underline-offset-4 mt-3 mb-2">{children}</h3>
+-                      ),
+-                      p: ({ children }) => <p className="whitespace-pre-wrap">{children}</p>,
+-                    }}
+-                  >
+-                    {msg.content}
+-                  </ReactMarkdown>
+-                ) : (
+-                  <p className="whitespace-pre-wrap">{msg.content}</p>
+-                )}
++                <p className="whitespace-pre-wrap">{msg.content}</p>
+               </div>
+             </div>
+           ))
+diff --git a/frontend/ai_analyst/package.json b/frontend/ai_analyst/package.json
+index c07989c..dcf3aaf 100644
+--- a/frontend/ai_analyst/package.json
++++ b/frontend/ai_analyst/package.json
+@@ -3,8 +3,8 @@
+   "version": "0.1.0",
+   "private": true,
+   "scripts": {
+-    "dev": "next dev --turbopack",
+-    "build": "next build --turbopack",
++    "dev": "next dev",
++    "build": "next build",
+     "start": "next start",
+     "lint": "eslint"
+   },

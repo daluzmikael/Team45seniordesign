@@ -240,7 +240,7 @@ export default function ChatPage() {
           <Button
             onClick={handleSend}
             size="icon"
-            className="h-[60px] w-[60px] border border-red-300 bg-red-400 text-zinc-900 hover:bg-red-300"
+            className="h-[60px] w-[60px] border border-red-400 bg-red-500 text-zinc-100 hover:bg-red-400"
             disabled={!!loadingState || !message.trim()}
           >
             <Send className="h-5 w-5 text-zinc-600" />

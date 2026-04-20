@@ -165,8 +165,8 @@ export function AppSidebar() {
 
   const grouped = groupByDate(conversations)
   const tabClass =
-    "border-0 bg-red-400 text-zinc-900 hover:bg-red-300 font-medium data-[active=true]:bg-red-400 data-[active=true]:text-zinc-900 data-[active=true]:hover:bg-red-300"
-  const activeTabClass = "bg-red-400 text-zinc-900"
+    "border-0 bg-red-500 text-zinc-100 hover:bg-red-400 font-medium data-[active=true]:bg-red-500 data-[active=true]:text-zinc-100 data-[active=true]:hover:bg-red-400"
+  const activeTabClass = "bg-red-500 text-zinc-100"
   const searchClass =
     "border-0 bg-[#bcc1c9] text-zinc-900 hover:bg-[#aeb4be] dark:bg-[#16171b] dark:text-zinc-100 dark:hover:bg-[#23252b]"
   const savedChatClass =

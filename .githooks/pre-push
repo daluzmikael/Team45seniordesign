@@ -1,0 +1,11 @@
+#!/bin/sh
+# Block direct pushes to main (use PRs or push feature branches only).
+remote="$1"
+while read -r local_ref local_sha remote_ref remote_sha || [ -n "$local_ref" ]; do
+  case "$remote_ref" in
+    *refs/heads/main)
+      echo "Refusing push to branch 'main'. Push to 'vonlindenthal' (or another feature branch) and open a PR."
+      exit 1
+      ;;
+  esac
+done

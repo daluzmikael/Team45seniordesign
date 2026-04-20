@@ -173,7 +173,7 @@ export function AppSidebar() {
     "border-0 bg-[#bcc1c9] text-zinc-900 hover:bg-[#aeb4be] dark:bg-[#16171b] dark:text-zinc-100 dark:hover:bg-[#23252b] data-[active=true]:bg-[#bcc1c9] data-[active=true]:text-zinc-900 data-[active=true]:hover:bg-[#aeb4be] dark:data-[active=true]:bg-[#16171b] dark:data-[active=true]:text-zinc-100 dark:data-[active=true]:hover:bg-[#23252b]"
 
   return (
-    <Sidebar className="[&_[data-sidebar=sidebar]]:bg-[#2f3136] [&_[data-sidebar=sidebar]]:text-zinc-100">
+    <Sidebar className="[&_[data-sidebar=sidebar]]:bg-[#aab0ba] [&_[data-sidebar=sidebar]]:text-zinc-900 dark:[&_[data-sidebar=sidebar]]:bg-[#2f3136] dark:[&_[data-sidebar=sidebar]]:text-zinc-100">
       <SidebarHeader className="p-2">
         <Button
           className={`w-full justify-start gap-2 ${tabClass}`}

@@ -1,0 +1,2 @@
+# Hooks must use LF shebang so Git runs them correctly on Windows
+.githooks/* text eol=lf

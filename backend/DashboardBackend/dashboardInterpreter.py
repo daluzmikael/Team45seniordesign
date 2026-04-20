@@ -68,7 +68,9 @@ IMPORTANT SQL RULES:
 
 OUTPUT SHAPE RULES (VERY IMPORTANT):
 - Always alias numeric y-values as `stat_value` for line/bar charts.
-- For CompareStats, include a player identifier column as `full_name` (or `player_name`) PLUS a time column: `season` OR `game_date`.
+- For CompareStats, include `player_name` or `full_name`, and `stat_value` for the metric being compared.
+- For CompareStats across seasons or games, include a time column: `season` OR `game_date`.
+- For **career totals** (compare two players' full careers), use the same `season` literal for every row, e.g. `SELECT 'Career' AS season, player_name, ... AS stat_value` so the bar chart has one bucket, or return one row per player with aggregates and `season` = 'Career'.
 - For SinglePlayerStat, include: `stat_value` and time column: `season` OR `game_date`.
 - For Leaderboard, include: `player_name`, optional `team_abbreviation`, and `stat_value`.
 - For CategoricalBreakdown / CompareCategoricalBreakdown (radar), select raw columns: `pts, ast, reb, stl, blk` (can be aliases), plus a `player_name`/`full_name` column for multi-player.
@@ -243,9 +245,14 @@ def _extract_names_heuristic(q: str) -> List[str]:
 
 def _intent_hint(user_question: str) -> Dict[str, Any]:
     q = user_question.lower()
+    # Pad so "Compare LeBron..." (compare at start of sentence) still matches.
+    q_padded = f" {q.strip()} "
     hint: Dict[str, Any] = {}
 
-    is_compare = any(w in q for w in [" compare ", " vs ", " versus ", "against "]) or " vs." in q
+    is_compare = (
+        any(w in q_padded for w in [" compare ", " vs ", " versus ", " against "])
+        or " vs." in q
+    )
     is_leaderboard = any(w in q for w in ["top ", "leaders", "leaderboard", "most ", "rank", "best "])
     is_profile = any(w in q for w in ["skill profile", "profile", "radar", "breakdown", "categories", "categorical"])
     is_recent = any(w in q for w in ["last ", "past ", "recent", "game log", "gamelog", "vs the", "vs ", "playoffs", "march", "april", "january", "february", "december", "november", "october"])
@@ -332,10 +339,13 @@ def _validate_and_autofix(chart_type: str, raw_data: List[Dict], chart_config: D
     if chart_type == "CompareStats":
         if "stat_value" not in cols:
             return False, chart_type, "CompareStats requires 'stat_value'"
-        if "season" not in cols and "game_date" not in cols:
-            return False, chart_type, "CompareStats requires 'season' or 'game_date'"
         if "full_name" not in cols and "player_name" not in cols:
             return False, chart_type, "CompareStats requires 'full_name' or 'player_name'"
+        if "season" not in cols and "game_date" not in cols:
+            # Career / single-snapshot comparisons (2–8 rows) have no time axis; chart uses one bucket.
+            if len(raw_data) <= 8:
+                return True, chart_type, "ok"
+            return False, chart_type, "CompareStats requires 'season' or 'game_date'"
         return True, chart_type, "ok"
 
     # CategoricalBreakdown requires radar columns (handled above by _looks_like_radar)

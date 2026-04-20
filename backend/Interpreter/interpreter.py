@@ -573,13 +573,32 @@ def _is_explicit_total_request(question_text: str) -> bool:
     return any(t in q for t in total_terms)
 
 
+def _is_head_to_head_career_question(question_text: str) -> bool:
+    """True for e.g. 'Compare LeBron and Jordan career stats' (needs SUM rollups, not per-season rows)."""
+    q = (question_text or "").lower()
+    if re.search(r"\bcaree+r\b", q) is None:
+        return False
+    if _is_over_time_request(question_text):
+        return False
+    return bool(
+        re.search(r"\bcompare\b", q)
+        or re.search(r"\bversus\b", q)
+        or re.search(r"\bvs\.?\b", q)
+        or re.search(r"\bbetween\b.+\band\b", q)
+    )
+
+
 def _rewrite_career_aggregate_to_by_season(sql_query: str, user_input: str) -> str:
     question_text = _extract_current_question_text(user_input)
     q_input = question_text.lower()
+    q = sql_query or ""
+    # Head-to-head career comparisons need UNION ALL + SUM + GROUP BY per player; do not rewrite to by-season.
+    if _is_head_to_head_career_question(question_text):
+        return q
+
     asks_over_time = _is_over_time_request(question_text)
     mentions_career = re.search(r"\bcaree+r\b", q_input) is not None
     wants_total = _is_explicit_total_request(question_text)
-    q = sql_query or ""
     q_lower = q.lower()
     has_union_sum_rollup = ("union all" in q_lower) and ("sum(" in q_lower) and ("group by player_name" in q_lower)
     # Default non-total career asks to by-season rows rather than SUM rollups.

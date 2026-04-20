@@ -36,7 +36,7 @@ export default function Home() {
           ].map((example) => (
             <div
               key={example}
-              className="cursor-pointer rounded-lg border border-red-400 bg-red-500 p-4 text-zinc-100 transition-colors hover:bg-red-400"
+              className="cursor-pointer rounded-lg border-0 bg-[#bcc1c9] p-4 text-zinc-900 transition-colors hover:bg-[#aeb4be] dark:bg-[#16171b] dark:text-zinc-100 dark:hover:bg-[#23252b]"
               onClick={() => setMessage(example)}
             >
               <p className="text-sm">{example}</p>

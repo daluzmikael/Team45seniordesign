@@ -2,6 +2,9 @@ import psycopg2
 import pandas as pd
 import re
 import sqlglot
+
+from data_result import prepare_dataframe_for_downstream
+from sql_postprocess import normalize_game_log_wl_column
 from sqlglot import parse_one
 from sqlglot.errors import ParseError
 import json
@@ -123,6 +126,7 @@ def check_query_cost(conn, sql_query, max_cost=100000):
 
 # Query execution function
 def execute_query(conn, sql_query, max_cost=100000, timeout_ms=3000):
+    sql_query = normalize_game_log_wl_column(sql_query or "")
     logger.info("Executing SQL Query:\n%s", sql_query)
     table_refs = sorted(
         set(
@@ -161,7 +165,7 @@ def execute_query(conn, sql_query, max_cost=100000, timeout_ms=3000):
             logger.info("Query result table: [empty]")
         else:
             logger.info("Query result table:\n%s", df_result.to_string(index=False))
-        return df_result
+        return prepare_dataframe_for_downstream(df_result)
 
     except Exception as e:
         conn.rollback() # Ensure we clean up if this attempt fails

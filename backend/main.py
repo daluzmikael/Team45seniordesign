@@ -14,8 +14,7 @@ from auth import (
     list_conversations,
 )
 from Interpreter.interpreter import run_query, debug_query_routing
-import numpy as np
-import pandas as pd
+from data_result import dataframe_to_json_records
 import re
 
 app = FastAPI()
@@ -300,8 +299,8 @@ async def analysis_endpoint(
                 }
             return payload
 
-        # Clean NaN before JSON serialization
-        clean_data = query_result.replace({np.nan: None}).to_dict(orient="records")
+        # JSON-safe records (Decimal/datetime normalized in executor + data_result)
+        clean_data = dataframe_to_json_records(query_result)
 
         # Pass the already-fetched dataframe directly to the analyzer
         # so it does NOT run a second query internally

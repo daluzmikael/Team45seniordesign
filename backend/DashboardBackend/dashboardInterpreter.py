@@ -7,6 +7,9 @@ from typing import Dict, List, Any, Tuple, Optional
 from dotenv import load_dotenv
 import re
 
+from data_result import prepare_raw_records
+from sql_postprocess import normalize_game_log_wl_column
+
 load_dotenv()
 # Setting up OpenAI client
 print("API Key Loaded:", os.getenv("OPENAI_API_KEY"))
@@ -620,10 +623,11 @@ def interpret_question(user_question: str) -> Dict[str, Any]:
         print(f"Chart Type: {chart_type}")
         print(f"Generated SQL: {sql_query}")
 
+        sql_query = normalize_game_log_wl_column(sql_query)
         conn = psycopg2.connect(**DB_CONFIG)
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute(sql_query)
-            raw_data = cursor.fetchall()
+            raw_data = prepare_raw_records(list(cursor.fetchall()))
 
         if not raw_data:
             return {
@@ -652,9 +656,10 @@ def interpret_question(user_question: str) -> Dict[str, Any]:
             print(f"[Retry] Chart Type: {chart_type}")
             print(f"[Retry] Generated SQL: {sql_query}")
 
+            sql_query = normalize_game_log_wl_column(sql_query)
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute(sql_query)
-                raw_data = cursor.fetchall()
+                raw_data = prepare_raw_records(list(cursor.fetchall()))
 
             if not raw_data:
                 return {

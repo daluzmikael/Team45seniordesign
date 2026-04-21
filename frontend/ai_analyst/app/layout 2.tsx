@@ -1,5 +1,6 @@
 import type React from "react"
 import type { Metadata } from "next"
+import { Geist, Geist_Mono } from "next/font/google"
 import { Analytics } from "@vercel/analytics/next"
 import "./globals.css"
 import { SidebarProvider, SidebarInset, SidebarTrigger } from "@/components/ui/sidebar"
@@ -7,7 +8,9 @@ import { AppSidebar } from "@/components/app-sidebar"
 import { ThemeProvider } from "next-themes"
 import { ThemeToggle } from "@/components/theme-toggle"
 import { AuthProvider } from "@/context/auth-context"
-import { BasketballDecorBackground } from "@/components/basketball-decor-background"
+
+const _geist = Geist({ subsets: ["latin"] })
+const _geistMono = Geist_Mono({ subsets: ["latin"] })
 
 export const metadata: Metadata = {
   title: "v0 App",
@@ -27,8 +30,8 @@ export default function RootLayout({
           <AuthProvider>
             <SidebarProvider>
               <AppSidebar />
-              <SidebarInset className="min-h-svh bg-[var(--surface-matte)] text-zinc-900 dark:bg-[var(--surface-matte)] dark:text-zinc-100">
-                <header className="sticky top-0 z-30 flex h-16 shrink-0 items-center gap-2 border-b border-[var(--surface-matte-border)] bg-[var(--surface-matte-raised)] px-4 dark:border-[var(--surface-matte-border)] dark:bg-[var(--surface-matte-raised)]">
+              <SidebarInset className="bg-[#c7cad1] text-zinc-900 dark:bg-[#1c1d21] dark:text-zinc-100">
+                <header className="sticky top-0 z-30 flex h-16 shrink-0 items-center gap-2 border-b border-zinc-500 bg-[#bcc1c9] px-4 dark:border-zinc-800 dark:bg-[#16171b]">
                   <SidebarTrigger />
                   <div className="flex items-center gap-2">
                     <h1 className="text-xl font-medium tracking-wide text-red-500">HoopQuery</h1>
@@ -37,10 +40,7 @@ export default function RootLayout({
                     <ThemeToggle />
                   </div>
                 </header>
-                <main className="relative flex min-h-0 flex-1 flex-col overflow-hidden bg-[var(--surface-matte)] p-4 dark:bg-[var(--surface-matte)]">
-                  <BasketballDecorBackground />
-                  <div className="relative z-10 flex min-h-0 flex-1 flex-col">{children}</div>
-                </main>
+                <main className="flex-1 overflow-auto bg-[#c7cad1] p-4 dark:bg-[#1c1d21]">{children}</main>
               </SidebarInset>
             </SidebarProvider>
           </AuthProvider>

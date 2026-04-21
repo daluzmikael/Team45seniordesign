@@ -1,3 +1,4 @@
+import logging
 import os
 import json
 import psycopg2
@@ -7,10 +8,15 @@ from typing import Dict, List, Any, Tuple, Optional
 from dotenv import load_dotenv
 import re
 
+logger = logging.getLogger(__name__)
 load_dotenv()
-# Setting up OpenAI client
-print("API Key Loaded:", os.getenv("OPENAI_API_KEY"))
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Never print or log the raw API key
+api_key_env = os.getenv("OPENAI_API_KEY")
+if api_key_env:
+    logger.debug("OpenAI API key loaded from environment")
+else:
+    logger.warning("OPENAI_API_KEY is not set")
+client = OpenAI(api_key=api_key_env)
 
 # AWS postgres database info
 DB_CONFIG = {

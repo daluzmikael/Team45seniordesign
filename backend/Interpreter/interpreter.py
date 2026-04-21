@@ -4,6 +4,18 @@ import re
 from dotenv import load_dotenv
 from openai import OpenAI
 
+load_dotenv()
+# Configure logging before importing executor: executor previously called basicConfig(INFO)
+# first, which blocked this module's DEBUG config and hid logger.debug(...) lines.
+_level_name = (os.getenv("LOG_LEVEL") or "INFO").upper()
+_level = getattr(logging, _level_name, logging.INFO)
+_fmt = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+if not logging.getLogger().handlers:
+    logging.basicConfig(level=_level, format=_fmt)
+else:
+    # Uvicorn (or another host) configured the root logger; only adjust severity.
+    logging.getLogger().setLevel(_level)
+
 from Executer.executor import (
     get_connection,
     get_db_schema,
@@ -13,17 +25,9 @@ from Executer.executor import (
     validate_and_normalize_sql
 )
 
-load_dotenv()
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-
 logger = logging.getLogger(__name__)
 api_key = os.getenv("OPENAI_API_KEY")
-if api_key:
-    logger.info("OpenAI API key loaded successfully")
-else:
+if not api_key:
     logger.warning("OpenAI API key missing from environment")
 client = OpenAI(api_key=api_key)
 
@@ -767,6 +771,128 @@ def _is_explicit_total_request(question_text: str) -> bool:
     return any(t in q for t in total_terms)
 
 
+def _has_explicit_comparison_timeframe(user_input: str) -> bool:
+    """Season/year/rookie/nth-season cues — absent these, head-to-head defaults to career."""
+    qt = _extract_current_question_text(user_input).lower()
+    if re.search(r"\b(19\d{2}|20\d{2})\s*[-/]\s*(\d{2}|19\d{2}|20\d{2})\b", qt):
+        return True
+    if _extract_bare_year_request(user_input) is not None:
+        return True
+    if any(
+        k in qt
+        for k in [
+            "this season",
+            "current season",
+            "last season",
+            "this playoff",
+            "current playoff",
+            "last playoff",
+            "last year",
+            "this year",
+        ]
+    ):
+        return True
+    if _extract_requested_nth_season(user_input) is not None:
+        return True
+    if "rookie year" in qt:
+        return True
+    if re.search(r"\b(rookie|sophomore|freshman)\s+(season|year)\b", qt):
+        return True
+    if re.search(r"\b\d{1,2}(st|nd|rd|th)\s+(season|year)\b", qt):
+        return True
+    for word in _ORDINAL_WORDS.keys():
+        if re.search(rf"\b{word}\s+(season|year)\b", qt):
+            return True
+    if _extract_requested_season_start_span(user_input) is not None:
+        return True
+    return False
+
+
+def _is_implicit_head_to_head_career_question(user_input: str) -> bool:
+    """Stat-style comparison(s) between players with no explicit season window."""
+    qt = _extract_current_question_text(user_input).lower()
+    looks_like_pair_compare = (
+        re.search(r"\bbetween\b.+\band\b", qt) is not None
+        or bool(re.search(r"\b(who\s+(is|'s)|which)\s+.{0,40}\bbetter\b", qt))
+        or ("compare " in qt)
+        or (" vs " in qt)
+        or (" versus " in qt)
+        or ("better than " in qt)
+        or (" than " in qt and re.search(r"\bbetter\b", qt))
+    )
+    if not looks_like_pair_compare:
+        return False
+    if _has_explicit_comparison_timeframe(user_input):
+        return False
+    # Playoff-era head-to-head without a year uses latest playoffs elsewhere; rewriter handles regular only first.
+    return True
+
+
+def _rewrite_implicit_head_to_head_to_career_sql(sql_query: str, user_input: str, conn) -> str:
+    """Expand single-season multi-player compares to weighted career aggregates (regular season)."""
+    if conn is None or not _is_implicit_head_to_head_career_question(user_input):
+        return sql_query
+    raw = sql_query or ""
+    q_low = raw.lower().strip()
+
+    named = _extract_named_players(user_input, raw)
+    if len(named) < 2:
+        return sql_query
+
+    if "union all" in q_low and raw.lower().count("all_players_regular_") > 1:
+        return sql_query
+
+    plays = ("playoff" in _extract_current_question_text(user_input).lower()) or (
+        "postseason" in _extract_current_question_text(user_input).lower()
+    )
+    table_kind = "playoffs" if plays else "regular"
+    prefix = f"all_players_{table_kind}_"
+
+    esc_p = re.escape(prefix)
+    from_m = re.search(rf"(?is)\bfrom\s+(?:public\.)?(?P<t>{esc_p}\d{{4}}_\d{{4}})\b", raw)
+    if not from_m:
+        return sql_query
+
+    wm = re.search(r"(?is)\bwhere\b", raw)
+    if not wm:
+        return sql_query
+    tail = raw[wm.end() :]
+    stops = []
+    for pat in (r"\border\s+by\b", r"\bgroup\s+by\b", r"\blimit\b"):
+        mm = re.search(pat, tail, flags=re.IGNORECASE)
+        if mm:
+            stops.append(mm.start())
+    where_clause = tail[: min(stops) if stops else len(tail)].strip().rstrip(";")
+
+    avail = _available_season_starts(conn, table_kind)
+    if len(avail) < 2:
+        return sql_query
+
+    legs = []
+    for start_year in avail:
+        end_full = start_year + 1
+        tnam = f"{prefix}{start_year}_{end_full}"
+        ref = _qualified_public_table_ref(tnam)
+        legs.append(
+            f"SELECT player_name, gp, reb, pts, ast, min, fgm, fga, fg3m, fg3a, ftm, fta FROM {ref} WHERE ({where_clause})"
+        )
+
+    union_inner = " UNION ALL ".join(legs)
+    return (
+        "SELECT player_name, "
+        "SUM(gp)::bigint AS career_gp, "
+        "SUM(reb * gp)::double precision / NULLIF(SUM(gp), 0) AS reb_per_game_career, "
+        "SUM(pts * gp)::double precision / NULLIF(SUM(gp), 0) AS pts_per_game_career, "
+        "SUM(ast * gp)::double precision / NULLIF(SUM(gp), 0) AS ast_per_game_career, "
+        "SUM(min * gp)::double precision / NULLIF(SUM(gp), 0) AS min_per_game_career, "
+        "(SUM(fgm)::double precision / NULLIF(SUM(fga), 0)) AS fg_pct_career, "
+        "(SUM(fg3m)::double precision / NULLIF(SUM(fg3a), 0)) AS fg3_pct_career, "
+        "(SUM(ftm)::double precision / NULLIF(SUM(fta), 0)) AS ft_pct_career "
+        f"FROM ({union_inner}) AS career_union "
+        "GROUP BY player_name LIMIT 50"
+    )
+
+
 def _rewrite_career_aggregate_to_by_season(sql_query: str, user_input: str, conn=None) -> str:
     question_text = _extract_current_question_text(user_input)
     q_input = question_text.lower()
@@ -1102,6 +1228,10 @@ def _enforce_raw_data_only_sql(sql_query: str) -> str:
     if not q:
         return q
 
+    # Weighted career head-to-head aggregates (see _rewrite_implicit_head_to_head_to_career_sql).
+    if re.search(r"(?i)\bcareer_union\b", q):
+        return q.rstrip(";") + ";"
+
     q = q.rstrip(";")
     q = re.sub(r"(?is)\border\s+by\b.*?(?=(\blimit\b|$))", " ", q)
     q = re.sub(r"(?is)\bgroup\s+by\b.*?(?=(\bhaving\b|\blimit\b|$))", " ", q)
@@ -1398,13 +1528,26 @@ RULE 5B — OVER-TIME / BY-SEASON TRENDS (NOT CAREER AGGREGATE):
   Example question: "Show me LeBron's blocks per season"
   → Return season_start, season_label, player_name, blk, blk_rank, gp by season order.
 
-RULE 6 — COMPARING TWO OR MORE PLAYERS (same era):
-  → Use the same season summary table for both players in one query
+RULE 6 — COMPARING TWO OR MORE PLAYERS WHEN A SEASON IS SPECIFIED ("this season", "last season", explicit year/range):
+  → Use ONE season summary table for all players in that query
   → Use OR with ILIKE for multiple players:
      player_name ILIKE '%LeBron%' OR player_name ILIKE '%Curry%'
   → NEVER use player_game_logs for season-level comparisons
   Example question: "Compare LeBron and Curry this season"
   Correct table: all_players_regular_2024_2025
+
+RULE 6B — WHO IS BETTER / BETWEEN A AND B WITH NO YEAR OR SEASON CONTEXT:
+  If the question compares players or stats — who is better, better rebounder/scorer/player, between X and Y, vs., than —
+  and it does NOT mention any specific season/year, ordinal season (first/second season, rookie/sophomore year),
+  decade, or dated range ("last season", "2023-24", "this year"):
+  → Treat it as CAREER comparison (regular season unless they clearly mean playoffs).
+  → UNION ALL across every `all_players_regular_*` table in the schema for those players' careers.
+  → Aggregate with GROUP BY player_name.
+  → For per-game columns (pts, reb, ast, min, etc.), use career weighted averages:
+       SUM(column * gp) / NULLIF(SUM(gp), 0)
+     Shooting percentages: SUM(fgm)/NULLIF(SUM(fga),0), SUM(fg3m)/NULLIF(SUM(fg3a),0), SUM(ftm)/NULLIF(SUM(fta),0).
+  Example question: "Who is the better rebounder between Bol Bol and Anthony Davis"
+  → Career weighted reb per game across all regular-season tables — NOT only all_players_regular_2024_2025.
 
 RULE 7 — COMPARING TWO PLAYERS (different eras / career):
   → Use UNION ALL — one SELECT per player from their respective era tables
@@ -1567,7 +1710,8 @@ DIVISION SAFETY:
   - NEVER do raw division like fgm / fga — always use the safe pattern above
 
 GENERAL:
-  - ALWAYS add LIMIT 50 to every query unless the user specifies a different number
+  - Do NOT add a generic LIMIT (e.g. LIMIT 50) unless the user asks for top-N, last-X games, or a bounded sample.
+  - For shot charts, game logs, or "all shots / full picture" asks, omit LIMIT so results are not arbitrarily truncated (heavy queries are still bounded by server cost/timeout).
   - NEVER use SELECT * — always name columns explicitly
   - NEVER invent column names that are not listed in this prompt
   - NEVER add ORDER BY game_date to season summary tables (game_date does not exist there)
@@ -1581,6 +1725,7 @@ SECTION 4: SEASON AND YEAR REFERENCE MAP
 ════════════════════════════════════════════════════════════════════════
 
   "current season" or no year specified (regular)  → all_players_regular_2024_2025
+    **Exception:** Head-to-head "who is better / between X and Y" with NO season/year wording → RULE 6B career UNION ALL (not only latest season).
   "current playoffs" or no year specified (playoff) → all_players_playoffs_2024_2025
   Bare year uses START-YEAR mapping for regular season:
   "2020"                                            → all_players_regular_2020_2021
@@ -1807,7 +1952,7 @@ Generate the SQL:"""
 
         sql_query = response.choices[0].message.content.strip()
         sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
-        logger.debug("Generated SQL from model:\n%s", sql_query)
+        logger.info("Generated SQL from model:\n%s", sql_query)
 
     except Exception as e:
         logger.error("OpenAI API error: %s", e)
@@ -1816,6 +1961,7 @@ Generate the SQL:"""
     sql_query = _enforce_start_year_table_mapping(sql_query, user_input_param)
     sql_query = _enforce_nth_season_table_mapping(sql_query, user_input_param, conn)
     sql_query = _rewrite_nth_season_comparison_sql(sql_query, user_input_param, conn)
+    sql_query = _rewrite_implicit_head_to_head_to_career_sql(sql_query, user_input_param, conn)
     sql_query = _enforce_advanced_table_mapping(sql_query, user_input_param, schema_description)
     sql_query = _rewrite_career_aggregate_to_by_season(sql_query, user_input_param, conn)
     sql_query = _ensure_rebounding_leaderboard_columns(sql_query, user_input_param)
@@ -1837,12 +1983,14 @@ Generate the SQL:"""
         sql_query = _enforce_start_year_table_mapping(sql_query, user_input_param)
         sql_query = _enforce_nth_season_table_mapping(sql_query, user_input_param, conn)
         sql_query = _rewrite_nth_season_comparison_sql(sql_query, user_input_param, conn)
+        sql_query = _rewrite_implicit_head_to_head_to_career_sql(sql_query, user_input_param, conn)
         sql_query = _enforce_advanced_table_mapping(sql_query, user_input_param, schema_description)
         sql_query = _expand_player_name_filters_for_encoding(sql_query)
         sql_query = _ensure_profile_columns_in_sql(sql_query, user_input_param)
         sql_query = _ensure_season_columns_in_sql(sql_query)
         sql_query = _enforce_raw_data_only_sql(sql_query)
     sql_query = _rewrite_nth_season_comparison_sql(sql_query, user_input_param, conn)
+    sql_query = _rewrite_implicit_head_to_head_to_career_sql(sql_query, user_input_param, conn)
     sql_query = limit_rows(sql_query)
 
     try:
@@ -1878,6 +2026,7 @@ Generate the SQL:"""
                 sql_query = _enforce_start_year_table_mapping(sql_query, user_input_param)
                 sql_query = _enforce_nth_season_table_mapping(sql_query, user_input_param, conn)
                 sql_query = _rewrite_nth_season_comparison_sql(sql_query, user_input_param, conn)
+                sql_query = _rewrite_implicit_head_to_head_to_career_sql(sql_query, user_input_param, conn)
                 sql_query = _enforce_advanced_table_mapping(sql_query, user_input_param, schema_description)
                 sql_query = _rewrite_career_aggregate_to_by_season(sql_query, user_input_param, conn)
                 sql_query = _ensure_rebounding_leaderboard_columns(sql_query, user_input_param)
@@ -1888,6 +2037,7 @@ Generate the SQL:"""
                 sql_query = _ensure_season_columns_in_sql(sql_query)
                 sql_query = _enforce_raw_data_only_sql(sql_query)
                 sql_query = _rewrite_nth_season_comparison_sql(sql_query, user_input_param, conn)
+                sql_query = _rewrite_implicit_head_to_head_to_career_sql(sql_query, user_input_param, conn)
                 sql_query = limit_rows(sql_query)
 
                 try:

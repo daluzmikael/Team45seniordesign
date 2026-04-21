@@ -1,8 +1,15 @@
+import logging
+import os
+
+# Align root log level with env before importing Interpreter/Executor (uvicorn may configure logging first).
+logging.getLogger().setLevel(
+    getattr(logging, (os.getenv("LOG_LEVEL") or "INFO").upper(), logging.INFO)
+)
+
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
-import os
 from DashboardBackend.dashboardInterpreter import interpret_question
 from Analyzer.query_analyzer import analyze_question_with_data
 from auth import (

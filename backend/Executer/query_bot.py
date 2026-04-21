@@ -1,7 +1,8 @@
-﻿"""
+"""
 To be deleted. Call executor.py and interpreter.py functions directly instead of this layer.
 """
 
+import logging
 import psycopg2
 import re
 import pandas as pd
@@ -11,9 +12,13 @@ import os
 # 1. OpenAI client
 from dotenv import load_dotenv
 
+logger = logging.getLogger(__name__)
 load_dotenv()
-# Setting up OpenAI client
-print("API Key Loaded:", os.getenv("OPENAI_API_KEY"))
+# Never print or log the raw API key
+if os.getenv("OPENAI_API_KEY"):
+    logger.debug("OpenAI API key loaded from environment")
+else:
+    logger.warning("OPENAI_API_KEY is not set")
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # 2. Connect to PostgreSQL (AWS RDS)
@@ -92,23 +97,10 @@ def is_safe_sql(sql_query):
     return True
 
 
-# 5. Add LIMIT automatically
+# 5. Row cap — disabled (matches executor.limit_rows); do not inject LIMIT.
 def limit_rows(sql_query, limit=50):
-    """Add LIMIT to query if not present, handling UNION queries properly"""
-    sql_lower = sql_query.lower()
-    
-    # Check if LIMIT already exists
-    if "limit" in sql_lower:
-        return sql_query
-    
-    # For UNION queries, wrap in subquery with limit
-    if "union" in sql_lower:
-        sql_query = sql_query.rstrip(";")
-        return f"SELECT * FROM ({sql_query}) AS combined_results LIMIT {limit};"
-    
-    # For simple queries, just append LIMIT
-    sql_query = sql_query.rstrip(";")
-    return f"{sql_query} LIMIT {limit};"
+    """Return SQL unchanged; automatic LIMIT injection removed."""
+    return sql_query
 
 # 5.5 repair SQL error
 

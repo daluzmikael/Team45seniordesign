@@ -168,12 +168,12 @@ export function AppSidebar() {
     "border-0 bg-red-500 text-zinc-100 hover:bg-red-400 font-medium data-[active=true]:bg-red-500 data-[active=true]:text-zinc-100 data-[active=true]:hover:bg-red-400"
   const activeTabClass = "bg-red-500 text-zinc-100"
   const searchClass =
-    "border-0 bg-[#bcc1c9] text-zinc-900 hover:bg-[#aeb4be] dark:bg-[#16171b] dark:text-zinc-100 dark:hover:bg-[#23252b]"
+    "border-0 bg-[var(--surface-matte-raised)] text-zinc-900 hover:bg-[var(--surface-matte-hover)] dark:bg-[var(--surface-matte-raised)] dark:text-zinc-100 dark:hover:bg-[var(--surface-matte-hover)]"
   const savedChatClass =
-    "border-0 bg-[#bcc1c9] text-zinc-900 hover:bg-[#aeb4be] dark:bg-[#16171b] dark:text-zinc-100 dark:hover:bg-[#23252b] data-[active=true]:bg-[#bcc1c9] data-[active=true]:text-zinc-900 data-[active=true]:hover:bg-[#aeb4be] dark:data-[active=true]:bg-[#16171b] dark:data-[active=true]:text-zinc-100 dark:data-[active=true]:hover:bg-[#23252b]"
+    "border-0 bg-[var(--surface-matte-raised)] text-zinc-900 hover:bg-[var(--surface-matte-hover)] dark:bg-[var(--surface-matte-raised)] dark:text-zinc-100 dark:hover:bg-[var(--surface-matte-hover)] data-[active=true]:bg-[var(--surface-matte-raised)] data-[active=true]:text-zinc-900 data-[active=true]:hover:bg-[var(--surface-matte-hover)] dark:data-[active=true]:bg-[var(--surface-matte-raised)] dark:data-[active=true]:text-zinc-100 dark:data-[active=true]:hover:bg-[var(--surface-matte-hover)]"
 
   return (
-    <Sidebar className="[&_[data-sidebar=sidebar]]:bg-[#aab0ba] [&_[data-sidebar=sidebar]]:text-zinc-900 dark:[&_[data-sidebar=sidebar]]:bg-[#2f3136] dark:[&_[data-sidebar=sidebar]]:text-zinc-100">
+    <Sidebar className="[&_[data-sidebar=sidebar]]:bg-[var(--surface-matte-sidebar)] [&_[data-sidebar=sidebar]]:text-zinc-900 [&_[data-sidebar=sidebar]]:shadow-none dark:[&_[data-sidebar=sidebar]]:bg-[var(--surface-matte-sidebar)] dark:[&_[data-sidebar=sidebar]]:text-zinc-100">
       <SidebarHeader className="p-2">
         <Button
           className={`w-full justify-start gap-2 ${tabClass}`}

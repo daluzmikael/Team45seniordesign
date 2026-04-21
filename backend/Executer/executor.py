@@ -7,9 +7,11 @@ from sqlglot.errors import ParseError
 import json
 import logging
 import os
+from typing import Optional
 
-if not logging.getLogger().hasHandlers():
-    logging.basicConfig(level=logging.INFO)
+# Root logging is configured by the app entrypoint (e.g. Interpreter.interpreter before
+# this import, or uvicorn). Avoid basicConfig here so we do not steal first configuration
+# and hide DEBUG lines in the interpreter.
 logger = logging.getLogger(__name__)
 # 2. Connect to PostgreSQL (AWS RDS)
 def get_connection():
@@ -78,30 +80,37 @@ def validate_and_normalize_sql(sql_query: str) -> str:
     logger.debug("Normalized SQL:\n%s", normalized_sql)
     return normalized_sql
 
-# 5. Add LIMIT automatically
+# 5. Row cap — automatic LIMIT injection disabled (callers still pass through for compatibility).
 def limit_rows(sql_query, limit=50):
-    sql_lower = sql_query.lower()
-
-    if "limit" in sql_lower:
-        return sql_query
-
-    if "union" in sql_lower:
-        sql_query = sql_query.rstrip(";")
-        return f"SELECT * FROM ({sql_query}) AS combined_results LIMIT {limit};"
-
-    sql_query = sql_query.rstrip(";")
-    final_query = f"{sql_query} LIMIT {limit};"
-
-    logger.debug("SQL after LIMIT enforcement:\n%s", final_query)
-
-    return final_query
+    """Return SQL unchanged; do not append LIMIT. The model may still emit LIMIT."""
+    return sql_query
 
 def set_query_timeout(conn, timeout_ms=3000):
     logger.debug("Setting query timeout to %d ms", timeout_ms)
     cursor = conn.cursor()
     cursor.execute(f"SET LOCAL statement_timeout = {timeout_ms};")
 
-def check_query_cost(conn, sql_query, max_cost=100000):
+def _query_plan_cost_disabled() -> bool:
+    """Env: DISABLE_QUERY_COST_CHECK=1/true or QUERY_PLAN_COST_MAX=off|0|unlimited."""
+    if os.getenv("DISABLE_QUERY_COST_CHECK", "").strip().lower() in ("1", "true", "yes"):
+        return True
+    raw = os.getenv("QUERY_PLAN_COST_MAX", "").strip().lower()
+    return raw in ("off", "none", "disable", "0", "unlimited")
+
+
+def _default_query_plan_cost_cap() -> float:
+    """Planner cost ceiling (PostgreSQL estimated cost units). Set QUERY_PLAN_COST_MAX in .env to override."""
+    return float(os.getenv("QUERY_PLAN_COST_MAX", "2000000").strip())
+
+
+def check_query_cost(conn, sql_query, max_cost: Optional[float] = None):
+    if _query_plan_cost_disabled():
+        logger.debug("Skipping PostgreSQL planner cost check (disabled via env)")
+        return 0.0
+
+    if max_cost is None:
+        max_cost = _default_query_plan_cost_cap()
+
     cursor = conn.cursor()
 
     explain_query = f"EXPLAIN (FORMAT JSON) {sql_query}"
@@ -122,7 +131,7 @@ def check_query_cost(conn, sql_query, max_cost=100000):
     return total_cost
 
 # Query execution function
-def execute_query(conn, sql_query, max_cost=100000, timeout_ms=3000):
+def execute_query(conn, sql_query, max_cost: Optional[float] = None, timeout_ms=60000):
     logger.info("Executing SQL Query:\n%s", sql_query)
     table_refs = sorted(
         set(

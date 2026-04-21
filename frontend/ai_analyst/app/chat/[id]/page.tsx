@@ -159,8 +159,8 @@ export default function ChatPage() {
 
   // for starting a new chat with a pre filled question from the homepage examples
   return (
-    <div className="flex flex-col h-full max-w-4xl mx-auto">
-      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+    <div className="mx-auto flex min-h-0 w-full max-w-4xl flex-1 flex-col">
+      <div className="min-h-0 flex-1 space-y-4 overflow-y-auto p-4">
         {messages.map((msg, idx) => (
           <div
             key={idx}
@@ -222,7 +222,7 @@ export default function ChatPage() {
         <div ref={bottomRef} />
       </div>
 
-      <div className="border-t border-zinc-500 bg-[#c7cad1] p-4 dark:border-zinc-800 dark:bg-[#1c1d21]">
+      <div className="shrink-0 border-t border-[var(--surface-matte-border)] bg-[var(--surface-matte)] p-4 dark:border-[var(--surface-matte-border)] dark:bg-[var(--surface-matte)]">
         <div className="flex gap-2 max-w-4xl mx-auto">
           <Textarea
             value={message}
@@ -234,7 +234,7 @@ export default function ChatPage() {
               }
             }}
             placeholder="Ask about basketball stats..."
-            className="min-h-[60px] resize-none border-zinc-500 bg-[#c7cad1] text-zinc-900 placeholder:text-zinc-600 dark:border-zinc-700 dark:bg-[#1c1d21] dark:text-zinc-100 dark:placeholder:text-zinc-400"
+            className="min-h-[60px] resize-none border-[var(--surface-matte-border)] bg-[var(--surface-matte)] text-zinc-900 shadow-none placeholder:text-zinc-600 dark:border-[var(--surface-matte-border)] dark:bg-[var(--surface-matte)] dark:text-zinc-100 dark:placeholder:text-zinc-400"
             disabled={!!loadingState}
           />
           <Button

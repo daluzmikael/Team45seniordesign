@@ -1348,6 +1348,120 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
     return "\n" + "\n".join(lines)
 
 
+def _is_spatial_shot_dataframe(df: pd.DataFrame) -> bool:
+    """court_shots-style rows with coordinates + make flag."""
+    if df is None or df.empty:
+        return False
+    cols = {c.lower() for c in df.columns}
+    return "loc_x" in cols and "loc_y" in cols and "shot_made_flag" in cols
+
+
+def _build_spatial_shot_summary(df: pd.DataFrame) -> str:
+    """Aggregate raw shot rows into zone / distance / side rates for the LLM."""
+    parts: List[str] = []
+    parts.append(
+        "=== PRE-COMPUTED SUMMARY (use these rates; do NOT recite individual shot rows or sound like a table dump) ==="
+    )
+    d = df.copy()
+    n = len(d)
+    parts.append(f"Shots in this query sample: {n}")
+    if n == 0:
+        return "\n".join(parts)
+
+    made_col = "shot_made_flag"
+    if made_col not in d.columns:
+        parts.append("(No shot_made_flag column.)")
+        return "\n".join(parts)
+
+    d["_mk"] = pd.to_numeric(d[made_col], errors="coerce").fillna(0).astype(int)
+    makes = int(d["_mk"].sum())
+    parts.append(f"Makes / attempts (sample): {makes} / {n}  ({(makes / max(n, 1)) * 100:.1f}% FG)")
+
+    # By shot_type (2PT vs 3PT)
+    st_col = next((c for c in d.columns if c.lower() == "shot_type"), None)
+    if st_col:
+        g = (
+            d.groupby(st_col, dropna=False)["_mk"]
+            .agg(["sum", "count"])
+            .rename(columns={"sum": "makes", "count": "att"})
+        )
+        g["fg_pct"] = (g["makes"] / g["att"].replace(0, np.nan) * 100).round(1)
+        parts.append("\nBy shot_type:")
+        parts.append(g.to_string())
+
+    # Distance buckets (feet)
+    sd_col = next((c for c in d.columns if c.lower() == "shot_distance"), None)
+    if sd_col:
+        sd = pd.to_numeric(d[sd_col], errors="coerce")
+        bins = [-0.1, 5, 16, 24, 500]
+        labels = ["at_rim_to_5ft", "short_mid_5_to_16ft", "long_two_16_to_24ft", "three_24ft_plus"]
+        bucket = pd.cut(sd, bins=bins, labels=labels)
+        gg = d.assign(_bucket=bucket).groupby("_bucket", observed=False)["_mk"].agg(["sum", "count"])
+        gg = gg.rename(columns={"sum": "makes", "count": "att"})
+        gg["fg_pct"] = (gg["makes"] / gg["att"].replace(0, np.nan) * 100).round(1)
+        parts.append("\nBy distance bucket (feet):")
+        parts.append(gg.to_string())
+
+    # Court side from loc_x (NBA stats.coordinate convention: negative/positive split)
+    lx_col = next((c for c in d.columns if c.lower() == "loc_x"), None)
+    if lx_col:
+        lx = pd.to_numeric(d[lx_col], errors="coerce")
+        side = np.where(lx < -40, "left_side", np.where(lx > 40, "right_side", "middle"))
+        gg2 = d.assign(_side=side).groupby("_side", observed=False)["_mk"].agg(["sum", "count"])
+        gg2 = gg2.rename(columns={"sum": "makes", "count": "att"})
+        gg2["fg_pct"] = (gg2["makes"] / gg2["att"].replace(0, np.nan) * 100).round(1)
+        parts.append("\nBy basket side (broad buckets from loc_x):")
+        parts.append(gg2.to_string())
+
+    zb = next((c for c in d.columns if c.lower() == "shot_zone_basic"), None)
+    if zb:
+        gz = d.groupby(zb, dropna=False)["_mk"].agg(["sum", "count"])
+        gz = gz.rename(columns={"sum": "makes", "count": "att"})
+        gz["fg_pct"] = (gz["makes"] / gz["att"].replace(0, np.nan) * 100).round(1)
+        parts.append("\nBy NBA shot_zone_basic (if present):")
+        parts.append(gz.to_string())
+
+    parts.append(
+        "\nNote: If the SQL query included a LIMIT, percentages reflect that sample only; otherwise treat as full query output."
+    )
+    return "\n".join(parts)
+
+
+def _format_spatial_shots_narrative(df: pd.DataFrame, question: str, client: Any) -> str:
+    """Free-form broadcast-style answer for shot-location questions — not rigid tables."""
+    summary = _build_spatial_shot_summary(df)
+    system_prompt = (
+        "You are an NBA analyst on TV — conversational, sharp, and easy to listen to.\n"
+        "The user asked about shooting spots / court locations / where shots come from.\n\n"
+        "RULES:\n"
+        "- Do NOT use stiff section headers like 'Executive Summary', 'Analysis', 'Conclusion', 'Key findings'.\n"
+        "- Do NOT narrate the dataset row-by-row or paste coordinate pairs.\n"
+        "- Use ONLY the PRE-COMPUTED SUMMARY for percentages — interpret what it means on the floor "
+        "(paint vs jumper vs three, left vs right if relevant).\n"
+        "- Write 2–4 short paragraphs OR a tight mix of prose + a few bullets — whichever fits naturally.\n"
+        "- Sound human: one hook line, then texture. Light use of **bold** on a few numbers max.\n"
+        "- If the sample is small or limited, say so casually in one clause — no alarmist disclaimers.\n"
+        "- No bullet wall of every stat; prioritize the story of 'best spots' and 'weaker spots'.\n"
+        "Return Markdown suitable for chat (no code blocks)."
+    )
+    user_prompt = f"Question:\n{question}\n\n{summary}\n\nAnswer in a relaxed, broadcast tone."
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0.75,
+            max_tokens=900,
+        )
+        raw = (resp.choices[0].message.content or "").strip()
+        formatted = raw.replace("###", "\n\n###").replace("####", "\n\n####")
+        return "\n" + formatted.strip()
+    except Exception as e:
+        return f"\nError generating shot-location narrative: {e}"
+
+
 def analyze_dataframe() -> str:
     if query_bot_module is None:
         return (
@@ -1366,6 +1480,9 @@ def analyze_dataframe() -> str:
         return "Error: The query returned an empty result set."
     if client is None:
         return "Error: OpenAI client not available. Set OPENAI_API_KEY or expose 'client' in query_bot."
+
+    if _is_spatial_shot_dataframe(df_output):
+        return _format_spatial_shots_narrative(df_output, user_input, client)
 
     domain = infer_domain(user_input, df_output.columns.tolist())
 
@@ -1526,6 +1643,9 @@ def analyze_question(question: str) -> str:
     if client is None:
         return "Error: OpenAI client not available. Set OPENAI_API_KEY or expose 'client' in query_bot."
 
+    if _is_spatial_shot_dataframe(df):
+        return _format_spatial_shots_narrative(df, question, client)
+
     domain = infer_domain(question, df.columns.tolist())
 
     score_table: Optional[pd.DataFrame] = None
@@ -1662,6 +1782,10 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
             "No data was found for this query. The player may not have participated "
             "in the requested season or playoffs, or the name was not recognized."
         )
+
+    # Shot-chart / court coordinate data: narrative style, pre-aggregated — avoid rigid table dumps.
+    if _is_spatial_shot_dataframe(df):
+        return _format_spatial_shots_narrative(df, question, client)
 
     domain = infer_domain(question, df.columns.tolist())
 

@@ -1,7 +1,7 @@
 "use client"
 
 import { useState } from "react"
-import { Search, Loader2, AlertCircle } from "lucide-react"
+import { Search, Loader2, AlertCircle, ChevronDown } from "lucide-react"
 import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -25,16 +25,65 @@ interface AnalysisResult {
     xAxisKey?: string
     timeFrame?: string
     statDisplayName?: string
-    mode?: "volume" | "accuracy" | "hotspots" | "coldspots"  // for shot chart
+    mode?: "volume" | "accuracy" | "hotspots" | "coldspots"
   }
   error?: string
 }
+
+const EXAMPLE_CATEGORIES = [
+  {
+    label: "Leaderboards",
+    examples: [
+      "Show me the top 10 scorers in 2008",
+      "Who were the top 10 players by assists per game in 2023?",
+      "Show me the top 5 players by rebounds per game in 2009",
+      "Who were the top 10 players with the most minutes in 2007?"
+    ],
+  },
+  {
+    label: "Player Trends",
+    examples: [
+      "Show me Kyle Kuzma ppg trend from 2019 to 2024",
+      "Show me Jimmy Butler's points trend in the 2023 Playoffs",
+      "Show me LeBron James rebounds per game trend from 2010 to 2023",
+      "Show me Stephen Curry 3 point percentage trend over his career"
+    ],
+  },
+  {
+    label: "Comparisons",
+    examples: [
+      "Show me Karl-Anthony Towns rebounds per game in 2021 vs Bol Bol",
+      "Show me Kyle Kuzma and Kevin Durant points from 2019 to 2024",
+      "Compare Stephen Curry and Damian Lillard 3 point shooting percentages in 2023",
+      "Compare LeBron James and Trae Young assists in the 2023 season"
+    ],
+  },
+  {
+    label: "Skill Profiles",
+    examples: [
+      "Show me Dirk Nowitzki's skill profile in 2005",
+      "Show me Manu Ginobili 2013 skill profile vs Trae Young's 2018 skill profile",
+      "Show me Stephen Curry's skill profile",
+      "Show me James Harden's skill profile in the 2018 season"
+    ],
+  },
+  {
+    label: "Shot Chart Heat Maps",
+    examples: [
+      "Show me a heat map of Stephen Curry's 3 point shot selection",
+      "Show me LeBron's best shooting zones against the Celtics",
+      "Show me Steph Curry's shooting percentages heat map",
+      "Show me Shaquille O'Neal's worst shooting zone within 15 feet",
+    ],
+  },
+]
 
 export default function DashboardsPage() {
   const [searchQuery, setSearchQuery] = useState("")
   const [isLoading, setIsLoading] = useState(false)
   const [result, setResult] = useState<AnalysisResult | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [expandedCategory, setExpandedCategory] = useState<string | null>(null)
 
   const handleSearch = async () => {
     if (!searchQuery.trim()) return
@@ -59,7 +108,6 @@ export default function DashboardsPage() {
         throw new Error(data.error || data.detail || "Failed to analyze data")
       }
 
-      // makes sure playerNames is always an array for consistency
       if (data.config && data.config.playerName && !data.config.playerNames) {
         data.config.playerNames = [data.config.playerName]
       }
@@ -71,6 +119,11 @@ export default function DashboardsPage() {
     } finally {
       setIsLoading(false)
     }
+  }
+
+  const handleExampleClick = (example: string) => {
+    setSearchQuery(example)
+    setExpandedCategory(null)
   }
 
   return (
@@ -101,6 +154,59 @@ export default function DashboardsPage() {
         </Button>
       </div>
 
+      {/* Example categories — only show when idle */}
+      {!result && !isLoading && !error && (
+        <div className="flex flex-col items-center gap-6 pt-4">
+          <p className="text-muted-foreground text-sm">
+            Not sure what to ask? Pick a category to see examples.
+          </p>
+
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3 w-full max-w-3xl">
+            {EXAMPLE_CATEGORIES.map((category) => (
+              <div
+                key={category.label}
+                className={`rounded-lg border bg-card p-4 cursor-pointer transition-all text-center hover:bg-accent ${
+                  expandedCategory === category.label
+                    ? "ring-2 ring-primary bg-accent"
+                    : ""
+                }`}
+                onClick={() =>
+                  setExpandedCategory(
+                    expandedCategory === category.label ? null : category.label
+                  )
+                }
+              >
+                <p className="text-sm font-medium">{category.label}</p>
+                <ChevronDown
+                  className={`h-3 w-3 mx-auto mt-1 text-muted-foreground transition-transform ${
+                    expandedCategory === category.label ? "rotate-180" : ""
+                  }`}
+                />
+              </div>
+            ))}
+          </div>
+
+          {/* Expanded example questions */}
+          {expandedCategory && (
+            <div className="w-full max-w-3xl animate-in fade-in slide-in-from-top-2 duration-200">
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {EXAMPLE_CATEGORIES.find(
+                  (c) => c.label === expandedCategory
+                )?.examples.map((example) => (
+                  <div
+                    key={example}
+                    className="rounded-lg border bg-card p-4 hover:bg-accent cursor-pointer transition-colors"
+                    onClick={() => handleExampleClick(example)}
+                  >
+                    <p className="text-sm">{example}</p>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
       {error && (
         <Alert variant="destructive">
           <AlertCircle className="h-4 w-4" />
@@ -111,7 +217,6 @@ export default function DashboardsPage() {
 
       {result && (
         <div className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500">
-          {/* Single Player Trend (Line Chart) */}
           {result.chartType === "SinglePlayerStat" && (
             <div className="border rounded-xl p-6 bg-card shadow-sm">
               <SinglePlayerStat
@@ -125,7 +230,6 @@ export default function DashboardsPage() {
             </div>
           )}
 
-          {/* Comparison (Bar chart) */}
           {result.chartType === "CompareStats" && (
             <div className="border rounded-xl p-6 bg-card shadow-sm">
               <CompareStats
@@ -138,7 +242,6 @@ export default function DashboardsPage() {
             </div>
           )}
 
-          {/* Skill Profile (Radar chart) */}
           {(result.chartType === "CategoricalBreakdown" || result.chartType === "CompareCategoricalBreakdown") && (
             <div className="border rounded-xl p-6 bg-card shadow-sm w-full max-w-lg mx-auto">
               {result.config.playerNames && result.config.playerNames.length > 1 ? (
@@ -158,7 +261,6 @@ export default function DashboardsPage() {
             </div>
           )}
 
-          {/* Leaderboard */}
           {result.chartType === "Leaderboard" && (
             <div className="border rounded-xl p-6 bg-card shadow-sm">
               <Leaderboard
@@ -171,7 +273,6 @@ export default function DashboardsPage() {
             </div>
           )}
 
-          {/* Shot Chart Heat Map */}
           {result.chartType === "ShotChart" && (
             <div className="border rounded-xl p-6 bg-card shadow-sm">
               <ShotChart

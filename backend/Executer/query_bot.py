@@ -1,4 +1,4 @@
-"""
+﻿"""
 To be deleted. Call executor.py and interpreter.py functions directly instead of this layer.
 """
 
@@ -27,7 +27,7 @@ def get_connection():
     return psycopg2.connect(
         host="nba-sdp-project.cs1c0smw8vqa.us-east-1.rds.amazonaws.com",
         port=5432,
-        dbname="NBA-STATS",
+        dbname="postgres",
         user="VonLindenthal",
         password="Vlindenthal1!",
         sslmode="require"

@@ -598,8 +598,8 @@ def _extract_requested_season_start_span(user_input: str):
 def _advanced_table_name_for_window(start: int, end: int, is_playoffs: bool) -> str:
     yy = str(end)[-2:]
     if is_playoffs:
-        return f"nba__advanced__season_{start}_{yy}__season_type_playoffs__per_mode_p"
-    return f"nba__advanced__season_{start}_{yy}__season_type_regular_season__per_"
+        return f"nba_advanced_season_{start}_{yy}_season_type_playoffs_per_mode_p"
+    return f"nba_advanced_season_{start}_{yy}_season_type_regular_season_per"
 
 
 def _qualified_public_table_ref(table_name: str) -> str:
@@ -615,7 +615,7 @@ def _pick_available_advanced_table(
         return _advanced_table_name_for_window(start, end, is_playoffs)
 
     pattern = re.compile(
-        r"nba__advanced__season_(\d{4})_(\d{2})__season_type_(regular_season|playoffs)__[a-z0-9_]+",
+        r"nba_advanced_season_(\d{4})_(\d{2})_season_type_(regular_season|playoffs)_[a-z0-9_]+",
         re.IGNORECASE,
     )
     matches = pattern.findall(schema_description)
@@ -662,7 +662,7 @@ def _enforce_advanced_table_mapping(sql_query: str, user_input: str, schema_desc
     q = re.sub(r"(?i)all_players_(regular|playoffs)_\d{4}_\d{4}", target_ref, q)
     q = re.sub(r"(?i)\bplayer_game_logs\b", target_ref, q)
     q = re.sub(
-        r"(?i)nba__advanced__season_\d{4}_\d{2}__season_type_(regular_season|playoffs)__[a-z0-9_]+",
+        r"(?i)nba_advanced_season_\d{4}_\d{2}_season_type_(regular_season|playoffs)_[a-z0-9_]+",
         target_ref,
         q,
     )
@@ -1083,7 +1083,7 @@ def _ensure_all_players_broad_columns(sql_query: str, user_input: str) -> str:
     # Never inject base-table columns into derived/subquery shapes like by_season.
     if " as by_season" in q_lower or re.search(r"(?is)\bfrom\s*\(", q):
         return q
-    if any(k in q_lower for k in [" sum(", " avg(", " count(", " group by ", " union all "]):
+    if any(k in q_lower for k in [" sum(", " avg(", " count(", " group by ", " union all ", " order by ", " limit "]):
         return q
 
     select_match = re.search(r"(?is)\bselect\b(?P<select_part>.*?)\bfrom\b", q)
@@ -1150,7 +1150,7 @@ def _ensure_profile_columns_in_sql(sql_query: str, user_input: str) -> str:
         return q
     if "player_name ilike" not in q_lower:
         return q
-    if any(k in q_lower for k in [" group by ", " union ", "sum("]):
+    if any(k in q_lower for k in [" group by ", " union ", "sum(", " order by ", " limit "]):
         return q
 
     select_match = re.search(r"(?is)\bselect\b(?P<select_part>.*?)\bfrom\b", q)
@@ -1233,7 +1233,10 @@ def _enforce_raw_data_only_sql(sql_query: str) -> str:
         return q.rstrip(";") + ";"
 
     q = q.rstrip(";")
-    q = re.sub(r"(?is)\border\s+by\b.*?(?=(\blimit\b|$))", " ", q)
+
+    if not re.search(r"(?i)\w+_rank\b", q):
+        q = re.sub(r"(?is)\border\s+by\b.*?(?=(\blimit\b|$))", " ", q)
+    
     q = re.sub(r"(?is)\bgroup\s+by\b.*?(?=(\bhaving\b|\blimit\b|$))", " ", q)
     q = re.sub(r"(?is)\bhaving\b.*?(?=(\blimit\b|$))", " ", q)
 
@@ -1970,25 +1973,27 @@ Generate the SQL:"""
     sql_query = _expand_player_name_filters_for_encoding(sql_query)
     sql_query = _ensure_profile_columns_in_sql(sql_query, user_input_param)
     sql_query = _ensure_season_columns_in_sql(sql_query)
-    try:
-        sql_query = _enforce_raw_data_only_sql(sql_query)
-    except ValueError as policy_error:
-        logger.warning("Raw-data policy violation in generated SQL. Attempting repair: %s", policy_error)
-        sql_query = repair_sql_error(
-            original_sql=sql_query,
-            error_message=f"Raw-data policy violation: {policy_error}",
-            schema_description=schema_description,
-            user_input=user_input_param
-        )
-        sql_query = _enforce_start_year_table_mapping(sql_query, user_input_param)
-        sql_query = _enforce_nth_season_table_mapping(sql_query, user_input_param, conn)
-        sql_query = _rewrite_nth_season_comparison_sql(sql_query, user_input_param, conn)
-        sql_query = _rewrite_implicit_head_to_head_to_career_sql(sql_query, user_input_param, conn)
-        sql_query = _enforce_advanced_table_mapping(sql_query, user_input_param, schema_description)
-        sql_query = _expand_player_name_filters_for_encoding(sql_query)
-        sql_query = _ensure_profile_columns_in_sql(sql_query, user_input_param)
-        sql_query = _ensure_season_columns_in_sql(sql_query)
-        sql_query = _enforce_raw_data_only_sql(sql_query)
+    # Skip raw-data policy for advanced metrics — those tables have pre-computed stats as direct columns
+    if not _is_advanced_metrics_request(user_input_param):
+        try:
+            sql_query = _enforce_raw_data_only_sql(sql_query)
+        except ValueError as policy_error:
+            logger.warning("Raw-data policy violation in generated SQL. Attempting repair: %s", policy_error)
+            sql_query = repair_sql_error(
+                original_sql=sql_query,
+                error_message=f"Raw-data policy violation: {policy_error}",
+                schema_description=schema_description,
+                user_input=user_input_param
+            )
+            sql_query = _enforce_start_year_table_mapping(sql_query, user_input_param)
+            sql_query = _enforce_nth_season_table_mapping(sql_query, user_input_param, conn)
+            sql_query = _rewrite_nth_season_comparison_sql(sql_query, user_input_param, conn)
+            sql_query = _rewrite_implicit_head_to_head_to_career_sql(sql_query, user_input_param, conn)
+            sql_query = _enforce_advanced_table_mapping(sql_query, user_input_param, schema_description)
+            sql_query = _expand_player_name_filters_for_encoding(sql_query)
+            sql_query = _ensure_profile_columns_in_sql(sql_query, user_input_param)
+            sql_query = _ensure_season_columns_in_sql(sql_query)
+            sql_query = _enforce_raw_data_only_sql(sql_query)
     sql_query = _rewrite_nth_season_comparison_sql(sql_query, user_input_param, conn)
     sql_query = _rewrite_implicit_head_to_head_to_career_sql(sql_query, user_input_param, conn)
     sql_query = limit_rows(sql_query)

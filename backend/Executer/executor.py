@@ -19,40 +19,131 @@ def get_connection():
     return psycopg2.connect(
         host="nba-sdp-project.cs1c0smw8vqa.us-east-1.rds.amazonaws.com",
         port=5432,
-        dbname="NBA-STATS",
+        dbname="postgres",
         user="VonLindenthal",
         password="Vlindenthal1!",
         sslmode="require"
     )
 
 
-# 3. Read DB schema (for GPT prompt)
+# 3. Read DB schema (for GPT prompt) — COMPACT + WHITELISTED version
+# Only includes tables the app actually queries. Groups repeated season tables
+# by type and lists columns once. Cuts token usage by ~95% vs the original.
+
+# Table patterns the app actually uses — everything else is excluded
+_RELEVANT_TABLE_PATTERNS = [
+    r"all_players_regular_\d{4}_\d{4}$",
+    r"all_players_playoffs_\d{4}_\d{4}$",
+    r"nba_advanced_season_\d{4}_\d{2}_season_type_(regular_season|playoffs)_per_mode_p",
+    r"player_game_logs$",
+    r"court_shots$",
+]
+
+def _is_relevant_table(table_name: str) -> bool:
+    return any(re.match(p, table_name) for p in _RELEVANT_TABLE_PATTERNS)
+
+
 def get_db_schema(conn):
-    logger.debug("Fetching database schema...")
+    logger.debug("Fetching database schema (compact + whitelisted)...")
     cursor = conn.cursor()
 
     cursor.execute("""
         SELECT table_name
         FROM information_schema.tables
-        WHERE table_schema = 'public';
+        WHERE table_schema = 'public'
+        ORDER BY table_name;
     """)
 
-    tables = cursor.fetchall()
-    schema_description = ""
+    all_tables = [row[0] for row in cursor.fetchall()]
 
-    for table in tables:
-        table_name = table[0]
+    # Filter to only relevant tables
+    tables = [t for t in all_tables if _is_relevant_table(t)]
+    logger.debug("Schema: %d relevant tables out of %d total", len(tables), len(all_tables))
 
+    # Categorize by type
+    regular_tables = sorted([t for t in tables if re.match(r"all_players_regular_\d{4}_\d{4}$", t)])
+    playoffs_tables = sorted([t for t in tables if re.match(r"all_players_playoffs_\d{4}_\d{4}$", t)])
+    advanced_tables = sorted([t for t in tables if t.startswith("nba_advanced_season_")])
+    other_tables = [t for t in tables if t not in regular_tables and t not in playoffs_tables and t not in advanced_tables]
+
+    schema_parts = []
+
+    # Regular season tables — columns once, enumerate years
+    if regular_tables:
+        cursor.execute(f"""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = '{regular_tables[-1]}'
+            ORDER BY ordinal_position;
+        """)
+        columns = ", ".join([col[0] for col in cursor.fetchall()])
+
+        years = []
+        for t in regular_tables:
+            m = re.match(r"all_players_regular_(\d{4})_(\d{4})$", t)
+            if m:
+                years.append(f"{m.group(1)}-{m.group(2)}")
+
+        schema_parts.append(
+            f"=== Regular Season Tables ===\n"
+            f"Table pattern: all_players_regular_YYYY_YYYY\n"
+            f"Columns (same for all): {columns}\n"
+            f"Available tables ({len(regular_tables)}): {', '.join(years)}\n"
+        )
+
+    # Playoffs tables
+    if playoffs_tables:
+        cursor.execute(f"""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = '{playoffs_tables[-1]}'
+            ORDER BY ordinal_position;
+        """)
+        columns = ", ".join([col[0] for col in cursor.fetchall()])
+
+        years = []
+        for t in playoffs_tables:
+            m = re.match(r"all_players_playoffs_(\d{4})_(\d{4})$", t)
+            if m:
+                years.append(f"{m.group(1)}-{m.group(2)}")
+
+        schema_parts.append(
+            f"=== Playoffs Tables ===\n"
+            f"Table pattern: all_players_playoffs_YYYY_YYYY\n"
+            f"Columns (same for all): {columns}\n"
+            f"Available tables ({len(playoffs_tables)}): {', '.join(years)}\n"
+        )
+
+    # Advanced season tables — columns once, list available
+    if advanced_tables:
+        cursor.execute(f"""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = '{advanced_tables[-1]}'
+            ORDER BY ordinal_position;
+        """)
+        columns = ", ".join([col[0] for col in cursor.fetchall()])
+
+        schema_parts.append(
+            f"=== Advanced Season Tables ===\n"
+            f"Table pattern: nba_advanced_season_YYYY_YY_season_type_TYPE_per_mode_p\n"
+            f"Columns (same for all): {columns}\n"
+            f"Available tables ({len(advanced_tables)}): {', '.join(advanced_tables[:5])}... and {len(advanced_tables) - 5} more\n"
+        )
+
+    # Other unique tables — list columns individually
+    for table_name in other_tables:
         cursor.execute(f"""
             SELECT column_name
             FROM information_schema.columns
             WHERE table_name = '{table_name}'
+            ORDER BY ordinal_position;
         """)
+        columns = ", ".join([col[0] for col in cursor.fetchall()])
+        schema_parts.append(f"{table_name}({columns})")
 
-        columns = cursor.fetchall()
-        column_list = ", ".join([col[0] for col in columns])
-        schema_description += f"{table_name}({column_list})\n"
-
+    schema_description = "\n".join(schema_parts)
+    logger.debug("Compact schema size: %d chars (%d tables included)", len(schema_description), len(tables))
     return schema_description
 
 

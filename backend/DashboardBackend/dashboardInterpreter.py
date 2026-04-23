@@ -22,7 +22,7 @@ client = OpenAI(api_key=api_key_env)
 DB_CONFIG = {
     "host": "nba-sdp-project.cs1c0smw8vqa.us-east-1.rds.amazonaws.com",
     "port": 5432,
-    "dbname": "NBA-STATS",
+    "dbname": "postgres",
     "user": "VonLindenthal",
     "password": "Vlindenthal1!",
     "sslmode": "require"

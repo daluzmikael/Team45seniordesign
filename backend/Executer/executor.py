@@ -48,10 +48,20 @@ def get_connection():
 
 # Table patterns the app actually uses — everything else is excluded
 _RELEVANT_TABLE_PATTERNS = [
+    r"player_pergame_regularseason_\d{4}_\d{4}$",
+    r"player_totals_regularseason_\d{4}_\d{4}$",
+    r"player_totals_playoffseason_\d{4}_\d{4}$",
+    r"advance_totals_regularseason_\d{4}_\d{4}$",
+    r"advance_totals_playoffseason_\d{4}_\d{4}$",
+    r"defense_totals_regularseason_\d{4}_\d{4}$",
     r"all_players_regular_\d{4}_\d{4}$",
     r"all_players_playoffs_\d{4}_\d{4}$",
     r"teams_pergame_regularseason_\d{4}_\d{4}$",
     r"teams_pergame_playoffseason_\d{4}_\d{4}$",
+    r"players_clutch_regularseason_\d{4}_\d{4}$",
+    r"players_clutch_playoffseason_\d{4}_\d{4}$",
+    r"violations_totals_regularseason_\d{4}_\d{4}$",
+    r"violations_totals_playoffseason_\d{4}_\d{4}$",
     r"nba_advanced_season_\d{4}_\d{2}_season_type_(regular_season|playoffs)_per_mode_p",
     r"player_game_logs$",
     r"court_shots$",

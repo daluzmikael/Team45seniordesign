@@ -662,6 +662,8 @@ def _enforce_nth_season_table_mapping(sql_query: str, user_input: str, conn) -> 
 
 
 def _rewrite_nth_season_comparison_sql(sql_query: str, user_input: str, conn) -> str:
+    if re.search(r"(?i)\bjoin\b", sql_query or ""):
+        return sql_query
     nth = _extract_requested_nth_season(user_input)
     if not nth:
         return sql_query
@@ -940,6 +942,10 @@ _PLAYER_ALIAS_MAP = {
     "russ": ["Russell Westbrook"],
     "pg": ["Paul George"],
     "pg13": ["Paul George"],
+    "luka": ["Luka Doncic", "Luka Dončić", "Doncic", "Dončić"],
+    "doncic": ["Luka Doncic", "Luka Dončić", "Doncic", "Dončić"],
+    "luka doncic": ["Luka Doncic", "Luka Dončić", "Doncic", "Dončić"],
+    "luka dončić": ["Luka Doncic", "Luka Dončić", "Doncic", "Dončić"],
 }
 
 
@@ -950,7 +956,13 @@ def _normalize_player_candidate(raw: str) -> str:
         "",
         candidate,
     ).strip()
-    candidate = re.sub(r"(?i)\b(in|during|for|from|through|thru|to|over|by|per|the|playoffs?|postseason)\b.*$", "", candidate).strip()
+    candidate = re.sub(
+        r"(?i)\b(in|during|for|from|through|thru|to|over|by|per|the|playoffs?|postseason|"
+        r"this|current|last|season|seasons|using|with|show|stats?|points?|rebounds?|assists?|"
+        r"steals?|blocks?|ts%|true|shooting)\b.*$",
+        "",
+        candidate,
+    ).strip()
     candidate = candidate.strip(" ,.;:!?")
     if not candidate:
         return ""
@@ -967,11 +979,39 @@ def _extract_player_names_from_question(question_text: str) -> list[str]:
     if not q:
         return []
 
+    pair_patterns = [
+        re.compile(r"(?i)\bcompare\s+(.+?)\s+(?:and|vs|versus)\s+(.+?)(?:\bfrom\b|\bin\b|\bduring\b|$)"),
+        re.compile(r"(?i)\bbetween\s+(.+?)\s+and\s+(.+?)(?:\bfrom\b|\bin\b|\bduring\b|$)"),
+        re.compile(r"(?i)\b(.+?)\s+\bthan\b\s+(.+?)(?:\bfrom\b|\bin\b|\bduring\b|$)"),
+    ]
+    pair_names: list[str] = []
+    for pattern in pair_patterns:
+        match = pattern.search(q)
+        if not match:
+            continue
+        for idx in (1, 2):
+            candidate = _normalize_player_candidate(match.group(idx))
+            if candidate:
+                pair_names.append(candidate)
+        break
+    if len(pair_names) >= 2:
+        dedup_pair: list[str] = []
+        seen_pair = set()
+        for name in pair_names:
+            key = name.lower()
+            if key in seen_pair:
+                continue
+            seen_pair.add(key)
+            dedup_pair.append(name)
+        if len(dedup_pair) >= 2:
+            return dedup_pair
+
     names: list[str] = []
     lower_q = q.lower()
     for alias, expanded in _PLAYER_ALIAS_MAP.items():
         if re.search(rf"(?i)\b{re.escape(alias)}\b", q):
-            names.extend(expanded)
+            if expanded:
+                names.append(expanded[0])
 
     possessive_pattern = re.compile(
         r"(?i)\b([A-Za-z][A-Za-z\.\-]*(?:\s+[A-Za-z][A-Za-z\.\-]*){0,2})(?:['’]s)\b"
@@ -980,20 +1020,6 @@ def _extract_player_names_from_question(question_text: str) -> list[str]:
         candidate = _normalize_player_candidate(match.group(1))
         if candidate:
             names.append(candidate)
-
-    pair_patterns = [
-        re.compile(r"(?i)\bcompare\s+(.+?)\s+(?:and|vs|versus)\s+(.+?)(?:\bfrom\b|\bin\b|\bduring\b|$)"),
-        re.compile(r"(?i)\bbetween\s+(.+?)\s+and\s+(.+?)(?:\bfrom\b|\bin\b|\bduring\b|$)"),
-        re.compile(r"(?i)\b(.+?)\s+\bthan\b\s+(.+?)(?:\bfrom\b|\bin\b|\bduring\b|$)"),
-    ]
-    for pattern in pair_patterns:
-        match = pattern.search(q)
-        if not match:
-            continue
-        for idx in (1, 2):
-            candidate = _normalize_player_candidate(match.group(idx))
-            if candidate:
-                names.append(candidate)
 
     capitalized_pattern = re.compile(r"\b([A-Z][a-zA-Z\.\-]+(?:\s+[A-Z][a-zA-Z\.\-]+){1,2})\b")
     for match in capitalized_pattern.finditer(q):
@@ -1236,12 +1262,144 @@ def _extract_schema_table_names(schema_description: str) -> set[str]:
     out: set[str] = set()
     if not schema_description:
         return out
+    # 1) Exact table(col, ...) lines
     for raw_line in schema_description.splitlines():
         line = (raw_line or "").strip()
         m = re.match(r"^([a-zA-Z0-9_]+)\(", line)
         if m:
             out.add(m.group(1))
+    # 2) Any season-table tokens embedded in compact section text
+    token_pat = (
+        r"\b(?:player_pergame_regularseason|player_totals_regularseason|player_totals_playoffseason|"
+        r"advance_totals_regularseason|advance_totals_playoffseason|defense_totals_regularseason|"
+        r"teams_pergame_regularseason|teams_pergame_playoffseason|players_clutch_regularseason|"
+        r"players_clutch_playoffseason|clutch_totals_regularseason|clutch_totals_playoffseason|"
+        r"violations_totals_regularseason|violations_totals_playoffseason|"
+        r"all_players_regular|all_players_playoffs)_(\d{4})_(\d{4})\b"
+    )
+    for m in re.finditer(token_pat, schema_description, flags=re.IGNORECASE):
+        out.add(f"{m.group(0)}")
+    for static_name in ["player_game_logs", "court_shots"]:
+        if re.search(rf"(?i)\b{re.escape(static_name)}\b", schema_description):
+            out.add(static_name)
     return out
+
+
+def _resolve_table_for_season(prefix: str, start: int, end: int, schema_description: str) -> str | None:
+    preferred = f"{prefix}{start}_{end}"
+    existing = _extract_schema_table_names(schema_description)
+    if preferred in existing:
+        return preferred
+    return _pick_latest_table_for_prefix(schema_description, prefix)
+
+
+def _build_dynamic_multitable_sql(sql_query: str, user_input: str, schema_description: str = "") -> str:
+    q = _extract_current_question_text(user_input).lower()
+    is_playoffs = "playoff" in q or "postseason" in q
+    if is_playoffs:
+        return sql_query
+
+    is_compare_prompt = any(k in q for k in ["compare", " vs ", "versus", "between"])
+    wants_advanced = any(k in q for k in ["advanced", "ts%", "true shooting", "usage", "usg", "offrtg", "defrtg", "netrtg"])
+    wants_defense = any(k in q for k in ["defense", "defensive", "blocks", "steals", "def rating", "def_rtg", "opp_pts"])
+    wants_offense = any(k in q for k in ["offense", "offensive", "points", "scoring", "assists", "rebounds", "fg%", "3p%", "ft%"])
+    # For plain compare prompts, automatically include commonly useful families.
+    if is_compare_prompt and not (wants_offense or wants_advanced or wants_defense):
+        wants_offense = True
+        wants_advanced = True
+        wants_defense = True
+    needed = int(wants_advanced) + int(wants_defense) + int(wants_offense)
+    if needed < 2:
+        return sql_query
+
+    start, end, _ = _extract_requested_season_window(user_input)
+    base_table = _resolve_table_for_season("player_pergame_regularseason_", start, end, schema_description)
+    adv_table = _resolve_table_for_season("advance_totals_regularseason_", start, end, schema_description) if wants_advanced else None
+    def_table = _resolve_table_for_season("defense_totals_regularseason_", start, end, schema_description) if wants_defense else None
+
+    if not base_table:
+        return sql_query
+    if wants_advanced and not adv_table:
+        return sql_query
+    if wants_defense and not def_table:
+        return sql_query
+
+    names = _extract_named_players(user_input, sql_query)
+    compare_match = re.search(r"(?i)\bcompare\s+(.+?)\s+(?:and|vs|versus)\s+(.+?)(?:\bfrom\b|\bin\b|\bduring\b|$)", _extract_current_question_text(user_input))
+    explicit_names: list[str] = []
+    if compare_match:
+        explicit_left = _normalize_player_candidate(compare_match.group(1))
+        explicit_right = _normalize_player_candidate(compare_match.group(2))
+        explicit_names = [n for n in [explicit_left, explicit_right] if n]
+        if len(explicit_names) >= 2:
+            names = explicit_names
+    if any(k in q for k in ["compare", "vs", "versus", "between"]):
+        sql_names = _extract_player_names_from_sql(sql_query)
+        if len(explicit_names) < 2 and len(sql_names) >= 2:
+            names = sql_names
+    if any(k in q for k in ["compare", "vs", "versus", "between"]):
+        unique_compare = []
+        seen_compare = set()
+        for n in names:
+            key = (n or "").strip().lower()
+            if not key or key in seen_compare:
+                continue
+            seen_compare.add(key)
+            unique_compare.append(n.strip())
+        if len(unique_compare) < 2:
+            q_text = _extract_current_question_text(user_input)
+            caps = re.findall(r"\b([A-Z][a-zA-Z\.\-]+(?:\s+[A-Z][a-zA-Z\.\-]+))\b", q_text)
+            for c in caps:
+                c_clean = _normalize_player_candidate(c)
+                if not c_clean:
+                    continue
+                key = c_clean.lower()
+                if key in seen_compare:
+                    continue
+                if key in {"compare jayson", "this season", "current season"}:
+                    continue
+                seen_compare.add(key)
+                unique_compare.append(c_clean)
+                if len(unique_compare) >= 2:
+                    break
+        if len(unique_compare) >= 2:
+            names = unique_compare
+    where_clause = _player_where_clause_for_names(names)
+    if where_clause:
+        where_clause = re.sub(r"(?i)(?<!\.)\bplayer\b", "pg.player", where_clause)
+    else:
+        where_match = re.search(r"(?is)\bwhere\b(.*?)(\border\s+by\b|\blimit\b|$)", sql_query)
+        where_clause = (where_match.group(1).strip() if where_match else "")
+        where_clause = re.sub(r"(?i)\bplayer_name\b", "pg.player", where_clause)
+        where_clause = re.sub(r"(?i)(?<!\.)\bplayer\b", "pg.player", where_clause)
+
+    select_cols = ['pg.player', 'pg.team', 'pg.gp']
+    if wants_offense:
+        select_cols.extend(['pg.pts', 'pg.reb', 'pg.ast', 'pg."fg%"', 'pg."3p%"', 'pg."ft%"'])
+    if wants_advanced:
+        select_cols.extend(['adv.ts', 'adv.usg', 'adv.offrtg', 'adv.defrtg', 'adv.netrtg'])
+    if wants_defense:
+        select_cols.extend(['defn.dreb', 'defn.stl', 'defn.blk', 'defn.def_rtg', 'defn.opp_pts'])
+
+    limit_clause = "LIMIT 50"
+    lim_match = re.search(r"(?i)\blimit\s+(\d+)", sql_query)
+    if lim_match:
+        limit_clause = f"LIMIT {lim_match.group(1)}"
+
+    parts = [
+        "SELECT " + ", ".join(select_cols),
+        f"FROM {_qualified_public_table_ref(base_table)} pg",
+    ]
+    if wants_advanced and adv_table:
+        parts.append(f"LEFT JOIN {_qualified_public_table_ref(adv_table)} adv ON pg.player = adv.player AND pg.team = adv.team")
+    if wants_defense and def_table:
+        parts.append(f"LEFT JOIN {_qualified_public_table_ref(def_table)} defn ON pg.player = defn.player AND pg.team = defn.team")
+    if where_clause:
+        parts.append(f"WHERE {where_clause}")
+    parts.append(limit_clause)
+    base_sql = " ".join(parts).strip() + ";"
+
+    return base_sql
 
 
 def _remap_known_table_families_to_existing(sql_query: str, user_input: str, schema_description: str = "") -> str:
@@ -1317,6 +1475,21 @@ def _enforce_extended_family_table_mapping(sql_query: str, user_input: str, sche
     q = _extract_current_question_text(user_input).lower()
     is_playoff_ask = any(k in q for k in ["playoff", "postseason"])
 
+    # Team-level defense asks should route to team tables (player defense totals do not
+    # contain team-name aggregates for prompts like "Celtics defense metrics").
+    has_team_alias = any(team_key in q for team_key in _TEAM_ALIASES.keys())
+    has_defense_term = any(t in q for t in ["defense", "defensive", "def rating", "def_rtg", "opponent points", "opp pts"])
+    if has_team_alias and has_defense_term:
+        start, end, _ = _extract_requested_season_window(user_input)
+        team_prefix = "teams_pergame_playoffseason_" if is_playoff_ask else "teams_pergame_regularseason_"
+        target_team_table = (
+            f"{team_prefix}{start}_{end}"
+            if _extract_schema_table_names(schema_description) and f"{team_prefix}{start}_{end}" in _extract_schema_table_names(schema_description)
+            else _pick_latest_table_for_prefix(schema_description, team_prefix)
+        )
+        if target_team_table:
+            return _replace_first_from_table(sql_query, target_team_table)
+
     # Violations intent: always route to violations totals family (regular/playoffs).
     if any(t in q for t in ["violation", "violations", "voilation", "voilations"]):
         candidate_prefixes = (
@@ -1377,6 +1550,8 @@ def _enforce_defense_table_columns(sql_query: str) -> str:
         return sql_query
     q_lower = sql_query.lower()
     if "defense_totals_regularseason_" not in q_lower:
+        return sql_query
+    if re.search(r"(?i)\bjoin\b", sql_query):
         return sql_query
     safe_select = "player, team, gp, min, def_rtg, dreb, stl, blk, opp_pts, def"
     return re.sub(r"(?is)\bselect\b.*?\bfrom\b", f"SELECT {safe_select} FROM", sql_query, count=1)
@@ -1470,6 +1645,8 @@ def _enforce_team_table_columns(sql_query: str, user_input: str) -> str:
             out = re.sub(r"(?is)\bwhere\b.*?(?=\border\s+by\b|\blimit\b|$)", f"WHERE ({clause}) ", out, count=1)
         else:
             out = out.rstrip(";") + f" WHERE ({clause})"
+    elif _is_team_record_request(user_input):
+        out = re.sub(r"(?is)\bwhere\b.*?(?=\border\s+by\b|\blimit\b|$)", " ", out, count=1)
     # Prefer the most complete/latest row when duplicate team labels exist.
     has_order = re.search(r"(?i)\border\s+by\b", out) is not None
     has_limit = re.search(r"(?i)\blimit\b", out) is not None
@@ -1480,9 +1657,69 @@ def _enforce_team_table_columns(sql_query: str, user_input: str) -> str:
         out = out + ' ORDER BY "GP" DESC NULLS LAST ' + lim_clause
     elif not has_order:
         out = out.rstrip(";") + ' ORDER BY "GP" DESC NULLS LAST'
+    if _is_team_record_request(user_input) and not team_candidates:
+        out = re.sub(
+            r'(?is)\border\s+by\b.*?(?=\blimit\b|$)',
+            'ORDER BY "W" DESC NULLS LAST, "WIN%" DESC NULLS LAST ',
+            out,
+            count=1,
+        )
     if not has_limit:
         out = out.rstrip(";") + " LIMIT 1"
     return out
+
+
+def _enforce_best_team_record_query(sql_query: str, user_input: str, schema_description: str = "") -> str:
+    q = _extract_current_question_text(user_input).lower()
+    if not _is_team_record_request(user_input):
+        return sql_query
+    if not any(k in q for k in ["best", "top", "highest"]):
+        return sql_query
+    if any(team_key in q for team_key in _TEAM_ALIASES.keys()):
+        return sql_query
+    target_table = _pick_latest_table_for_prefix(schema_description, "teams_pergame_regularseason_")
+    if not target_table:
+        return sql_query
+    return (
+        f'SELECT "Team", "GP", "W", "L", "WIN%", "PTS", "FG%", "3P%", "FT%", "+/-" '
+        f'FROM {_qualified_public_table_ref(target_table)} '
+        'ORDER BY "W" DESC NULLS LAST, "WIN%" DESC NULLS LAST LIMIT 1;'
+    )
+
+
+def _enforce_playoff_compare_template(sql_query: str, user_input: str, schema_description: str = "") -> str:
+    q = _extract_current_question_text(user_input).lower()
+    if "playoff" not in q and "postseason" not in q:
+        return sql_query
+    if not any(k in q for k in ["compare", "versus", " vs ", "between"]):
+        return sql_query
+    names = _extract_named_players(user_input, sql_query)
+    if len(names) < 2:
+        return sql_query
+    start, end, is_playoffs = _extract_requested_season_window(user_input)
+    if not is_playoffs:
+        return sql_query
+    table = _resolve_table_for_season("player_totals_playoffseason_", start, end, schema_description)
+    if not table:
+        return sql_query
+    where_clause = _player_where_clause_for_names(names[:2])
+    if not where_clause:
+        return sql_query
+    return (
+        'SELECT player, team, gp, pts, reb, ast, stl, blk, tov, fgm, fga, fg, c_3pm, c_3pa, c_3p, ftm, fta, ft '
+        f'FROM {_qualified_public_table_ref(table)} WHERE {where_clause} LIMIT 50;'
+    )
+
+
+def _enforce_multi_family_stats_join(sql_query: str, user_input: str, schema_description: str = "") -> str:
+    if not sql_query:
+        return sql_query
+    return _build_dynamic_multitable_sql(sql_query, user_input, schema_description)
+
+
+def _enforce_compare_pts_reb_ast_ts_template(sql_query: str, user_input: str) -> str:
+    # Legacy compare template disabled; dynamic multi-family router handles compare logic.
+    return sql_query
 
 
 def _enforce_game_log_column_mapping(sql_query: str, user_input: str) -> str:
@@ -1524,7 +1761,22 @@ def _enforce_game_log_column_mapping(sql_query: str, user_input: str) -> str:
 def _enforce_advanced_table_mapping(sql_query: str, user_input: str, schema_description: str = "") -> str:
     if not sql_query or not _is_advanced_metrics_request(user_input):
         return sql_query
+    # Do not rewrite table names on already-joined SQL; these queries are typically
+    # intentional mixed-family pulls and over-rewriting can corrupt qualified refs.
+    if re.search(r"(?i)\bjoin\b", sql_query):
+        return sql_query
+    # Preserve already-correct mixed-table join queries (basic + advanced).
+    if re.search(r"(?i)\bjoin\b", sql_query) and re.search(r"(?i)\badv\.ts\b", sql_query):
+        if re.search(r"(?i)\bpg\.(pts|reb|ast|gp)\b", sql_query):
+            return sql_query
     user_q = _extract_current_question_text(user_input).lower()
+    has_basic_stat_terms = any(
+        k in user_q
+        for k in ["points", "pts", "rebound", "reb", "assist", "ast", "fg%", "3p%", "ft%", "box score"]
+    )
+    # Do not collapse/retarget when the query is already multi-table for mixed stat asks.
+    if has_basic_stat_terms and re.search(r"(?i)\bjoin\b", sql_query):
+        return sql_query
 
     start, end, is_playoffs = _extract_requested_season_window(user_input)
     target = _pick_available_advanced_table(schema_description, start, end, is_playoffs)
@@ -1549,13 +1801,21 @@ def _enforce_advanced_table_mapping(sql_query: str, user_input: str, schema_desc
     )
 
     is_true_shooting_request = any(k in user_q for k in ["true shooting", "ts%", "ts pct", "ts_pct"])
-    if is_true_shooting_request:
+    # Only collapse to a TS-only query when TS is the primary ask.
+    # If user also asks for basic box stats (pts/reb/ast/etc.), preserve multi-table SQL.
+    is_multi_metric_or_compare = bool(
+        re.search(r"(?i)\b(compare|versus|vs|between)\b", user_q)
+        or re.search(r"(?i)\b(points?|rebounds?|assists?|pts|reb|ast)\b", user_q)
+    )
+    if is_true_shooting_request and not has_basic_stat_terms and not is_multi_metric_or_compare:
         where_clause = None
         where_match = re.search(r"(?is)\bwhere\b(.*?)(\bgroup\s+by\b|\border\s+by\b|\blimit\b|$)", q)
         if where_match:
             maybe = where_match.group(1).strip()
             if re.search(r"(?i)\bplayer\b", maybe) or re.search(r"(?i)\bplayer_name\b", maybe):
                 where_clause = re.sub(r"(?i)\bplayer_name\b", "player", maybe)
+                # If we collapse to a single advanced table, strip source aliases like pg.player.
+                where_clause = re.sub(r"(?i)\b[a-zA-Z_][a-zA-Z0-9_]*\.(player)\b", r"\1", where_clause)
 
         limit = 50
         lim_match = re.search(r"(?i)\blimit\s+(\d+)", q)
@@ -1710,6 +1970,13 @@ def _is_implicit_head_to_head_career_question(user_input: str) -> bool:
 
 def _rewrite_implicit_head_to_head_to_career_sql(sql_query: str, user_input: str, conn) -> str:
     """Expand single-season multi-player compares to weighted career aggregates (regular season)."""
+    if re.search(r"(?i)\bjoin\b", sql_query or ""):
+        return sql_query
+    q_text = _extract_current_question_text(user_input).lower()
+    if ("compare" in q_text or "versus" in q_text or " vs " in q_text or "between" in q_text) and (
+        "playoff" in q_text or "postseason" in q_text
+    ):
+        return sql_query
     if conn is None or not _is_implicit_head_to_head_career_question(user_input):
         return sql_query
     raw = sql_query or ""
@@ -1787,6 +2054,8 @@ def _rewrite_career_aggregate_to_by_season(sql_query: str, user_input: str, conn
     mentions_career = re.search(r"\bcaree+r\b", q_input) is not None
     wants_total = _is_explicit_total_request(question_text)
     q = sql_query or ""
+    if re.search(r"(?i)\bjoin\b", q):
+        return q
     q_lower = q.lower()
     has_union_sum_rollup = ("union all" in q_lower) and ("sum(" in q_lower) and (
         "group by player_name" in q_lower or "group by player" in q_lower
@@ -2045,11 +2314,13 @@ def _expand_player_name_filters_for_encoding(sql_query: str) -> str:
     if not sql_query:
         return sql_query
 
-    pattern = re.compile(r"(?i)(player|player_name)\s+ILIKE\s+'%([^%']+)%'")
+    pattern = re.compile(r"(?i)(?:(?P<alias>[a-zA-Z_][a-zA-Z0-9_]*)\.)?(?P<col>player|player_name)\s+ILIKE\s+'%([^%']+)%'")
 
     def repl(match: re.Match) -> str:
-        col = match.group(1)
-        raw_name = match.group(2).strip()
+        alias = match.group("alias")
+        base_col = match.group("col")
+        col = f"{alias}.{base_col}" if alias else base_col
+        raw_name = match.group(3).strip()
         parts = [p for p in raw_name.split() if p]
         if len(parts) < 2:
             alias_variants = _PLAYER_ALIAS_MAP.get(raw_name.lower())
@@ -2211,7 +2482,17 @@ def _enforce_raw_data_only_sql(sql_query: str) -> str:
     # treat punctuation inside column names as arithmetic.
     select_without_strings = re.sub(r"'[^']*'", "", select_part)
     select_without_strings = re.sub(r'"[^"]*"', "", select_without_strings)
-    if any(op in select_without_strings for op in ["/", "*", "+", "-"]):
+    # Preserve plus/minus stat token if it appears unquoted in model output.
+    # Example: SELECT player, +/- FROM ...
+    select_without_strings = re.sub(
+        r"(?i)(?<!\w)(?:[a-z_][a-z0-9_]*\.)?\+/\-(?!\w)",
+        "PLUS_MINUS_TOKEN",
+        select_without_strings,
+    )
+    arithmetic_pattern = re.compile(
+        r"(?i)(?:\b[a-z_][a-z0-9_\.]*\b|\b\d+(?:\.\d+)?\b)\s*[+\-*/]\s*(?:\b[a-z_][a-z0-9_\.]*\b|\b\d+(?:\.\d+)?\b)"
+    )
+    if arithmetic_pattern.search(select_without_strings):
         raise ValueError("Generated SQL contains disallowed arithmetic in SELECT.")
 
     q = re.sub(r"\s+", " ", q).strip()
@@ -2850,7 +3131,10 @@ Generate the SQL:"""
     sql_query = _rewrite_nth_season_comparison_sql(sql_query, user_input_param, conn)
     sql_query = _rewrite_implicit_head_to_head_to_career_sql(sql_query, user_input_param, conn)
     sql_query = _enforce_advanced_table_mapping(sql_query, user_input_param, schema_description)
+    sql_query = _enforce_multi_family_stats_join(sql_query, user_input_param, schema_description)
     sql_query = _enforce_team_table_mapping(sql_query, user_input_param, schema_description)
+    sql_query = _enforce_best_team_record_query(sql_query, user_input_param, schema_description)
+    sql_query = _enforce_playoff_compare_template(sql_query, user_input_param, schema_description)
     sql_query = _enforce_extended_family_table_mapping(sql_query, user_input_param, schema_description)
     sql_query = _remap_known_table_families_to_existing(sql_query, user_input_param, schema_description)
     sql_query = _enforce_team_table_columns(sql_query, user_input_param)
@@ -2884,7 +3168,10 @@ Generate the SQL:"""
             sql_query = _rewrite_nth_season_comparison_sql(sql_query, user_input_param, conn)
             sql_query = _rewrite_implicit_head_to_head_to_career_sql(sql_query, user_input_param, conn)
             sql_query = _enforce_advanced_table_mapping(sql_query, user_input_param, schema_description)
+            sql_query = _enforce_multi_family_stats_join(sql_query, user_input_param, schema_description)
             sql_query = _enforce_team_table_mapping(sql_query, user_input_param, schema_description)
+            sql_query = _enforce_best_team_record_query(sql_query, user_input_param, schema_description)
+            sql_query = _enforce_playoff_compare_template(sql_query, user_input_param, schema_description)
             sql_query = _enforce_extended_family_table_mapping(sql_query, user_input_param, schema_description)
             sql_query = _remap_known_table_families_to_existing(sql_query, user_input_param, schema_description)
             sql_query = _enforce_team_table_columns(sql_query, user_input_param)
@@ -2898,6 +3185,8 @@ Generate the SQL:"""
                 sql_query = _enforce_raw_data_only_sql(sql_query)
     sql_query = _rewrite_nth_season_comparison_sql(sql_query, user_input_param, conn)
     sql_query = _rewrite_implicit_head_to_head_to_career_sql(sql_query, user_input_param, conn)
+    sql_query = _enforce_best_team_record_query(sql_query, user_input_param, schema_description)
+    sql_query = _enforce_playoff_compare_template(sql_query, user_input_param, schema_description)
     sql_query = limit_rows(sql_query)
 
     try:
@@ -2912,6 +3201,9 @@ Generate the SQL:"""
         try:
             sql_query = _canonicalize_nba_stats_sql(sql_query)
             sql_query = _enforce_team_table_mapping(sql_query, user_input_param, schema_description)
+            sql_query = _enforce_multi_family_stats_join(sql_query, user_input_param, schema_description)
+            sql_query = _enforce_best_team_record_query(sql_query, user_input_param, schema_description)
+            sql_query = _enforce_playoff_compare_template(sql_query, user_input_param, schema_description)
             sql_query = _enforce_extended_family_table_mapping(sql_query, user_input_param, schema_description)
             sql_query = _remap_known_table_families_to_existing(sql_query, user_input_param, schema_description)
             sql_query = _enforce_team_table_columns(sql_query, user_input_param)
@@ -3001,7 +3293,10 @@ Generate the SQL:"""
                 sql_query = _rewrite_nth_season_comparison_sql(sql_query, user_input_param, conn)
                 sql_query = _rewrite_implicit_head_to_head_to_career_sql(sql_query, user_input_param, conn)
                 sql_query = _enforce_advanced_table_mapping(sql_query, user_input_param, schema_description)
+                sql_query = _enforce_multi_family_stats_join(sql_query, user_input_param, schema_description)
                 sql_query = _enforce_team_table_mapping(sql_query, user_input_param, schema_description)
+                sql_query = _enforce_best_team_record_query(sql_query, user_input_param, schema_description)
+                sql_query = _enforce_playoff_compare_template(sql_query, user_input_param, schema_description)
                 sql_query = _enforce_extended_family_table_mapping(sql_query, user_input_param, schema_description)
                 sql_query = _remap_known_table_families_to_existing(sql_query, user_input_param, schema_description)
                 sql_query = _enforce_team_table_columns(sql_query, user_input_param)

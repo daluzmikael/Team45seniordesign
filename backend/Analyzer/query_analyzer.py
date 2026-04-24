@@ -585,10 +585,9 @@ def _is_single_player_stats_question(question: str, df: pd.DataFrame) -> bool:
 def _is_clutch_question_or_frame(question: str, df: pd.DataFrame) -> bool:
     q = (question or "").lower()
     has_clutch_intent = any(k in q for k in ["clutch", "close game", "last 5 minutes"])
-    cols = {str(c).lower() for c in (df.columns.tolist() if df is not None else [])}
-    clutch_markers = {"w_pct", "w", "w_l", "c_3p", "plus_minus"}
-    has_clutch_like_cols = len(cols.intersection(clutch_markers)) > 0
-    return has_clutch_intent or has_clutch_like_cols
+    # Avoid false positives: non-clutch season tables can share overlapping columns.
+    # Only explicit clutch intent should route to clutch profile formatting.
+    return has_clutch_intent
 
 
 def _format_single_player_clutch_profile(df: pd.DataFrame, question: str) -> str:
@@ -1128,44 +1127,102 @@ def _format_single_player_stats_profile(df: pd.DataFrame, question: str, client:
             )
         season_summary = " ".join(summary_sentences)
 
-    lines = [
-        heading,
+    def _append_filtered_table(lines_out: list[str], title: str, cells: list[tuple[str, str]]) -> None:
+        filtered = [(label, value) for label, value in cells if value != "N/A"]
+        if not filtered:
+            return
+        if title:
+            lines_out.append(title)
+        lines_out.append("| " + " | ".join(label for label, _ in filtered) + " |")
+        lines_out.append("|" + "|".join(["---:" for _ in filtered]) + "|")
+        lines_out.append("| " + " | ".join(value for _, value in filtered) + " |")
+        lines_out.append("")
+
+    bio_parts = []
+    if age != "N/A":
+        bio_parts.append(f"Age: {age}")
+    if mins != "N/A":
+        bio_parts.append(f"Minutes: {mins}")
+    if w_pct != "N/A":
+        bio_parts.append(f"W%: {w_pct}")
+    if gp != "N/A":
+        bio_parts.append(f"Games Played: {gp}")
+
+    lines = [heading, ""]
+    if bio_parts:
+        lines.append("_" + " | ".join(bio_parts) + "_")
+        lines.append("")
+
+    _append_filtered_table(
+        lines,
         "",
-        f"_Age: {age} | Minutes: {mins} | W%: {w_pct} | Games Played: {gp}_",
-        "",
-        f"| PPG | REB | AST | Plus/Minus | {extra_label} |",
-        "|---:|---:|---:|---:|---:|",
-        f"| {_fmt_num(_v(row, 'pts'))} | {_fmt_num(_v(row, 'reb'))} | {_fmt_num(_v(row, 'ast'))} | {_fmt_num(_v(row, 'plus_minus'))} | {extra_value} |",
-        "",
+        [
+            ("PPG", _fmt_num(_v(row, "pts"))),
+            ("REB", _fmt_num(_v(row, "reb"))),
+            ("AST", _fmt_num(_v(row, "ast"))),
+            ("Plus/Minus", _fmt_num(_v(row, "plus_minus"))),
+            (extra_label, extra_value),
+        ],
+    )
+    _append_filtered_table(
+        lines,
         "### Scoring",
-        "| PTS | FG% | 3P% | FT% | PTS Rank | FG% Rank | 3P% Rank | FT% Rank |",
-        "|---:|---:|---:|---:|---:|---:|---:|---:|",
-        f"| {_fmt_num(_v(row, 'pts'))} | {_fmt_pct(_v(row, 'fg_pct'))} | {_fmt_pct(_v(row, 'fg3_pct'))} | {_fmt_pct(_v(row, 'ft_pct'))} | {_fmt_int(_v(row, 'pts_rank'))} | {_fmt_int(_v(row, 'fg_pct_rank'))} | {_fmt_int(_v(row, 'fg3_pct_rank'))} | {_fmt_int(_v(row, 'ft_pct_rank'))} |",
-        "",
+        [
+            ("PTS", _fmt_num(_v(row, "pts"))),
+            ("FG%", _fmt_pct(_v(row, "fg_pct"))),
+            ("3P%", _fmt_pct(_v(row, "fg3_pct"))),
+            ("FT%", _fmt_pct(_v(row, "ft_pct"))),
+            ("PTS Rank", _fmt_int(_v(row, "pts_rank"))),
+            ("FG% Rank", _fmt_int(_v(row, "fg_pct_rank"))),
+            ("3P% Rank", _fmt_int(_v(row, "fg3_pct_rank"))),
+            ("FT% Rank", _fmt_int(_v(row, "ft_pct_rank"))),
+        ],
+    )
+    _append_filtered_table(
+        lines,
         "### Rebounding",
-        "| REB | DREB | OREB | REB Rank | DREB Rank | OREB Rank |",
-        "|---:|---:|---:|---:|---:|---:|",
-        f"| {_fmt_num(_v(row, 'reb'))} | {_fmt_num(_v(row, 'dreb'))} | {_fmt_num(_v(row, 'oreb'))} | {_fmt_int(_v(row, 'reb_rank'))} | {_fmt_int(_v(row, 'dreb_rank'))} | {_fmt_int(_v(row, 'oreb_rank'))} |",
-        "",
+        [
+            ("REB", _fmt_num(_v(row, "reb"))),
+            ("DREB", _fmt_num(_v(row, "dreb"))),
+            ("OREB", _fmt_num(_v(row, "oreb"))),
+            ("REB Rank", _fmt_int(_v(row, "reb_rank"))),
+            ("DREB Rank", _fmt_int(_v(row, "dreb_rank"))),
+            ("OREB Rank", _fmt_int(_v(row, "oreb_rank"))),
+        ],
+    )
+    _append_filtered_table(
+        lines,
         "### Assists & Ball Security",
-        "| AST | TOV | AST Rank | TOV Rank |",
-        "|---:|---:|---:|---:|",
-        f"| {_fmt_num(_v(row, 'ast'))} | {_fmt_num(_v(row, 'tov'))} | {_fmt_int(_v(row, 'ast_rank'))} | {_fmt_int(_v(row, 'tov_rank'))} |",
-        "",
+        [
+            ("AST", _fmt_num(_v(row, "ast"))),
+            ("TOV", _fmt_num(_v(row, "tov"))),
+            ("AST Rank", _fmt_int(_v(row, "ast_rank"))),
+            ("TOV Rank", _fmt_int(_v(row, "tov_rank"))),
+        ],
+    )
+    _append_filtered_table(
+        lines,
         "### Defense",
-        "| STL | BLK | PF | STL Rank | BLK Rank | PF Rank |",
-        "|---:|---:|---:|---:|---:|---:|",
-        f"| {_fmt_num(_v(row, 'stl'))} | {_fmt_num(_v(row, 'blk'))} | {_fmt_num(_v(row, 'pf'))} | {_fmt_int(_v(row, 'stl_rank'))} | {_fmt_int(_v(row, 'blk_rank'))} | {_fmt_int(_v(row, 'pf_rank'))} |",
-        "",
+        [
+            ("STL", _fmt_num(_v(row, "stl"))),
+            ("BLK", _fmt_num(_v(row, "blk"))),
+            ("PF", _fmt_num(_v(row, "pf"))),
+            ("STL Rank", _fmt_int(_v(row, "stl_rank"))),
+            ("BLK Rank", _fmt_int(_v(row, "blk_rank"))),
+            ("PF Rank", _fmt_int(_v(row, "pf_rank"))),
+        ],
+    )
+    _append_filtered_table(
+        lines,
         "### Double-Double / Triple-Double",
-        "| DD2 | TD3 | DD2 Rank | TD3 Rank |",
-        "|---:|---:|---:|---:|",
-        f"| {_fmt_num(_v(row, 'dd2'))} | {_fmt_num(_v(row, 'td3'))} | {_fmt_int(_v(row, 'dd2_rank'))} | {_fmt_int(_v(row, 'td3_rank'))} |",
-        "",
-        season_summary,
-        "",
-        "Want me to break down his season profile further?",
-    ]
+        [
+            ("DD2", _fmt_num(_v(row, "dd2"))),
+            ("TD3", _fmt_num(_v(row, "td3"))),
+            ("DD2 Rank", _fmt_int(_v(row, "dd2_rank"))),
+            ("TD3 Rank", _fmt_int(_v(row, "td3_rank"))),
+        ],
+    )
+    lines.extend([season_summary, "", "Want me to break down his season profile further?"])
     return "\n" + "\n".join(lines)
 
 

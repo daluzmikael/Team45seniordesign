@@ -7,22 +7,38 @@ from sqlglot.errors import ParseError
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Optional
+
+from dotenv import load_dotenv
 
 # Root logging is configured by the app entrypoint (e.g. Interpreter.interpreter before
 # this import, or uvicorn). Avoid basicConfig here so we do not steal first configuration
 # and hide DEBUG lines in the interpreter.
 logger = logging.getLogger(__name__)
+
+
+def _load_backend_dotenv() -> None:
+    """Load backend/.env so POSTGRES_* vars apply before connecting."""
+    load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
+
 # 2. Connect to PostgreSQL (AWS RDS)
 def get_connection():
-    """Get a fresh database connection"""
+    """Get a fresh database connection (database name from POSTGRES_DB, default NBA-STATS)."""
+    _load_backend_dotenv()
+    password = os.getenv("POSTGRES_PASSWORD")
+    if not password:
+        raise RuntimeError(
+            "POSTGRES_PASSWORD is not set. Add it to Team45seniordesign/backend/.env"
+        )
     return psycopg2.connect(
-        host="nba-sdp-project.cs1c0smw8vqa.us-east-1.rds.amazonaws.com",
-        port=5432,
-        dbname="postgres",
-        user="VonLindenthal",
-        password="Vlindenthal1!",
-        sslmode="require"
+        host=os.getenv("POSTGRES_HOST", "nba-sdp-project.cs1c0smw8vqa.us-east-1.rds.amazonaws.com"),
+        port=int(os.getenv("POSTGRES_PORT", "5432")),
+        dbname=os.getenv("POSTGRES_DB", "NBA-STATS"),
+        user=os.getenv("POSTGRES_USER", "VonLindenthal"),
+        password=password,
+        sslmode=os.getenv("POSTGRES_SSLMODE", "require"),
     )
 
 

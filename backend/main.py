@@ -20,7 +20,7 @@ from auth import (
     get_conversation_messages,
     list_conversations,
 )
-from Interpreter.interpreter import run_query, debug_query_routing
+from Interpreter.interpreter import run_query, debug_query_routing, get_last_tables_used
 import numpy as np
 import pandas as pd
 import re
@@ -286,6 +286,11 @@ async def analysis_endpoint(
         # Run the query ONCE here — do not let query_analyzer run it again
         query_result = run_query(effective_question)
 
+        tables_used = get_last_tables_used()
+        if tables_used:
+            print("---- TABLES USED ----")
+            print(", ".join(tables_used))
+
         # Handle empty or failed queries with a helpful message instead of crashing
         if query_result is None or query_result.empty:
             payload = {
@@ -297,7 +302,8 @@ async def analysis_endpoint(
                     "- Try specifying a season year, e.g. 'Giannis 2023 playoff performance'."
                 ),
                 "data": [],
-                "question": request.question
+                "question": request.question,
+                "tablesUsed": tables_used,
             }
             if _analysis_debug_enabled():
                 payload["debug"] = {
@@ -318,7 +324,8 @@ async def analysis_endpoint(
             "success": True,
             "analysis": analysis_result,
             "data": clean_data,
-            "question": request.question
+            "question": request.question,
+            "tablesUsed": tables_used,
         }
         if _analysis_debug_enabled():
             payload["debug"] = {

@@ -25,7 +25,7 @@ DB_CONFIG = {
     "dbname": "postgres",
     "user": "VonLindenthal",
     "password": "Vlindenthal1!",
-    "sslmode": "require"
+    "sslmode": "require",
 }
 
 # Database schema info for GPT

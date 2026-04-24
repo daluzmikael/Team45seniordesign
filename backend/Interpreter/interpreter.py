@@ -30,6 +30,7 @@ api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
     logger.warning("OpenAI API key missing from environment")
 client = OpenAI(api_key=api_key)
+_LAST_TABLES_USED: list[str] = []
 
 
 def _extract_current_question_text(user_input: str) -> str:
@@ -179,24 +180,258 @@ def _extract_nth_comparison_player_names(user_input: str):
     return deduped
 
 
+def _physical_regular_summary_table(start: int, end: int) -> str:
+    return f"player_pergame_regularseason_{start}_{end}"
+
+
+def _physical_playoff_summary_table(start: int, end: int) -> str:
+    return f"player_totals_playoffseason_{start}_{end}"
+
+
+def _strip_rank_like_columns_from_select(fragment: str) -> str:
+    """Remove legacy *_rank columns from SELECT lists (not present on NBA-STATS summary tables)."""
+    m = re.search(r"(?is)\bselect\b(?P<sel>.*?)\bfrom\b", fragment)
+    if not m:
+        return fragment
+    sel = m.group("sel")
+    sel2 = re.sub(r",?\s*\b[a-z0-9_]*_rank\b", "", sel, flags=re.IGNORECASE)
+    if sel2 == sel:
+        return fragment
+    return fragment[: m.start("sel")] + sel2 + fragment[m.end("sel") :]
+
+
+def _apply_pergame_column_aliases(fragment: str) -> str:
+    out = fragment
+    pairs = [
+        (r"\bplayer_name\b", "player"),
+        (r"\bteam_abbreviation\b", "team"),
+        (r"\bplus_minus\b", '"+/-"'),
+        (r"\bfg3_pct\b", '"3p%"'),
+        (r"\bfg3a\b", '"3pa"'),
+        (r"\bfg3m\b", '"3pm"'),
+        (r"\bfg_pct\b", '"fg%"'),
+        (r"\bft_pct\b", '"ft%"'),
+    ]
+    for pat, repl in pairs:
+        out = re.sub(pat, repl, out, flags=re.IGNORECASE)
+    return _strip_rank_like_columns_from_select(out)
+
+
+def _apply_totals_column_aliases(fragment: str) -> str:
+    out = fragment
+    pairs = [
+        (r"\bplayer_name\b", "player"),
+        (r"\bteam_abbreviation\b", "team"),
+        (r"\bfg3_pct\b", "c_3p"),
+        (r"\bfg3a\b", "c_3pa"),
+        (r"\bfg3m\b", "c_3pm"),
+        (r"\bfg_pct\b", "fg"),
+        (r"\bft_pct\b", "ft"),
+    ]
+    for pat, repl in pairs:
+        out = re.sub(pat, repl, out, flags=re.IGNORECASE)
+    return _strip_rank_like_columns_from_select(out)
+
+
+def _map_sql_fragment_to_physical_columns(fragment: str) -> str:
+    low = (fragment or "").lower()
+    if "advance_totals_" in low:
+        out = re.sub(r"\bplayer_name\b", "player", fragment, flags=re.IGNORECASE)
+        out = re.sub(r"\bteam_abbreviation\b", "team", out, flags=re.IGNORECASE)
+        out = re.sub(r"\bts_pct\b", "ts", out, flags=re.IGNORECASE)
+        return out
+    if "player_totals_playoffseason_" in low or "player_totals_regularseason_" in low:
+        return _apply_totals_column_aliases(fragment)
+    if "player_pergame_regularseason_" in low:
+        return _apply_pergame_column_aliases(fragment)
+    return fragment
+
+
+def _canonicalize_nba_stats_sql(sql_query: str) -> str:
+    """
+    Map legacy prompt/table names to physical NBA-STATS tables and column identifiers.
+    Safe to run multiple times (idempotent for already-canonical SQL).
+    """
+    if not sql_query:
+        return sql_query
+    q = sql_query
+    q = re.sub(
+        r"(?i)\ball_players_regular_(\d{4})_(\d{4})\b",
+        r"player_pergame_regularseason_\1_\2",
+        q,
+    )
+    q = re.sub(
+        r"(?i)\ball_players_playoffs_(\d{4})_(\d{4})\b",
+        r"player_totals_playoffseason_\1_\2",
+        q,
+    )
+    parts = re.split(r"(?i)\bunion\s+all\b", q)
+    mapped = [_map_sql_fragment_to_physical_columns(p) for p in parts]
+    return " UNION ALL ".join(mapped)
+
+
+def _normalize_table_family_name(table_name: str) -> str:
+    """Collapse year-suffixed physical tables into a stable family key."""
+    return re.sub(r"_(\d{4})_(\d{4})$", "", (table_name or "").strip())
+
+
+def _build_schema_routing_guide(schema_description: str) -> str:
+    """
+    Build a compact routing guide from live information_schema output so the
+    model can map associated words to real columns and table families.
+    """
+    if not schema_description:
+        return ""
+
+    family_to_columns: dict[str, set[str]] = {}
+    for raw_line in schema_description.splitlines():
+        line = (raw_line or "").strip()
+        if not line or "(" not in line or ")" not in line:
+            continue
+        m = re.match(r"^([a-zA-Z0-9_]+)\((.*)\)$", line)
+        if not m:
+            continue
+        table_name = m.group(1).strip()
+        cols_blob = m.group(2).strip()
+        columns = [c.strip() for c in cols_blob.split(",") if c.strip()]
+        if not columns:
+            continue
+        family = _normalize_table_family_name(table_name)
+        family_to_columns.setdefault(family, set()).update(columns)
+
+    if not family_to_columns:
+        return ""
+
+    preferred_families = [
+        "player_pergame_regularseason",
+        "player_totals_regularseason",
+        "player_totals_playoffseason",
+        "advance_totals_regularseason",
+        "advance_totals_playoffseason",
+        "defense_totals_regularseason",
+        "player_game_logs",
+        "court_shots",
+    ]
+
+    keyword_targets = {
+        "points/scoring": ["pts"],
+        "rebounds/boards": ["reb", "oreb", "dreb"],
+        "assists/playmaking": ["ast", "ast_to", "ast_ratio"],
+        "steals/defense": ["stl", "blk", "defrtg", "netrtg"],
+        "turnovers/ball security": ["tov", "to_ratio"],
+        "shooting efficiency": ["fg%", "3p%", "ft%", "fg", "c_3p", "ft", "efg", "ts"],
+        "volume shooting": ["fga", "3pa", "fta", "fg3a"],
+        "usage/workload": ["usg", "min", "gp", "pace", "poss"],
+        "lineup impact": ["netrtg", "offrtg", "defrtg", "poss"],
+        "shot location": ["shot_zone_basic", "shot_zone_area", "loc_x", "loc_y", "shot_made_flag"],
+        "schedule/standings context": ["game_date", "matchup", "wl", "season_type", "season_id"],
+    }
+
+    def _families_for_column(col: str) -> list[str]:
+        matches = [f for f, cols in family_to_columns.items() if col in cols]
+        return sorted(matches)
+
+    lines: list[str] = []
+    lines.append("LIVE SCHEMA ROUTING GUIDE (AUTO-GENERATED FROM DATABASE SCHEMA):")
+    lines.append("- Use this mapping before guessing columns. If a requested stat term appears here, route to these families first.")
+    lines.append("- Always verify final table+column names against DATABASE SCHEMA below when there is any ambiguity.")
+    lines.append("")
+    lines.append("Keyword → candidate columns → table families:")
+
+    for label, cols in keyword_targets.items():
+        family_hits: list[str] = []
+        for col in cols:
+            family_hits.extend(_families_for_column(col))
+        deduped_hits = sorted(set(family_hits))
+        if not deduped_hits:
+            continue
+        show_cols = ", ".join(cols)
+        show_fams = ", ".join(deduped_hits[:8])
+        suffix = " ..." if len(deduped_hits) > 8 else ""
+        lines.append(f"- {label}: [{show_cols}] -> {show_fams}{suffix}")
+
+    nba_families = sorted(f for f in family_to_columns if f.startswith("nba__"))
+    if nba_families:
+        lines.append("")
+        lines.append("NBA__ families discovered in schema:")
+        lines.append("- " + ", ".join(nba_families))
+
+    lines.append("")
+    lines.append("Family column snapshots (real columns discovered):")
+    shown = set()
+    for fam in preferred_families + nba_families[:5]:
+        if fam not in family_to_columns or fam in shown:
+            continue
+        shown.add(fam)
+        cols = sorted(family_to_columns[fam])
+        lines.append(f"- {fam}: " + ", ".join(cols[:24]))
+
+    return "\n".join(lines)
+
+
+def _extract_tables_from_sql(sql_query: str) -> list[str]:
+    """
+    Extract table names referenced by FROM/JOIN so we can print routing visibility
+    in the backend terminal for each user question.
+    """
+    if not sql_query:
+        return []
+    q = re.sub(r"\s+", " ", sql_query)
+    matches = re.findall(
+        r"(?i)\b(?:from|join)\s+(?:public\.)?(?:\"([^\"]+)\"|([a-zA-Z_][a-zA-Z0-9_]*))",
+        q,
+    )
+    tables: list[str] = []
+    seen = set()
+    for quoted_name, bare_name in matches:
+        name = (quoted_name or bare_name or "").strip()
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        tables.append(name)
+    return tables
+
+
+def get_last_tables_used() -> list[str]:
+    return list(_LAST_TABLES_USED)
+
+
 def _available_season_starts(conn, table_type: str):
     try:
         cursor = conn.cursor()
-        cursor.execute(
-            """
-            SELECT table_name
-            FROM information_schema.tables
-            WHERE table_schema = 'public'
-              AND table_name LIKE %s
-            ORDER BY table_name ASC;
-            """,
-            (f"all_players_{table_type}_%",),
-        )
+        if table_type == "regular":
+            like_patterns = ("player_pergame_regularseason_%", "all_players_regular_%")
+        else:
+            like_patterns = ("player_totals_playoffseason_%", "all_players_playoffs_%")
         starts = []
-        for (table_name,) in cursor.fetchall():
-            m = re.match(rf"all_players_{table_type}_(\d{{4}})_(\d{{4}})$", table_name or "")
-            if m:
-                starts.append(int(m.group(1)))
+        for like_pat in like_patterns:
+            cursor.execute(
+                """
+                SELECT table_name
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND table_name LIKE %s
+                ORDER BY table_name ASC;
+                """,
+                (like_pat,),
+            )
+            for (table_name,) in cursor.fetchall():
+                tn = table_name or ""
+                if table_type == "regular":
+                    m = re.match(
+                        r"(?:player_pergame_regularseason|all_players_regular)_(\d{4})_(\d{4})$",
+                        tn,
+                    )
+                else:
+                    m = re.match(
+                        r"(?:player_totals_playoffseason|all_players_playoffs)_(\d{4})_(\d{4})$",
+                        tn,
+                    )
+                if m:
+                    starts.append(int(m.group(1)))
         return sorted(set(starts))
     except Exception:
         return []
@@ -206,9 +441,13 @@ def _first_season_start_for_where(conn, table_type: str, where_clause: str, star
     if not where_clause or not starts:
         return None
     cleaned_where = where_clause.strip().rstrip(";")
+    cleaned_where = re.sub(r"(?i)\bplayer_name\b", "player", cleaned_where)
     for start in starts:
         end = start + 1
-        table_name = f'all_players_{table_type}_{start}_{end}'
+        if table_type == "playoffs":
+            table_name = _physical_playoff_summary_table(start, end)
+        else:
+            table_name = _physical_regular_summary_table(start, end)
         sql = f'SELECT 1 FROM public."{table_name}" WHERE {cleaned_where} LIMIT 1'
         try:
             cursor = conn.cursor()
@@ -233,13 +472,19 @@ def _enforce_nth_season_table_mapping(sql_query: str, user_input: str, conn) -> 
 
     leg_pattern = re.compile(
         r"(?is)(select\s+)(?P<select_part>.*?)(\s+from\s+)"
-        r"(?P<table_name>all_players_(?P<table_type>regular|playoffs)_(?P<start>\d{4})_(?P<end>\d{4}))"
+        r"(?P<table_name>(?:player_pergame_regularseason|player_totals_playoffseason|player_totals_regularseason|all_players_(?:regular|playoffs))_(?P<start>\d{4})_(?P<end>\d{4}))"
         r"(?P<rest>\s+where\s+.*?)(?=(\bunion\s+all\b|$))"
     )
 
     def _rewrite_leg(match: re.Match):
         select_part = match.group("select_part")
-        table_type = (match.group("table_type") or "").lower()
+        table_name_full = (match.group("table_name") or "").lower()
+        if "playoffseason" in table_name_full or (
+            "all_players_" in table_name_full and "playoffs" in table_name_full
+        ):
+            table_type = "playoffs"
+        else:
+            table_type = "regular"
         rest = match.group("rest") or ""
 
         where_match = re.search(
@@ -262,7 +507,10 @@ def _enforce_nth_season_table_mapping(sql_query: str, user_input: str, conn) -> 
         if target_start not in starts:
             return match.group(0)
         target_end = target_start + 1
-        target_table = f"all_players_{table_type}_{target_start}_{target_end}"
+        if table_type == "playoffs":
+            target_table = _physical_playoff_summary_table(target_start, target_end)
+        else:
+            target_table = _physical_regular_summary_table(target_start, target_end)
         season_label = f"{target_start}-{str(target_end)[-2:]}"
 
         updated_select = select_part
@@ -300,7 +548,7 @@ def _rewrite_nth_season_comparison_sql(sql_query: str, user_input: str, conn) ->
     legs = []
     for player_name in player_names[:2]:
         safe_name = player_name.replace("'", "''")
-        where_clause = f"player_name ILIKE '%{safe_name}%'"
+        where_clause = f"player ILIKE '%{safe_name}%'"
         first_start = _first_season_start_for_where(conn, "regular", where_clause, regular_starts)
         if first_start is None:
             continue
@@ -309,18 +557,18 @@ def _rewrite_nth_season_comparison_sql(sql_query: str, user_input: str, conn) ->
             continue
         target_end = target_start + 1
         season_label = f"{target_start}-{str(target_end)[-2:]}"
-        table_name = f'all_players_regular_{target_start}_{target_end}'
+        table_name = _physical_regular_summary_table(target_start, target_end)
         legs.append(
             "SELECT DISTINCT "
             f"{target_start} AS season_start, '{season_label}' AS season_label, "
-            "player_name, pts, reb, ast, fg_pct, fg3_pct, ft_pct, gp "
+            'player, pts, reb, ast, "fg%", "3p%", "ft%", gp '
             f'FROM public."{table_name}" WHERE {where_clause}'
         )
 
     if len(legs) < 2:
         return sql_query
     return (
-        "SELECT season_start, season_label, player_name, pts, reb, ast, fg_pct, fg3_pct, ft_pct, gp "
+        'SELECT season_start, season_label, player, pts, reb, ast, "fg%", "3p%", "ft%", gp '
         f"FROM ({' UNION ALL '.join(legs)}) AS comparison LIMIT 50;"
     )
 
@@ -339,15 +587,19 @@ def _enforce_start_year_table_mapping(sql_query: str, user_input: str) -> str:
     if is_playoffs:
         start = year - 1
         end = year
-        target = f"all_players_playoffs_{start}_{end}"
-        replaced = re.sub(r"(?i)all_players_(regular|playoffs)_\d{4}_\d{4}", target, sql_query)
-        return replaced
+        target = _physical_playoff_summary_table(start, end)
+    else:
+        start = year
+        end = year + 1
+        target = _physical_regular_summary_table(start, end)
 
-    start = year
-    end = year + 1
-    target = f"all_players_regular_{start}_{end}"
-    replaced = re.sub(r"(?i)all_players_(regular|playoffs)_\d{4}_\d{4}", target, sql_query)
-    return replaced
+    summary_pat = (
+        r"(?i)(?:all_players_(?:regular|playoffs)_\d{4}_\d{4}|"
+        r"player_pergame_regularseason_\d{4}_\d{4}|"
+        r"player_totals_playoffseason_\d{4}_\d{4}|"
+        r"player_totals_regularseason_\d{4}_\d{4})"
+    )
+    return re.sub(summary_pat, target, sql_query)
 
 
 def _is_advanced_metrics_request(user_input: str) -> bool:
@@ -397,16 +649,78 @@ def _extract_requested_season_window(user_input: str):
     return 2024, 2025, is_playoffs
 
 
-def _all_players_full_row_columns() -> list[str]:
+def _player_pergame_regularseason_columns() -> list[str]:
+    """Column identifiers on player_pergame_regularseason_* (NBA-STATS)."""
     return [
-        "player_id", "player_name", "nickname", "team_id", "team_abbreviation", "age", "gp", "w", "l", "w_pct",
-        "min", "fgm", "fga", "fg_pct", "fg3m", "fg3a", "fg3_pct", "ftm", "fta", "ft_pct",
-        "oreb", "dreb", "reb", "ast", "tov", "stl", "blk", "blka", "pf", "pfd", "pts", "plus_minus",
-        "gp_rank", "w_rank", "l_rank", "w_pct_rank", "min_rank", "fgm_rank", "fga_rank", "fg_pct_rank",
-        "fg3m_rank", "fg3a_rank", "fg3_pct_rank", "ftm_rank", "fta_rank", "ft_pct_rank", "oreb_rank",
-        "dreb_rank", "reb_rank", "ast_rank", "tov_rank", "stl_rank", "blk_rank", "blka_rank", "pf_rank",
-        "pfd_rank", "pts_rank", "plus_minus_rank", "dd2", "td3", "dd2_rank", "td3_rank", "team_count",
+        "player",
+        "team",
+        "age",
+        "gp",
+        "w",
+        "l",
+        "min",
+        "pts",
+        "fgm",
+        "fga",
+        '"fg%"',
+        '"3pm"',
+        '"3pa"',
+        '"3p%"',
+        "ftm",
+        "fta",
+        '"ft%"',
+        "oreb",
+        "dreb",
+        "reb",
+        "ast",
+        "tov",
+        "stl",
+        "blk",
+        "pf",
+        "fp",
+        "dd2",
+        "td3",
+        '"+/-"',
     ]
+
+
+def _player_totals_season_columns() -> list[str]:
+    """Column identifiers on player_totals_*season_* (NBA-STATS)."""
+    return [
+        "player",
+        "team",
+        "age",
+        "gp",
+        "w",
+        "l",
+        "min",
+        "pts",
+        "fgm",
+        "fga",
+        "fg",
+        "c_3pm",
+        "c_3pa",
+        "c_3p",
+        "ftm",
+        "fta",
+        "ft",
+        "oreb",
+        "dreb",
+        "reb",
+        "ast",
+        "tov",
+        "stl",
+        "blk",
+        "pf",
+        "fp",
+        "dd2",
+        "td3",
+    ]
+
+
+def _all_players_full_row_columns() -> list[str]:
+    """Backward-compatible name: full row slice uses per-game regular-season layout."""
+    return _player_pergame_regularseason_columns()
 
 
 _PLAYER_ALIAS_MAP = {
@@ -502,7 +816,7 @@ def _extract_player_names_from_sql(sql_query: str) -> list[str]:
     q = sql_query or ""
     matches = [
         m.strip()
-        for m in re.findall(r"(?i)player_name\s+ILIKE\s+'%([^%']+)%'", q)
+        for m in re.findall(r"(?i)(?:player|player_name)\s+ILIKE\s+'%([^%']+)%'", q)
         if m and m.strip()
     ]
     if not matches:
@@ -541,7 +855,7 @@ def _player_where_clause_for_names(player_names: list[str]) -> str:
         subclauses = []
         for variant in expanded_variants:
             safe_name = variant.replace("'", "''")
-            subclauses.append(f"player_name ILIKE '%{safe_name}%'")
+            subclauses.append(f"player ILIKE '%{safe_name}%'")
         if subclauses:
             clauses.append("(" + " OR ".join(subclauses) + ")")
     return " OR ".join(clauses)
@@ -596,16 +910,25 @@ def _extract_requested_season_start_span(user_input: str):
 
 
 def _advanced_table_name_for_window(start: int, end: int, is_playoffs: bool) -> str:
-    yy = str(end)[-2:]
     if is_playoffs:
-        return f"nba_advanced_season_{start}_{yy}_season_type_playoffs_per_mode_p"
-    return f"nba_advanced_season_{start}_{yy}_season_type_regular_season_per"
+        return f"advance_totals_playoffseason_{start}_{end}"
+    return f"advance_totals_regularseason_{start}_{end}"
 
 
 def _qualified_public_table_ref(table_name: str) -> str:
     # Quote the identifier and qualify schema to avoid search_path mismatches.
     safe = (table_name or "").replace('"', '""')
     return f'public."{safe}"'
+
+
+def _sql_select_mentions_column(select_part: str, col: str) -> bool:
+    """Match quoted stat columns (e.g. \"fg%\") or plain identifiers in a SELECT list."""
+    if not col:
+        return True
+    sp = select_part or ""
+    if col.startswith('"'):
+        return col.lower().replace(" ", "") in sp.lower().replace(" ", "")
+    return re.search(rf"(?i)\b{re.escape(col)}\b", sp) is not None
 
 
 def _pick_available_advanced_table(
@@ -615,24 +938,47 @@ def _pick_available_advanced_table(
         return _advanced_table_name_for_window(start, end, is_playoffs)
 
     pattern = re.compile(
-        r"nba_advanced_season_(\d{4})_(\d{2})_season_type_(regular_season|playoffs)_[a-z0-9_]+",
+        r"advance_totals_(regularseason|playoffseason)_(\d{4})_(\d{4})",
         re.IGNORECASE,
     )
     matches = pattern.findall(schema_description)
     if not matches:
-        return _advanced_table_name_for_window(start, end, is_playoffs)
+        legacy = re.compile(
+            r"nba_advanced_season_(\d{4})_(\d{2})_season_type_(regular_season|playoffs)_[a-z0-9_]+",
+            re.IGNORECASE,
+        )
+        leg = legacy.findall(schema_description)
+        if not leg:
+            return _advanced_table_name_for_window(start, end, is_playoffs)
+        wanted = "playoffs" if is_playoffs else "regular_season"
+        candidates = []
+        for start_s, end_yy_s, season_type in leg:
+            if season_type.lower() != wanted:
+                continue
+            try:
+                st = int(start_s)
+                ed = int(f"{str(st)[:2]}{end_yy_s}")
+            except Exception:
+                continue
+            candidates.append((st, ed))
+        if not candidates:
+            return _advanced_table_name_for_window(start, end, is_playoffs)
+        for st, ed in candidates:
+            if st == start and ed == end:
+                return _advanced_table_name_for_window(st, ed, is_playoffs)
+        older_or_equal = [c for c in candidates if c[0] <= start]
+        best = max(older_or_equal, key=lambda c: c[0]) if older_or_equal else max(candidates, key=lambda c: c[0])
+        return _advanced_table_name_for_window(best[0], best[1], is_playoffs)
 
-    wanted_type = "playoffs" if is_playoffs else "regular_season"
+    wanted_kind = "playoffseason" if is_playoffs else "regularseason"
     candidates = []
-    for start_s, end_yy_s, season_type in matches:
-        if season_type.lower() != wanted_type:
+    for kind, st_s, ed_s in matches:
+        if kind.lower() != wanted_kind:
             continue
         try:
-            st = int(start_s)
-            ed = int(f"{str(st)[:2]}{end_yy_s}")
+            candidates.append((int(st_s), int(ed_s)))
         except Exception:
             continue
-        candidates.append((st, ed))
 
     if not candidates:
         return _advanced_table_name_for_window(start, end, is_playoffs)
@@ -660,9 +1006,17 @@ def _enforce_advanced_table_mapping(sql_query: str, user_input: str, schema_desc
 
     # Route any season-summary/game-log source to advanced table family for advanced-stat intents.
     q = re.sub(r"(?i)all_players_(regular|playoffs)_\d{4}_\d{4}", target_ref, q)
+    q = re.sub(r"(?i)player_pergame_regularseason_\d{4}_\d{4}", target_ref, q)
+    q = re.sub(r"(?i)player_totals_playoffseason_\d{4}_\d{4}", target_ref, q)
+    q = re.sub(r"(?i)player_totals_regularseason_\d{4}_\d{4}", target_ref, q)
     q = re.sub(r"(?i)\bplayer_game_logs\b", target_ref, q)
     q = re.sub(
         r"(?i)nba_advanced_season_\d{4}_\d{2}_season_type_(regular_season|playoffs)_[a-z0-9_]+",
+        target_ref,
+        q,
+    )
+    q = re.sub(
+        r"(?i)advance_totals_(?:regularseason|playoffseason)_\d{4}_\d{4}",
         target_ref,
         q,
     )
@@ -674,8 +1028,8 @@ def _enforce_advanced_table_mapping(sql_query: str, user_input: str, schema_desc
         where_match = re.search(r"(?is)\bwhere\b(.*?)(\bgroup\s+by\b|\border\s+by\b|\blimit\b|$)", q)
         if where_match:
             maybe = where_match.group(1).strip()
-            if "player_name" in maybe.lower():
-                where_clause = maybe
+            if re.search(r"(?i)\bplayer\b", maybe) or re.search(r"(?i)\bplayer_name\b", maybe):
+                where_clause = re.sub(r"(?i)\bplayer_name\b", "player", maybe)
 
         limit = 50
         lim_match = re.search(r"(?i)\blimit\s+(\d+)", q)
@@ -686,7 +1040,7 @@ def _enforce_advanced_table_mapping(sql_query: str, user_input: str, schema_desc
                 limit = 50
 
         parts = [
-            "SELECT player_name, team_abbreviation, CAST(ts_pct AS DOUBLE PRECISION) AS true_shooting_pct",
+            "SELECT player, team, ts AS true_shooting_pct",
             f"FROM {target_ref}",
         ]
         if where_clause:
@@ -701,18 +1055,18 @@ def _enforce_advanced_table_mapping(sql_query: str, user_input: str, schema_desc
 def _columns_for_by_season_question(question_text: str) -> list[str]:
     q = (question_text or "").lower()
     if any(k in q for k in ["shoot", "percentage", "fg%", "3 point", "3p", "true shooting"]):
-        return ["fg_pct", "fg3_pct", "ft_pct", "fgm", "fga", "fg3m", "fg3a", "ftm", "fta", "gp"]
+        return ['"fg%"', '"3p%"', '"ft%"', "fgm", "fga", '"3pm"', '"3pa"', "ftm", "fta", "gp"]
     if any(k in q for k in ["rebound", "boards", "glass"]):
-        return ["reb", "oreb", "dreb", "reb_rank", "oreb_rank", "dreb_rank", "gp"]
+        return ["reb", "oreb", "dreb", "gp"]
     if any(k in q for k in ["assist", "playmaking", "passing"]):
-        return ["ast", "ast_rank", "tov", "tov_rank", "gp"]
+        return ["ast", "tov", "gp"]
     if any(k in q for k in ["block", "rim protection"]):
-        return ["blk", "blk_rank", "gp"]
+        return ["blk", "gp"]
     if any(k in q for k in ["steal", "defense"]):
-        return ["stl", "stl_rank", "gp"]
+        return ["stl", "gp"]
     if any(k in q for k in ["score", "points", "scor", "offense"]):
-        return ["pts", "pts_rank", "fg_pct", "fg3_pct", "ft_pct", "gp"]
-    return ["pts", "reb", "ast", "fg_pct", "fg3_pct", "ft_pct", "gp"]
+        return ["pts", '"fg%"', '"3p%"', '"ft%"', "gp"]
+    return ["pts", "reb", "ast", '"fg%"', '"3p%"', '"ft%"', "gp"]
 
 
 def _is_over_time_request(question_text: str) -> bool:
@@ -839,17 +1193,23 @@ def _rewrite_implicit_head_to_head_to_career_sql(sql_query: str, user_input: str
     if len(named) < 2:
         return sql_query
 
-    if "union all" in q_low and raw.lower().count("all_players_regular_") > 1:
+    if "union all" in q_low and raw.lower().count("player_pergame_regularseason_") > 1:
         return sql_query
 
     plays = ("playoff" in _extract_current_question_text(user_input).lower()) or (
         "postseason" in _extract_current_question_text(user_input).lower()
     )
     table_kind = "playoffs" if plays else "regular"
-    prefix = f"all_players_{table_kind}_"
+    prefix = (
+        "player_totals_playoffseason_"
+        if table_kind == "playoffs"
+        else "player_pergame_regularseason_"
+    )
 
     esc_p = re.escape(prefix)
-    from_m = re.search(rf"(?is)\bfrom\s+(?:public\.)?(?P<t>{esc_p}\d{{4}}_\d{{4}})\b", raw)
+    from_m = re.search(rf"(?is)\bfrom\s+(?:public\.)?\"(?P<t>{esc_p}\d{{4}}_\d{{4}})\"\b", raw)
+    if not from_m:
+        from_m = re.search(rf"(?is)\bfrom\s+(?:public\.)?(?P<t>{esc_p}\d{{4}}_\d{{4}})\b", raw)
     if not from_m:
         return sql_query
 
@@ -863,6 +1223,7 @@ def _rewrite_implicit_head_to_head_to_career_sql(sql_query: str, user_input: str
         if mm:
             stops.append(mm.start())
     where_clause = tail[: min(stops) if stops else len(tail)].strip().rstrip(";")
+    where_clause = re.sub(r"(?i)\bplayer_name\b", "player", where_clause)
 
     avail = _available_season_starts(conn, table_kind)
     if len(avail) < 2:
@@ -873,24 +1234,22 @@ def _rewrite_implicit_head_to_head_to_career_sql(sql_query: str, user_input: str
         end_full = start_year + 1
         tnam = f"{prefix}{start_year}_{end_full}"
         ref = _qualified_public_table_ref(tnam)
-        legs.append(
-            f"SELECT player_name, gp, reb, pts, ast, min, fgm, fga, fg3m, fg3a, ftm, fta FROM {ref} WHERE ({where_clause})"
-        )
+        if table_kind == "playoffs":
+            legs.append(
+                f"SELECT {start_year} AS season_start, player, team, gp, w, l, min, pts, reb, ast, "
+                "fgm, fga, fg, c_3pm, c_3pa, c_3p, ftm, fta, ft, oreb, dreb, stl, blk, tov, pf "
+                f"FROM {ref} WHERE ({where_clause})"
+            )
+        else:
+            legs.append(
+                f'SELECT {start_year} AS season_start, player, team, gp, w, l, min, pts, reb, ast, '
+                'fgm, fga, "fg%", "3pm", "3pa", "3p%", ftm, fta, "ft%", stl, blk, tov, pf, "+/-" '
+                f"FROM {ref} WHERE ({where_clause})"
+            )
 
+    # Raw rows only: one row per player per season; all stats come from the tables (no SUM/CAST in SQL).
     union_inner = " UNION ALL ".join(legs)
-    return (
-        "SELECT player_name, "
-        "SUM(gp)::bigint AS career_gp, "
-        "SUM(reb * gp)::double precision / NULLIF(SUM(gp), 0) AS reb_per_game_career, "
-        "SUM(pts * gp)::double precision / NULLIF(SUM(gp), 0) AS pts_per_game_career, "
-        "SUM(ast * gp)::double precision / NULLIF(SUM(gp), 0) AS ast_per_game_career, "
-        "SUM(min * gp)::double precision / NULLIF(SUM(gp), 0) AS min_per_game_career, "
-        "(SUM(fgm)::double precision / NULLIF(SUM(fga), 0)) AS fg_pct_career, "
-        "(SUM(fg3m)::double precision / NULLIF(SUM(fg3a), 0)) AS fg3_pct_career, "
-        "(SUM(ftm)::double precision / NULLIF(SUM(fta), 0)) AS ft_pct_career "
-        f"FROM ({union_inner}) AS career_union "
-        "GROUP BY player_name LIMIT 50"
-    )
+    return union_inner + " LIMIT 500"
 
 
 def _rewrite_career_aggregate_to_by_season(sql_query: str, user_input: str, conn=None) -> str:
@@ -903,7 +1262,9 @@ def _rewrite_career_aggregate_to_by_season(sql_query: str, user_input: str, conn
     wants_total = _is_explicit_total_request(question_text)
     q = sql_query or ""
     q_lower = q.lower()
-    has_union_sum_rollup = ("union all" in q_lower) and ("sum(" in q_lower) and ("group by player_name" in q_lower)
+    has_union_sum_rollup = ("union all" in q_lower) and ("sum(" in q_lower) and (
+        "group by player_name" in q_lower or "group by player" in q_lower
+    )
     # Default non-total career asks to by-season rows rather than SUM rollups.
     if mentions_career and not wants_total:
         asks_over_time = True
@@ -918,23 +1279,44 @@ def _rewrite_career_aggregate_to_by_season(sql_query: str, user_input: str, conn
     if not asks_over_time and not asks_full_row_player_slice:
         return sql_query
 
-    if "all_players_regular_" not in q_lower and "all_players_playoffs_" not in q_lower:
+    if not re.search(
+        r"(?i)\b(player_pergame_regularseason_|player_totals_playoffseason_|player_totals_regularseason_|all_players_(?:regular|playoffs)_)\d{4}_\d{4}\b",
+        q,
+    ):
         return q
 
-    table_type = "playoffs" if (("playoff" in q_input) or ("postseason" in q_input) or ("all_players_playoffs_" in q_lower)) else "regular"
+    table_type = (
+        "playoffs"
+        if (
+            ("playoff" in q_input)
+            or ("postseason" in q_input)
+            or ("player_totals_playoffseason_" in q_lower)
+            or ("all_players_playoffs_" in q_lower)
+        )
+        else "regular"
+    )
 
     # Build from detected season tables directly (no SUM/COUNT) for stable season-trend output.
-    table_matches = re.findall(r"(?i)\b(all_players_(?:regular|playoffs)_(\d{4})_(\d{4}))\b", q)
-    if not table_matches:
-        table_matches = []
+    table_matches = re.findall(
+        r"(?i)\b(player_pergame_regularseason_\d{4}_\d{4}|player_totals_playoffseason_\d{4}_\d{4}|"
+        r"player_totals_regularseason_\d{4}_\d{4}|all_players_regular_\d{4}_\d{4}|all_players_playoffs_\d{4}_\d{4})\b",
+        q,
+    )
     unique_tables: dict[str, tuple[int, int]] = {}
-    for table_name, start_s, end_s in table_matches:
+    for table_name in table_matches:
+        m = re.search(r"_(\d{4})_(\d{4})$", table_name)
+        if not m:
+            continue
         try:
-            unique_tables[table_name] = (int(start_s), int(end_s))
+            unique_tables[table_name] = (int(m.group(1)), int(m.group(2)))
         except Exception:
             continue
     if named_players:
-        full_cols = _all_players_full_row_columns()
+        full_cols = (
+            _player_totals_season_columns()
+            if table_type == "playoffs"
+            else _player_pergame_regularseason_columns()
+        )
         col_sql = ", ".join(full_cols)
         available_starts = _available_season_starts(conn, table_type) if conn is not None else []
         legs = []
@@ -977,11 +1359,16 @@ def _rewrite_career_aggregate_to_by_season(sql_query: str, user_input: str, conn
 
             for start in season_starts:
                 end = start + 1
-                table_name = f"all_players_{table_type}_{start}_{end}"
+                phys = (
+                    _physical_playoff_summary_table(start, end)
+                    if table_type == "playoffs"
+                    else _physical_regular_summary_table(start, end)
+                )
+                ref = _qualified_public_table_ref(phys)
                 season_label = f"{start}-{str(end)[-2:]}"
                 legs.append(
                     f"SELECT {start} AS season_start, '{season_label}' AS season_label, "
-                    f"{col_sql} FROM {table_name} WHERE {player_where}"
+                    f"{col_sql} FROM {ref} WHERE {player_where}"
                 )
 
         if legs:
@@ -1002,6 +1389,7 @@ def _rewrite_career_aggregate_to_by_season(sql_query: str, user_input: str, conn
     where_clause = (where_match.group("where") or "").strip()
     if not where_clause:
         return q
+    where_clause = re.sub(r"(?i)\bplayer_name\b", "player", where_clause)
 
     cols = _columns_for_by_season_question(question_text)
     col_sql = ", ".join(cols)
@@ -1010,13 +1398,21 @@ def _rewrite_career_aggregate_to_by_season(sql_query: str, user_input: str, conn
     legs = []
     for table_name, (start, end) in sorted_tables:
         season_label = f"{start}-{str(end)[-2:]}"
+        low = table_name.lower()
+        if "playoffseason" in low or "all_players_playoffs" in low:
+            phys = _physical_playoff_summary_table(start, end)
+        elif "player_totals_regularseason" in low:
+            phys = f"player_totals_regularseason_{start}_{end}"
+        else:
+            phys = _physical_regular_summary_table(start, end)
+        ref = _qualified_public_table_ref(phys)
         legs.append(
             f"SELECT {start} AS season_start, '{season_label}' AS season_label, "
-            f"player_name, {col_sql} FROM {table_name} WHERE {where_clause}"
+            f"player, {col_sql} FROM {ref} WHERE {where_clause}"
         )
 
     rebuilt = (
-        f"SELECT DISTINCT season_start, season_label, player_name, {col_sql} "
+        f"SELECT DISTINCT season_start, season_label, player, {col_sql} "
         f"FROM ({' UNION ALL '.join(legs)}) AS by_season "
         f"ORDER BY season_start ASC LIMIT 50;"
     )
@@ -1037,7 +1433,7 @@ def _ensure_rebounding_leaderboard_columns(sql_query: str, user_input: str) -> s
 
     select_part = select_match.group("select_part")
     start, end = select_match.span("select_part")
-    required = ["player_name", "team_abbreviation", "reb", "reb_rank", "oreb", "oreb_rank", "dreb", "dreb_rank", "gp"]
+    required = ["player", "team", "reb", "oreb", "dreb", "gp"]
     missing = [col for col in required if not re.search(rf"(?i)\b{re.escape(col)}\b", select_part)]
     if not missing:
         return q
@@ -1046,7 +1442,7 @@ def _ensure_rebounding_leaderboard_columns(sql_query: str, user_input: str) -> s
     q = q[:start] + injected + q[end:]
 
     if "order by" not in q.lower():
-        q = q.rstrip().rstrip(";") + " ORDER BY reb_rank ASC NULLS LAST;"
+        q = q.rstrip().rstrip(";") + " ORDER BY reb DESC NULLS LAST;"
     return q
 
 
@@ -1063,14 +1459,14 @@ def _ensure_assist_leaderboard_columns(sql_query: str, user_input: str) -> str:
         return q
     select_part = select_match.group("select_part")
     start, end = select_match.span("select_part")
-    required = ["player_name", "team_abbreviation", "ast", "ast_rank", "tov", "tov_rank", "gp"]
+    required = ["player", "team", "ast", "tov", "gp"]
     missing = [col for col in required if not re.search(rf"(?i)\b{re.escape(col)}\b", select_part)]
     if not missing:
         return q
     injected = select_part.rstrip() + ", " + ", ".join(missing) + " "
     q = q[:start] + injected + q[end:]
     if "order by" not in q.lower():
-        q = q.rstrip().rstrip(";") + " ORDER BY ast_rank ASC NULLS LAST;"
+        q = q.rstrip().rstrip(";") + " ORDER BY ast DESC NULLS LAST;"
     return q
 
 
@@ -1078,7 +1474,13 @@ def _ensure_all_players_broad_columns(sql_query: str, user_input: str) -> str:
     q = sql_query or ""
     q_lower = q.lower()
     # Restrict to simple single-season season-summary selects.
-    if "all_players_regular_" not in q_lower and "all_players_playoffs_" not in q_lower:
+    if (
+        "player_pergame_regularseason_" not in q_lower
+        and "player_totals_playoffseason_" not in q_lower
+        and "player_totals_regularseason_" not in q_lower
+        and "all_players_regular_" not in q_lower
+        and "all_players_playoffs_" not in q_lower
+    ):
         return q
     # Never inject base-table columns into derived/subquery shapes like by_season.
     if " as by_season" in q_lower or re.search(r"(?is)\bfrom\s*\(", q):
@@ -1091,8 +1493,12 @@ def _ensure_all_players_broad_columns(sql_query: str, user_input: str) -> str:
         return q
     select_part = select_match.group("select_part")
     start, end = select_match.span("select_part")
-    required_columns = _all_players_full_row_columns()
-    missing = [c for c in required_columns if not re.search(rf"(?i)\b{re.escape(c)}\b", select_part)]
+    required_columns = (
+        _player_totals_season_columns()
+        if "player_totals_" in q_lower
+        else _player_pergame_regularseason_columns()
+    )
+    missing = [c for c in required_columns if not _sql_select_mentions_column(select_part, c)]
     if not missing:
         return q
     injected = select_part.rstrip() + ", " + ", ".join(missing) + " "
@@ -1101,11 +1507,11 @@ def _ensure_all_players_broad_columns(sql_query: str, user_input: str) -> str:
 
 def _expand_player_name_filters_for_encoding(sql_query: str) -> str:
     """
-    Expand exact full-name ILIKE filters with a robust fallback:
-      player_name ILIKE '%First Last%'
+    Expand exact full-name ILIKE filters with a robust fallback on the `player` column:
+      player ILIKE '%First Last%'
     becomes:
-      (player_name ILIKE '%First Last%' OR
-       (player_name ILIKE '%First%' AND player_name ILIKE '%LastPrefix%'))
+      (player ILIKE '%First Last%' OR
+       (player ILIKE '%First%' AND player ILIKE '%LastPrefix%'))
 
     This helps match mojibake/diacritics corruption in DB values
     (e.g., Jokić stored as JokiÄ) without modifying database data.
@@ -1113,10 +1519,10 @@ def _expand_player_name_filters_for_encoding(sql_query: str) -> str:
     if not sql_query:
         return sql_query
 
-    pattern = re.compile(r"(?i)player_name\s+ILIKE\s+'%([^%']+)%'")
+    pattern = re.compile(r"(?i)(player|player_name)\s+ILIKE\s+'%([^%']+)%'")
 
     def repl(match: re.Match) -> str:
-        raw_name = match.group(1).strip()
+        raw_name = match.group(2).strip()
         parts = [p for p in raw_name.split() if p]
         if len(parts) < 2:
             return match.group(0)
@@ -1130,10 +1536,8 @@ def _expand_player_name_filters_for_encoding(sql_query: str) -> str:
             return match.group(0)
 
         last_prefix = last_clean[:4]
-        full_clause = f"player_name ILIKE '%{raw_name}%'"
-        fallback_clause = (
-            f"(player_name ILIKE '%{first}%' AND player_name ILIKE '%{last_prefix}%')"
-        )
+        full_clause = f"player ILIKE '%{raw_name}%'"
+        fallback_clause = f"(player ILIKE '%{first}%' AND player ILIKE '%{last_prefix}%')"
         return f"({full_clause} OR {fallback_clause})"
 
     return pattern.sub(repl, sql_query)
@@ -1159,21 +1563,13 @@ def _ensure_profile_columns_in_sql(sql_query: str, user_input: str) -> str:
 
     select_part = select_match.group("select_part")
     start, end = select_match.span("select_part")
-    required_columns = [
-        "min",
-        "fgm",
-        "fga",
-        "fgm_rank",
-        "fga_rank",
-        "fg3m_rank",
-        "fg3a_rank",
-        "ftm_rank",
-        "fta_rank",
-        "min_rank",
-    ]
+    if "player_totals_" in q_lower:
+        required_columns = ["min", "fgm", "fga", "c_3pm", "c_3pa", "ftm", "fta"]
+    else:
+        required_columns = ["min", "fgm", "fga", '"3pm"', '"3pa"', "ftm", "fta", '"fg%"', '"3p%"', '"ft%"']
     missing = []
     for col in required_columns:
-        if not re.search(rf"(?i)\b{re.escape(col)}\b", select_part):
+        if not _sql_select_mentions_column(select_part, col):
             missing.append(col)
 
     if not missing:
@@ -1194,7 +1590,7 @@ def _ensure_season_columns_in_sql(sql_query: str) -> str:
 
     leg_pattern = re.compile(
         r"(?is)(select\s+)(?P<select_part>.*?)(\s+from\s+)"
-        r"(?P<table_name>all_players_(?P<table_type>regular|playoffs)_(?P<start>\d{4})_(?P<end>\d{4}))"
+        r"(?P<table_name>(?:player_pergame_regularseason|player_totals_playoffseason|player_totals_regularseason|all_players_(?:regular|playoffs))_(?P<start>\d{4})_(?P<end>\d{4}))"
         r"(?P<rest>\s+where\s+.*?)(?=(\bunion\s+all\b|$))"
     )
 
@@ -1228,13 +1624,13 @@ def _enforce_raw_data_only_sql(sql_query: str) -> str:
     if not q:
         return q
 
-    # Weighted career head-to-head aggregates (see _rewrite_implicit_head_to_head_to_career_sql).
-    if re.search(r"(?i)\bcareer_union\b", q):
-        return q.rstrip(";") + ";"
-
     q = q.rstrip(";")
 
-    if not re.search(r"(?i)\w+_rank\b", q):
+    summary_tables = re.search(
+        r"(?i)player_pergame_regularseason_|player_totals_(?:playoff|regular)season_",
+        q,
+    )
+    if not re.search(r"(?i)\w+_rank\b", q) and not summary_tables:
         q = re.sub(r"(?is)\border\s+by\b.*?(?=(\blimit\b|$))", " ", q)
     
     q = re.sub(r"(?is)\bgroup\s+by\b.*?(?=(\bhaving\b|\blimit\b|$))", " ", q)
@@ -1268,7 +1664,10 @@ def _enforce_raw_data_only_sql(sql_query: str) -> str:
     if any(fn in select_lower for fn in banned_functions):
         raise ValueError("Generated SQL contains disallowed functions in SELECT.")
 
+    # Strip string literals and double-quoted identifiers (e.g. "+/-", "fg%") so we do not
+    # treat punctuation inside column names as arithmetic.
     select_without_strings = re.sub(r"'[^']*'", "", select_part)
+    select_without_strings = re.sub(r'"[^"]*"', "", select_without_strings)
     if any(op in select_without_strings for op in ["/", "*", "+", "-"]):
         raise ValueError("Generated SQL contains disallowed arithmetic in SELECT.")
 
@@ -1295,7 +1694,7 @@ Database error:
 
 Fix the SQL to match the schema exactly while keeping a RAW DATA query shape.
 STRICT RULES:
-- ONLY select direct columns from the tables
+- ONLY select direct columns from the tables (JOIN across multiple tables is OK when keys exist in schema)
 - DO NOT use SUM, AVG, COUNT, MIN, MAX, CAST, NULLIF, COALESCE, window functions, or arithmetic expressions
 - DO NOT use GROUP BY, HAVING, or ORDER BY
 - Keep WHERE/JOIN only when needed to fetch correct rows and columns
@@ -1315,6 +1714,7 @@ Do NOT include any additional text or markdown.
 
     fixed_sql = response.choices[0].message.content.strip()
     fixed_sql = fixed_sql.replace("```sql", "").replace("```", "").strip()
+    fixed_sql = _canonicalize_nba_stats_sql(fixed_sql)
 
     return fixed_sql
 
@@ -1328,6 +1728,7 @@ def natural_language_to_sql(user_input_param: str):
 
     conn = get_connection()
     schema_description = get_db_schema(conn)
+    schema_routing_guide = _build_schema_routing_guide(schema_description)
 
     prompt = f"""
 You are a senior SQL data engineer specializing in NBA statistics databases.
@@ -1336,7 +1737,8 @@ You MUST follow every rule below without exception. There is no ambiguity — if
 
 GLOBAL OVERRIDE (HIGHEST PRIORITY):
 - Return RAW DATA queries only.
-- SELECT only direct existing columns from source table(s).
+- SELECT only direct existing columns from source table(s), optionally **table-qualified** (e.g. pg.pts, adv.ts).
+- When the question clearly needs facts from **more than one table** (different columns or different families), use **one SELECT** with **INNER JOIN** or **LEFT JOIN** between those tables — still no SQL-side aggregates or arithmetic on stats.
 - DO NOT use SUM, AVG, COUNT, MIN, MAX, CAST, NULLIF, COALESCE, window functions, or arithmetic expressions.
 - DO NOT use GROUP BY, HAVING, or ORDER BY.
 - The analyzer layer handles sorting, ranking, and math after query execution.
@@ -1345,43 +1747,26 @@ GLOBAL OVERRIDE (HIGHEST PRIORITY):
 SECTION 1: THE TWO TABLE TYPES — UNDERSTAND THEM COMPLETELY
 ════════════════════════════════════════════════════════════════════════
 
-TYPE A — SEASON SUMMARY TABLES:
-  Naming pattern: `all_players_regular_YYYY_YYYY` and `all_players_playoffs_YYYY_YYYY`
-  What they contain: One row per player per season. Pre-aggregated season stats.
-  IMPORTANT SCHEMA MEANING:
-    - `pts`, `reb`, `ast`, `fg_pct`, `fg3_pct`, `ft_pct` are already season-level values for that player.
-    - `gp` is games played in that season.
-    - `_rank` columns (like `pts_rank`) are precomputed league ranks for that season.
-    - Because each player is already one row in a season table, single-season leaderboards should NOT use SUM()+GROUP BY.
-  Available regular season tables (oldest to newest):
-    all_players_regular_1996_1997, all_players_regular_1997_1998, all_players_regular_1998_1999,
-    all_players_regular_1999_2000, all_players_regular_2000_2001, all_players_regular_2001_2002,
-    all_players_regular_2002_2003, all_players_regular_2003_2004, all_players_regular_2004_2005,
-    all_players_regular_2005_2006, all_players_regular_2006_2007, all_players_regular_2007_2008,
-    all_players_regular_2008_2009, all_players_regular_2009_2010, all_players_regular_2010_2011,
-    all_players_regular_2011_2012, all_players_regular_2012_2013, all_players_regular_2013_2014,
-    all_players_regular_2014_2015, all_players_regular_2015_2016, all_players_regular_2016_2017,
-    all_players_regular_2017_2018, all_players_regular_2018_2019, all_players_regular_2019_2020,
-    all_players_regular_2020_2021, all_players_regular_2021_2022, all_players_regular_2022_2023,
-    all_players_regular_2023_2024, all_players_regular_2024_2025
-  Available playoffs tables (oldest to newest):
-    all_players_playoffs_2007_2008, all_players_playoffs_2008_2009, all_players_playoffs_2009_2010,
-    all_players_playoffs_2010_2011, all_players_playoffs_2011_2012, all_players_playoffs_2012_2013,
-    all_players_playoffs_2013_2014, all_players_playoffs_2014_2015, all_players_playoffs_2015_2016,
-    all_players_playoffs_2016_2017, all_players_playoffs_2017_2018, all_players_playoffs_2018_2019,
-    all_players_playoffs_2019_2020, all_players_playoffs_2020_2021, all_players_playoffs_2021_2022,
-    all_players_playoffs_2022_2023, all_players_playoffs_2023_2024, all_players_playoffs_2024_2025
+TYPE A — SEASON SUMMARY TABLES (NBA-STATS):
+  Regular-season per-game summaries: `player_pergame_regularseason_STARTYEAR_ENDYEAR` (ENDYEAR = STARTYEAR + 1).
+  Playoff summaries (totals-style column names): `player_totals_playoffseason_STARTYEAR_ENDYEAR`.
+  Optional regular-season totals (if listed in schema): `player_totals_regularseason_STARTYEAR_ENDYEAR`.
+  Advanced season totals (TS%, USG, ratings, etc.): `advance_totals_regularseason_STARTYEAR_ENDYEAR` or
+    `advance_totals_playoffseason_STARTYEAR_ENDYEAR` — always confirm columns from DATABASE SCHEMA below.
 
-  COLUMNS THAT EXIST in all_players_regular_* AND all_players_playoffs_*:
-    player_id, player_name, nickname, team_id, team_abbreviation, age, gp, w, l,
-    w_pct, min, fgm, fga, fg_pct, fg3m, fg3a, fg3_pct, ftm, fta, ft_pct,
-    oreb, dreb, reb, ast, tov, stl, blk, blka, pf, pfd, pts, plus_minus,
-    nba_fantasy_pts, dd2, td3, gp_rank, w_rank, l_rank, w_pct_rank, min_rank,
-    fgm_rank, fga_rank, fg_pct_rank, fg3m_rank, fg3a_rank, fg3_pct_rank,
-    ftm_rank, fta_rank, ft_pct_rank, oreb_rank, dreb_rank, reb_rank, ast_rank,
-    tov_rank, stl_rank, blk_rank, blka_rank, pf_rank, pfd_rank, pts_rank,
-    plus_minus_rank, nba_fantasy_pts_rank, dd2_rank, td3_rank, wnba_fantasy_pts,
-    wnba_fantasy_pts_rank, team_count
+  One row per player per season. Filter players with `player ILIKE '%Name%'` (column is `player`, not `player_name`).
+  Team abbreviation column is `team` (not `team_abbreviation`).
+
+  On `player_pergame_regularseason_*`, quote identifiers that contain % or + or /:
+    "fg%", "3pm", "3pa", "3p%", "ft%", "+/-"
+  The "+/-" column is **plus-minus** (team point differential while that player was on the floor for the season)—a real
+  box-score-style stat, not arithmetic. In PostgreSQL it must be referenced exactly as the quoted identifier `"+/-"`.
+  Base counters: fgm, fga, ftm, fta, oreb, dreb, reb, ast, tov, stl, blk, pf, pts, min, gp, w, l, age, fp, dd2, td3.
+
+  On `player_totals_*season_*`, shooting columns are named fg, c_3pm, c_3pa, c_3p, ft (not fg% / 3pm style).
+  These summary tables do NOT expose legacy `*_rank` or `player_name` / `team_abbreviation` column names.
+
+  Which season years exist: use the DATABASE SCHEMA block at the end of this prompt (do not invent table years).
 
   COLUMNS THAT DO NOT EXIST in season summary tables — NEVER USE THEM:
     ❌ season_id       (the season is encoded in the TABLE NAME itself)
@@ -1404,15 +1789,13 @@ TYPE B — GAME LOGS TABLE:
     fg3m, fg3a, ftm, fta, min
 
   COLUMNS THAT DO NOT EXIST in player_game_logs — NEVER USE THEM:
-    ❌ fg_pct          (must be calculated: CAST(SUM(fgm) AS DOUBLE PRECISION) / NULLIF(SUM(fga), 0))
-    ❌ fg3_pct         (must be calculated: CAST(SUM(fg3m) AS DOUBLE PRECISION) / NULLIF(SUM(fg3a), 0))
-    ❌ ft_pct          (must be calculated: CAST(SUM(ftm) AS DOUBLE PRECISION) / NULLIF(SUM(fta), 0))
+    ❌ fg_pct / fg3_pct / ft_pct as SQL expressions — not in this table; select fgm, fga, fg3m, fg3a, ftm, fta only (or use a season summary table for "fg%" columns).
     ❌ age             (not tracked per game)
     ❌ gp              (not a column — count rows instead: COUNT(*) AS games_played)
     ❌ oreb            (offensive rebounds not tracked separately)
     ❌ dreb            (defensive rebounds not tracked separately)
     ❌ nickname        (not in this table)
-    ❌ plus_minus      (not in this table)
+    ❌ +/- (plus-minus) — not in player_game_logs; for season-level plus-minus use player_pergame_regularseason_*
     ❌ dd2, td3        (not in this table)
     ❌ any _rank columns (none of the rank columns exist here)
     ❌ team_id         (not in this table)
@@ -1430,7 +1813,7 @@ TYPE C — EXTENDED NBA DATA FAMILIES (from current_working_data schema):
   IMPORTANT:
   - These tables are highly structured by name (season, season_type, per_mode, endpoint naming).
   - ALWAYS rely on DATABASE SCHEMA below to pick exact columns; never invent columns.
-  - If user asks for clutch/hustle/lineup/schedule/standings, do NOT force all_players_regular_* or player_game_logs.
+  - If user asks for clutch/hustle/lineup/schedule/standings, do NOT force player_pergame_regularseason_* or player_game_logs.
   - Use table-name pattern matching by intent first, then schema-confirmed columns.
 
 ════════════════════════════════════════════════════════════════════════
@@ -1444,34 +1827,34 @@ RULE 0 — INTENT ROUTING FOR EXTENDED TABLE FAMILIES:
   - "lineup", "5-man unit", "best lineup", "on/off 5"   → `nba__lineups__...`
   - "schedule", "next games", "calendar"                → `nba__schedule__...`
   - "standings", "seed", "conference rank", "record"    → `nba__standings__...`
-  - "advanced metrics", "advanced stats profile"         → `nba__advanced__...`
-  Use all_players_regular_*/playoffs_* only when the question is season-summary player stats.
+  - "advanced metrics", "advanced stats profile"         → `advance_totals_*` tables from schema
+  Use player_pergame_regularseason_* / player_totals_playoffseason_* for season-summary player stats.
   Use player_game_logs only when question is game-by-game recency/log context.
 
 RULE 1 — MOST RECENT PLAYOFF PERFORMANCE (most common case):
   Trigger phrases: "playoff performance", "playoffs", "analyze playoffs", "postseason",
                    "how did X do in the playoffs", "X playoff stats", "X in the playoffs"
   With NO specific year or "all time" mentioned:
-  → ALWAYS use: `all_players_playoffs_2024_2025`
-  → ALWAYS use SUM() aggregation with GROUP BY player_name
+  → ALWAYS use the latest `player_totals_playoffseason_YYYY_YYYY` listed in DATABASE SCHEMA (e.g. 2024_2025 when present)
+  → For a single season row per player, SELECT columns directly (no SUM/GROUP BY on one table).
   → NEVER use player_game_logs for this
   → NEVER guess an older year like 2018_2019 or 2023_2024
   Example question: "Analyze Giannis playoff performance"
   Example question: "How did Jayson Tatum do in the playoffs"
   Example question: "Show me Steph Curry's playoff stats"
-  Correct table: all_players_playoffs_2024_2025
+  Correct table pattern: player_totals_playoffseason_2024_2025 (adjust year to schema)
 
 RULE 2 — MOST RECENT REGULAR SEASON PERFORMANCE (season summary):
   Trigger phrases: "season stats", "season averages", "how did X do this season",
                    "season performance", "season totals", top scorers, leaderboards,
-                   rank-based questions, questions needing oreb/dreb/plus_minus/age/gp
+                   questions needing oreb, dreb, "+/-", age, gp
   With NO specific year mentioned:
-  → Use: `all_players_regular_2024_2025`
-  → Use this table when rank columns (_rank) or columns like oreb, dreb, age, gp are needed
+  → Use the latest `player_pergame_regularseason_YYYY_YYYY` from DATABASE SCHEMA
+  → Order leaderboards with ORDER BY stat DESC (there are no *_rank columns)
   → NEVER use player_game_logs for leaderboards or rank-based questions
   Example question: "Who are the top 10 scorers this season"
   Example question: "Show me the league leaders in assists"
-  Correct table: all_players_regular_2024_2025
+  Correct table pattern: player_pergame_regularseason_2024_2025 (adjust year to schema)
 
 RULE 3 — CURRENT FORM / RECENT ACTIVITY (use player_game_logs):
   Trigger phrases: "lately", "recently", "how is X playing", "current form",
@@ -1484,7 +1867,7 @@ RULE 3 — CURRENT FORM / RECENT ACTIVITY (use player_game_logs):
   → For 2025-26 season: WHERE season_id = '22025' AND season_type = 'Regular Season'
   → For 2025 playoffs: WHERE season_id = '22025' AND season_type = 'Playoffs'
   → ALWAYS ORDER BY game_date DESC when recency matters
-  → ALWAYS calculate percentages — never reference fg_pct, fg3_pct, ft_pct directly
+  → SELECT raw box columns only (fgm, fga, fg3m, fg3a, ftm, fta, pts, etc.) — do NOT use CAST, division, or made-up fg_pct columns in SQL.
   → Use LIMIT to restrict to the number of games requested (e.g., last 10 → LIMIT 10)
   Example question: "Show me LeBron's last 10 games"
   Example question: "How has Steph been playing lately"
@@ -1495,29 +1878,29 @@ RULE 4 — SPECIFIC YEAR OR SEASON REQUESTED:
   If user mentions a specific year like "2019", "2022-23", "last year", "2018 playoffs":
   → Map to the correct table using this logic:
       START-YEAR RULE (regular season): a bare year means the season that STARTS that year.
-        "2020" or "2020 season"        → all_players_regular_2020_2021
-        "2016 season"                  → all_players_regular_2016_2017
+        "2020" or "2020 season"        → player_pergame_regularseason_2020_2021
+        "2016 season"                  → player_pergame_regularseason_2016_2017
       PLAYOFF EXCEPTION: a playoff year refers to playoffs at the END of that season.
-        "2016 playoffs"                → all_players_playoffs_2015_2016
-        "2020 playoffs"                → all_players_playoffs_2019_2020
+        "2016 playoffs"                → player_totals_playoffseason_2015_2016
+        "2020 playoffs"                → player_totals_playoffseason_2019_2020
       Explicit ranges still map directly by start and end:
-        "2018-19 playoffs"             → all_players_playoffs_2018_2019
-        "2022-23 season"               → all_players_regular_2022_2023
+        "2018-19 playoffs"             → player_totals_playoffseason_2018_2019
+        "2022-23 season"               → player_pergame_regularseason_2022_2023
       Relative references:
-        "last season" (current year is 2026)   → all_players_regular_2024_2025
-  → Table name format is ALWAYS: all_players_[regular|playoffs]_STARTYEAR_ENDYEAR
-  → The ENDYEAR is always STARTYEAR + 1
+        "last season" (current year is 2026)   → player_pergame_regularseason_2024_2025 (if in schema)
+  → Regular per-game: player_pergame_regularseason_START_END; Playoffs: player_totals_playoffseason_START_END
+  → The END year is always START + 1 (four-digit years in the table name).
   Example question: "How did Kobe do in the 2009 playoffs"
-  Correct table: all_players_playoffs_2008_2009
+  Correct table: player_totals_playoffseason_2008_2009
 
 RULE 5 — CAREER / ALL TIME STATS:
   Trigger phrases: "career", "all time", "entire career", "over his career",
                    "throughout his career", "historically", "all seasons"
   → Use UNION ALL across ALL available yearly tables for that player's era
   → NEVER use player_game_logs for career stats
-  → Wrap in a subquery and aggregate with SUM() or AVG() and GROUP BY player_name
+  → Return raw rows only (same columns each leg); do NOT wrap in SUM()/AVG()/GROUP BY in SQL.
   Example question: "Show me LeBron's career regular season stats"
-  → UNION ALL across all_players_regular_2003_2004 through all_players_regular_2024_2025
+  → UNION ALL across every player_pergame_regularseason_* table in schema for that era
 
 RULE 5B — OVER-TIME / BY-SEASON TRENDS (NOT CAREER AGGREGATE):
   Trigger phrases: "by season", "per season", "season by season", "over the years",
@@ -1525,61 +1908,55 @@ RULE 5B — OVER-TIME / BY-SEASON TRENDS (NOT CAREER AGGREGATE):
                    "over his career" / "throughout his career" when asking for rate stats,
                    "rookie year to YYYY", "2010s decade", or explicit ranges like "from 2012 to 2024"
   → Use UNION ALL across relevant season tables, but return ONE ROW PER SEASON (no rollup).
-  → Do NOT use SUM(), AVG(), COUNT(*), or GROUP BY player_name for this intent.
+  → Do NOT use SUM(), AVG(), COUNT(*), or GROUP BY player for this intent.
   → If model produced SUM()+GROUP BY over UNION for these asks, rewrite to per-season direct columns.
   → Pull per-season columns directly from each season table (including gp for games played).
   Example question: "Show me LeBron's blocks per season"
-  → Return season_start, season_label, player_name, blk, blk_rank, gp by season order.
+  → Return season_start, season_label, player, blk, gp by season order.
 
 RULE 6 — COMPARING TWO OR MORE PLAYERS WHEN A SEASON IS SPECIFIED ("this season", "last season", explicit year/range):
-  → Use ONE season summary table for all players in that query
+  → Use **one primary** season summary table for all players in that query (same season suffix in table names).
+  → If the question also needs columns only on another table (e.g. advanced row for the same season), **JOIN** that second table on keys listed in DATABASE SCHEMA (typically same `player` / `team` and matching `_YYYY_YYYY` table pair).
   → Use OR with ILIKE for multiple players:
-     player_name ILIKE '%LeBron%' OR player_name ILIKE '%Curry%'
+     player ILIKE '%LeBron%' OR player ILIKE '%Curry%'
   → NEVER use player_game_logs for season-level comparisons
   Example question: "Compare LeBron and Curry this season"
-  Correct table: all_players_regular_2024_2025
+  Correct table: player_pergame_regularseason_2024_2025 (adjust to schema)
 
 RULE 6B — WHO IS BETTER / BETWEEN A AND B WITH NO YEAR OR SEASON CONTEXT:
   If the question compares players or stats — who is better, better rebounder/scorer/player, between X and Y, vs., than —
   and it does NOT mention any specific season/year, ordinal season (first/second season, rookie/sophomore year),
   decade, or dated range ("last season", "2023-24", "this year"):
   → Treat it as CAREER comparison (regular season unless they clearly mean playoffs).
-  → UNION ALL across every `all_players_regular_*` table in the schema for those players' careers.
-  → Aggregate with GROUP BY player_name.
-  → For per-game columns (pts, reb, ast, min, etc.), use career weighted averages:
-       SUM(column * gp) / NULLIF(SUM(gp), 0)
-     Shooting percentages: SUM(fgm)/NULLIF(SUM(fga),0), SUM(fg3m)/NULLIF(SUM(fg3a),0), SUM(ftm)/NULLIF(SUM(fta),0).
+  → UNION ALL across every `player_pergame_regularseason_*` table in the schema for those players' careers.
+  → Return raw per-season rows per player (no SQL aggregation); the app compares rows downstream.
   Example question: "Who is the better rebounder between Bol Bol and Anthony Davis"
-  → Career weighted reb per game across all regular-season tables — NOT only all_players_regular_2024_2025.
+  → UNION ALL of per-season reb, gp, pts, etc. for each player across seasons.
 
 RULE 7 — COMPARING TWO PLAYERS (different eras / career):
   → Use UNION ALL — one SELECT per player from their respective era tables
-  → Wrap in outer query to aggregate
+  → Do not add an outer SELECT with SUM or GROUP BY
   Example question: "Compare LeBron and Jordan career stats"
-  → LeBron from all_players_regular_2003_2004 through 2024_2025
-  → Jordan from all_players_regular_1996_1997 through 2002_2003
+  → LeBron from player_pergame_regularseason_2003_2004 through latest in schema
+  → Jordan from player_pergame_regularseason_1996_1997 through 2002_2003
 
 RULE 8 — TOP PLAYERS / LEADERBOARD QUESTIONS:
-  → Use season summary tables only — they have pre-built rank columns
+  → Use season summary tables only (player_pergame_regularseason_* or player_totals_playoffseason_*)
   → NEVER use player_game_logs for rankings
-  → For single-season leaderboard questions, query ONE season table directly.
+  → For single-season leaderboard questions, query **one** season stats table directly **unless** the user asks for extra fields only on another table — then JOIN that table (same season/year in names) without changing leaderboard logic.
   → Do NOT use SUM(), GROUP BY, or UNION unless the user explicitly asks for career/all-time across seasons.
-  → If the relevant _rank column exists, use it for ordering.
-  → For top/best scorers, ALWAYS ORDER BY `pts_rank ASC NULLS LAST` (not by SUM(pts)).
-  → If a _rank column is not selected, order by the relevant stat DESC (example: pts DESC).
-  → For top scorers specifically, use `pts` (and optionally `pts_rank`) from that season table.
+  → There are no *_rank columns — ORDER BY the stat column DESC (e.g. ORDER BY pts DESC NULLS LAST).
+  → For top scorers specifically, use pts, "fg%", "3p%", gp from that season table.
   → If the user asks for "top scorers", "best scorers", or "leading scorers":
-      - SELECT from one `all_players_regular_YYYY_YYYY` table only
-      - include `player_name, team_abbreviation, pts, pts_rank, gp, fg_pct, fg3_pct, fg3m, fg3a, ftm, fta, ft_pct`
+      - SELECT from one player_pergame_regularseason_YYYY_YYYY table (add JOIN only if the question explicitly needs non-overlapping columns from another table)
+      - include player, team, pts, gp, "fg%", "3p%", "3pm", "3pa", ftm, fta, "ft%"
       - use DISTINCT to prevent duplicate player rows when source data has repeats
-      - ORDER BY `pts_rank ASC NULLS LAST`
+      - ORDER BY pts DESC NULLS LAST
       - use LIMIT requested by user; if no number is provided, default to LIMIT 5
-      - IMPORTANT: These extra scoring-context columns are for follow-up questions;
-        keep the primary response concise, but still return them in query results.
   Example question: "Who are the top 10 scorers this season"
-  Correct: SELECT player_name, team_abbreviation, pts, pts_rank, gp, fg_pct, fg3_pct
-           FROM all_players_regular_2024_2025
-           ORDER BY pts_rank ASC NULLS LAST
+  Correct: SELECT player, team, pts, gp, "fg%", "3p%"
+           FROM player_pergame_regularseason_2024_2025
+           ORDER BY pts DESC NULLS LAST
            LIMIT 10
 
 RULE 9 — PLAYER DID NOT PLAY / ZERO ROWS RETURNED:
@@ -1594,95 +1971,87 @@ RULE 10 — WHEN player_game_logs IS BETTER THAN SEASON SUMMARY TABLES:
   - The user uses words like "lately", "recently", "now", "currently", "this year so far"
   - The user wants "last X games" regardless of season
   - The user wants game dates, opponents, win/loss results
-  HOWEVER, keep using all_players_regular_2024_2025 when:
-  - The user wants season rankings or leaderboards (needs _rank columns)
-  - The user needs oreb, dreb, plus_minus, age, or gp columns
-  - The user asks for season shooting percentage columns directly (fg_pct etc.)
+  HOWEVER, keep using player_pergame_regularseason_2024_2025 (or latest in schema) when:
+  - The user wants season rankings or leaderboards (ORDER BY stat on summary table)
+  - The user needs oreb, dreb, "+/-", age, or gp columns
+  - The user asks for season shooting columns directly ("fg%", "3p%", "ft%" on per-game tables)
 
 RULE 11 — SINGLE PLAYER GENERAL STATS PROFILE (season summary):
   Trigger phrases: "what were X stats", "X stats in 20YY", "show X season stats",
                    "player profile", "general stats"
   If this is for one player and one season table:
-  → Use ONE `all_players_regular_YYYY_YYYY` table (or playoffs table only if user explicitly says playoffs)
+  → Use ONE player_pergame_regularseason_YYYY_YYYY (or player_totals_playoffseason_* if playoffs) as the base row.
+  → If the user also wants advanced-only columns (TS%, USG, ratings, etc.), **JOIN** `advance_totals_*` for the **same** season suffix on join keys from DATABASE SCHEMA (never invent column names).
   → Do NOT use SUM(), GROUP BY, or UNION
   → Return a broad stat set for downstream profile tables:
-     player_name, team_abbreviation, age, gp, min, w_pct,
-     pts, reb, ast, tov, stl, blk, pf, plus_minus, fgm, fga,
-     fg_pct, fg3_pct, ft_pct, fg3m, fg3a, ftm, fta,
-     pts_rank, fg_pct_rank, fg3_pct_rank, ft_pct_rank, fgm_rank, fga_rank, fg3m_rank, fg3a_rank, ftm_rank, fta_rank, min_rank,
-     reb_rank, dreb_rank, oreb_rank, ast_rank, tov_rank, stl_rank, blk_rank, pf_rank,
-     dreb, oreb, dd2, td3, dd2_rank, td3_rank
+     player, team, age, gp, min, w, l,
+     pts, reb, ast, tov, stl, blk, pf, fgm, fga, "fg%", "3pm", "3pa", "3p%", ftm, fta, "ft%",
+     dreb, oreb, dd2, td3, "+/-"
   → Use DISTINCT if needed to avoid duplicate player rows
+
+RULE 12 — MULTIPLE TABLES IN ONE QUERY (JOIN):
+  Use a JOIN when the user question **clearly combines** information that lives on different tables, for example:
+  - Same-season **basic per-game** (`player_pergame_regularseason_YYYY_YYYY`) **plus** **advanced totals** (`advance_totals_regularseason_YYYY_YYYY`) for one player or many players.
+  - **NBA__** family table (clutch, hustle, lineups, schedule, standings) **plus** a player/team identifier table from schema when both are required to answer.
+  - **player_game_logs** plus another table: only when DATABASE SCHEMA shows a shared key (e.g. `game_id` on both sides). Otherwise use the single table that best matches the question — do not invent join keys.
+  Rules:
+  - **SELECT list:** only direct columns (qualified aliases allowed: `pg.pts`, `adv.ts` as stored in DB). No aggregates, no arithmetic on stats.
+  - **ON clause:** use real columns from schema on both sides; same entity + same season usually means matching `_YYYY_YYYY` across joined NBA-STATS tables and `player` = `player` (or documented equivalent).
+  - **UNION ALL** = same-shaped rows across **years** or players in disjoint tables; **JOIN** = **different columns** about the **same** season/entity from compatible tables. Choose the right tool; do not UNION tables with incompatible column sets unless you align columns explicitly with literals only where the prompt already allows (e.g. season_label).
+  - Avoid CROSS JOIN and unbounded many-to-many joins; if join cardinality is unclear, narrow with WHERE and LIMIT per user request.
+
+{schema_routing_guide}
 
 ════════════════════════════════════════════════════════════════════════
 SECTION 3: MANDATORY QUERY CONSTRUCTION RULES
 ════════════════════════════════════════════════════════════════════════
 
 PLAYER NAME MATCHING:
-  - ALWAYS use ILIKE with wildcards on BOTH sides: player_name ILIKE '%Giannis%'
-  - For full names use: player_name ILIKE '%LeBron James%'
+  - ALWAYS use ILIKE with wildcards on BOTH sides: player ILIKE '%Giannis%'
+  - For full names use: player ILIKE '%LeBron James%'
+  - On player_game_logs the column may still be player_name — follow DATABASE SCHEMA for that table.
   - NEVER use exact match (=) for player names
   - NEVER use ILIKE 'Jordan%' — this matches Jordan Poole, DeAndre Jordan, etc.
-  - For last-name-only queries use a leading space: player_name ILIKE '% Harris%'
+  - For last-name-only queries use a leading space: player ILIKE '% Harris%'
     to reduce false matches like "Gary Harris" when searching just "Harris"
   - Expand ALL nicknames to full names before searching:
-      "Steph" or "Steph Curry"   → player_name ILIKE '%Stephen Curry%' OR player_name ILIKE '%Steph Curry%'
-      "Bron" or "King James"     → player_name ILIKE '%LeBron James%'
-      "Greek Freak"              → player_name ILIKE '%Giannis%'
-      "KD"                       → player_name ILIKE '%Kevin Durant%'
-      "AD"                       → player_name ILIKE '%Anthony Davis%'
-      "Kawhi"                    → player_name ILIKE '%Kawhi Leonard%'
-      "CP3"                      → player_name ILIKE '%Chris Paul%'
-      "Dame"                     → player_name ILIKE '%Damian Lillard%'
-      "Russ"                     → player_name ILIKE '%Russell Westbrook%'
-      "PG" or "PG13"             → player_name ILIKE '%Paul George%'
+      "Steph" or "Steph Curry"   → player ILIKE '%Stephen Curry%' OR player ILIKE '%Steph Curry%'
+      "Bron" or "King James"     → player ILIKE '%LeBron James%'
+      "Greek Freak"              → player ILIKE '%Giannis%'
+      "KD"                       → player ILIKE '%Kevin Durant%'
+      "AD"                       → player ILIKE '%Anthony Davis%'
+      "Kawhi"                    → player ILIKE '%Kawhi Leonard%'
+      "CP3"                      → player ILIKE '%Chris Paul%'
+      "Dame"                     → player ILIKE '%Damian Lillard%'
+      "Russ"                     → player ILIKE '%Russell Westbrook%'
+      "PG" or "PG13"             → player ILIKE '%Paul George%'
 
 AGGREGATION RULES for season summary tables:
-  - ONLY use SUM()+GROUP BY when combining MULTIPLE rows per player
-    (examples: UNION ALL across many seasons for career stats, or other explicit multi-season rollups).
-  - For SINGLE-SEASON season-summary queries (one all_players_regular_YYYY_YYYY table),
-    SELECT columns directly and DO NOT use SUM() or GROUP BY.
-  - If percentages already exist in season summary tables (`fg_pct`, `fg3_pct`, `ft_pct`), select them directly.
-  - Only calculate percentages via SUM() when aggregating multiple rows per player:
-      (CAST(SUM(fgm) AS DOUBLE PRECISION) / NULLIF(SUM(fga), 0)) AS fg_pct
-      (CAST(SUM(fg3m) AS DOUBLE PRECISION) / NULLIF(SUM(fg3a), 0)) AS fg3_pct
-      (CAST(SUM(ftm) AS DOUBLE PRECISION) / NULLIF(SUM(fta), 0)) AS ft_pct
+  - Do NOT use SUM, AVG, COUNT, GROUP BY, CAST, or division in SQL — every stat must come from a table column.
+  - For career or multi-season questions, use UNION ALL of identical SELECT lists (one per season table).
+  - On per-game summary tables, quote shooting columns: "fg%", "3p%", "ft%". On player_totals_* use fg, c_3p, ft.
 
-STANDARD PLAYER PERFORMANCE SELECT BLOCK:
-  Use this exact block ONLY for career/all-time or explicit multi-season aggregation:
-    player_name,
-    SUM(pts)  AS total_pts,
-    SUM(reb)  AS total_reb,
-    SUM(ast)  AS total_ast,
-    SUM(stl)  AS total_stl,
-    SUM(blk)  AS total_blk,
-    SUM(tov)  AS total_tov,
-    SUM(fgm)  AS total_fgm,
-    SUM(fga)  AS total_fga,
-    SUM(fg3m) AS total_fg3m,
-    SUM(fg3a) AS total_fg3a,
-    SUM(ftm)  AS total_ftm,
-    SUM(fta)  AS total_fta,
-    (CAST(SUM(fgm)  AS DOUBLE PRECISION) / NULLIF(SUM(fga),  0)) AS fg_pct,
-    (CAST(SUM(fg3m) AS DOUBLE PRECISION) / NULLIF(SUM(fg3a), 0)) AS fg3_pct,
-    (CAST(SUM(ftm)  AS DOUBLE PRECISION) / NULLIF(SUM(fta),  0)) AS ft_pct
+STANDARD PLAYER PERFORMANCE (multi-season, raw rows only):
+  Repeat this shape per season and join with UNION ALL (no outer aggregate):
+    SELECT player, gp, pts, reb, ast, fgm, fga, "fg%", "3pm", "3pa", "3p%", ftm, fta, "ft%"
+    FROM player_pergame_regularseason_YYYY_YYYY
+    WHERE player ILIKE '%Name%'
 
 STANDARD SINGLE-SEASON LEADERBOARD BLOCK (NO AGGREGATION):
   Use this for questions like "top scorers in 2001-02", "best scorers this season", "league leaders in points":
-    player_name,
-    team_abbreviation,
+    player,
+    team,
     pts,
-    pts_rank,
     gp,
-    fg_pct,
-    fg3_pct,
-    fg3m,
-    fg3a,
+    "fg%",
+    "3p%",
+    "3pm",
+    "3pa",
     ftm,
     fta,
-    ft_pct
-  FROM one season table only
-  ORDER BY pts_rank ASC NULLS LAST (or pts DESC when rank unavailable)
+    "ft%"
+  FROM one player_pergame_regularseason_YYYY_YYYY table only
+  ORDER BY pts DESC NULLS LAST
 
 STANDARD GAME LOG SELECT BLOCK:
   Use this exact block when querying player_game_logs for recent/current games:
@@ -1702,17 +2071,10 @@ STANDARD GAME LOG SELECT BLOCK:
     fg3a,
     ftm,
     fta,
-    min,
-    (CAST(fgm  AS DOUBLE PRECISION) / NULLIF(fga,  0)) AS fg_pct,
-    (CAST(fg3m AS DOUBLE PRECISION) / NULLIF(fg3a, 0)) AS fg3_pct,
-    (CAST(ftm  AS DOUBLE PRECISION) / NULLIF(fta,  0)) AS ft_pct
-
-DIVISION SAFETY:
-  - ALWAYS wrap division denominators with NULLIF(..., 0)
-  - ALWAYS cast numerator to DOUBLE PRECISION before dividing
-  - NEVER do raw division like fgm / fga — always use the safe pattern above
+    min
 
 GENERAL:
+  - **Multi-table:** Prefer JOIN over omitting part of the question when schema shows join keys and the user asks for stats from two sources (see RULE 12).
   - Do NOT add a generic LIMIT (e.g. LIMIT 50) unless the user asks for top-N, last-X games, or a bounded sample.
   - For shot charts, game logs, or "all shots / full picture" asks, omit LIMIT so results are not arbitrarily truncated (heavy queries are still bounded by server cost/timeout).
   - NEVER use SELECT * — always name columns explicitly
@@ -1727,28 +2089,28 @@ GENERAL:
 SECTION 4: SEASON AND YEAR REFERENCE MAP
 ════════════════════════════════════════════════════════════════════════
 
-  "current season" or no year specified (regular)  → all_players_regular_2024_2025
+  "current season" or no year specified (regular)  → player_pergame_regularseason_2024_2025 (if in schema)
     **Exception:** Head-to-head "who is better / between X and Y" with NO season/year wording → RULE 6B career UNION ALL (not only latest season).
-  "current playoffs" or no year specified (playoff) → all_players_playoffs_2024_2025
+  "current playoffs" or no year specified (playoff) → player_totals_playoffseason_2024_2025 (if in schema)
   Bare year uses START-YEAR mapping for regular season:
-  "2020"                                            → all_players_regular_2020_2021
-  "2018"                                            → all_players_regular_2018_2019
-  "2016"                                            → all_players_regular_2016_2017
+  "2020"                                            → player_pergame_regularseason_2020_2021
+  "2018"                                            → player_pergame_regularseason_2018_2019
+  "2016"                                            → player_pergame_regularseason_2016_2017
 
   Playoff year uses END-YEAR mapping:
-  "2020 playoffs"                                   → all_players_playoffs_2019_2020
-  "2016 playoffs"                                   → all_players_playoffs_2015_2016
+  "2020 playoffs"                                   → player_totals_playoffseason_2019_2020
+  "2016 playoffs"                                   → player_totals_playoffseason_2015_2016
 
-  "last season" / "2024-25"                         → all_players_regular_2024_2025
-  "2023-24" / "last year"                           → all_players_regular_2023_2024
-  "2022-23"                                         → all_players_regular_2022_2023
-  "2021-22"                                         → all_players_regular_2021_2022
-  "2020-21"                                         → all_players_regular_2020_2021
-  "bubble" / "2019-20"                              → all_players_regular_2019_2020
-  "2018-19"                                         → all_players_regular_2018_2019
-  "2017-18"                                         → all_players_regular_2017_2018
-  "2016-17"                                         → all_players_regular_2016_2017
-  "2015-16"                                         → all_players_regular_2015_2016
+  "last season" / "2024-25"                         → player_pergame_regularseason_2024_2025
+  "2023-24" / "last year"                           → player_pergame_regularseason_2023_2024
+  "2022-23"                                         → player_pergame_regularseason_2022_2023
+  "2021-22"                                         → player_pergame_regularseason_2021_2022
+  "2020-21"                                         → player_pergame_regularseason_2020_2021
+  "bubble" / "2019-20"                              → player_pergame_regularseason_2019_2020
+  "2018-19"                                         → player_pergame_regularseason_2018_2019
+  "2017-18"                                         → player_pergame_regularseason_2017_2018
+  "2016-17"                                         → player_pergame_regularseason_2016_2017
+  "2015-16"                                         → player_pergame_regularseason_2015_2016
 
   season_id values inside player_game_logs:
     2025-26 season (CURRENT — use this by default): '22025'
@@ -1764,53 +2126,30 @@ SECTION 5: WORKED EXAMPLES OF CORRECT QUERIES
 ════════════════════════════════════════════════════════════════════════
 
 Q: "Analyze Giannis playoff performance"
-→ RULE 1. No year. Use all_players_playoffs_2024_2025.
-SELECT player_name,
-  SUM(pts) AS total_pts, SUM(reb) AS total_reb, SUM(ast) AS total_ast,
-  SUM(stl) AS total_stl, SUM(blk) AS total_blk, SUM(tov) AS total_tov,
-  SUM(fgm) AS total_fgm, SUM(fga) AS total_fga,
-  SUM(fg3m) AS total_fg3m, SUM(fg3a) AS total_fg3a,
-  SUM(ftm) AS total_ftm, SUM(fta) AS total_fta,
-  (CAST(SUM(fgm)  AS DOUBLE PRECISION) / NULLIF(SUM(fga),  0)) AS fg_pct,
-  (CAST(SUM(fg3m) AS DOUBLE PRECISION) / NULLIF(SUM(fg3a), 0)) AS fg3_pct,
-  (CAST(SUM(ftm)  AS DOUBLE PRECISION) / NULLIF(SUM(fta),  0)) AS ft_pct
-FROM all_players_playoffs_2024_2025
-WHERE player_name ILIKE '%Giannis%'
-GROUP BY player_name LIMIT 50;
+→ RULE 1. No year. Use player_totals_playoffseason_2024_2025 (latest in schema).
+SELECT player, team, gp, pts, reb, ast, stl, blk, tov, fgm, fga, fg, c_3pm, c_3pa, c_3p, ftm, fta, ft
+FROM player_totals_playoffseason_2024_2025
+WHERE player ILIKE '%Giannis%'
+LIMIT 50;
 
 Q: "Analyze Garry Harris playoff performance"
-→ RULE 1. No year. Use all_players_playoffs_2024_2025.
-SELECT player_name,
-  SUM(pts) AS total_pts, SUM(reb) AS total_reb, SUM(ast) AS total_ast,
-  SUM(stl) AS total_stl, SUM(blk) AS total_blk, SUM(tov) AS total_tov,
-  SUM(fgm) AS total_fgm, SUM(fga) AS total_fga,
-  SUM(fg3m) AS total_fg3m, SUM(fg3a) AS total_fg3a,
-  SUM(ftm) AS total_ftm, SUM(fta) AS total_fta,
-  (CAST(SUM(fgm)  AS DOUBLE PRECISION) / NULLIF(SUM(fga),  0)) AS fg_pct,
-  (CAST(SUM(fg3m) AS DOUBLE PRECISION) / NULLIF(SUM(fg3a), 0)) AS fg3_pct,
-  (CAST(SUM(ftm)  AS DOUBLE PRECISION) / NULLIF(SUM(fta),  0)) AS ft_pct
-FROM all_players_playoffs_2024_2025
-WHERE player_name ILIKE '%Garry Harris%'
-GROUP BY player_name LIMIT 50;
+→ RULE 1. No year. Use player_totals_playoffseason_2024_2025.
+SELECT player, team, gp, pts, reb, ast, stl, blk, tov, fgm, fga, fg, c_3pm, c_3pa, c_3p, ftm, fta, ft
+FROM player_totals_playoffseason_2024_2025
+WHERE player ILIKE '%Garry Harris%'
+LIMIT 50;
 
 Q: "How did Giannis do in the 2019 playoffs"
-→ RULE 4. Year specified: 2019 → all_players_playoffs_2018_2019.
-SELECT player_name,
-  SUM(pts) AS total_pts, SUM(reb) AS total_reb, SUM(ast) AS total_ast,
-  (CAST(SUM(fgm)  AS DOUBLE PRECISION) / NULLIF(SUM(fga),  0)) AS fg_pct,
-  (CAST(SUM(fg3m) AS DOUBLE PRECISION) / NULLIF(SUM(fg3a), 0)) AS fg3_pct,
-  (CAST(SUM(ftm)  AS DOUBLE PRECISION) / NULLIF(SUM(fta),  0)) AS ft_pct
-FROM all_players_playoffs_2018_2019
-WHERE player_name ILIKE '%Giannis%'
-GROUP BY player_name LIMIT 50;
+→ RULE 4. Year specified: 2019 → player_totals_playoffseason_2018_2019.
+SELECT player, team, gp, pts, reb, ast, fgm, fga, fg, c_3pm, c_3pa, c_3p, ftm, fta, ft
+FROM player_totals_playoffseason_2018_2019
+WHERE player ILIKE '%Giannis%'
+LIMIT 50;
 
 Q: "Show me LeBron's last 10 games"
 → RULE 3. Recency. Use player_game_logs, season_id = '22025', ORDER BY game_date DESC.
 SELECT player_name, game_date, matchup, wl, pts, reb, ast, stl, blk, tov,
-  fgm, fga, fg3m, fg3a, ftm, fta, min,
-  (CAST(fgm  AS DOUBLE PRECISION) / NULLIF(fga,  0)) AS fg_pct,
-  (CAST(fg3m AS DOUBLE PRECISION) / NULLIF(fg3a, 0)) AS fg3_pct,
-  (CAST(ftm  AS DOUBLE PRECISION) / NULLIF(fta,  0)) AS ft_pct
+  fgm, fga, fg3m, fg3a, ftm, fta, min
 FROM player_game_logs
 WHERE player_name ILIKE '%LeBron James%'
   AND season_id = '22025'
@@ -1819,9 +2158,7 @@ ORDER BY game_date DESC LIMIT 10;
 Q: "How has Steph been playing lately"
 → RULE 3 / RULE 10. Recency keyword. Use player_game_logs, season_id = '22025'.
 SELECT player_name, game_date, matchup, wl, pts, reb, ast,
-  fgm, fga, fg3m, fg3a,
-  (CAST(fgm  AS DOUBLE PRECISION) / NULLIF(fga,  0)) AS fg_pct,
-  (CAST(fg3m AS DOUBLE PRECISION) / NULLIF(fg3a, 0)) AS fg3_pct
+  fgm, fga, fg3m, fg3a, ftm, fta, min
 FROM player_game_logs
 WHERE (player_name ILIKE '%Stephen Curry%' OR player_name ILIKE '%Steph Curry%')
   AND season_id = '22025'
@@ -1829,60 +2166,47 @@ WHERE (player_name ILIKE '%Stephen Curry%' OR player_name ILIKE '%Steph Curry%')
 ORDER BY game_date DESC LIMIT 15;
 
 Q: "Compare LeBron and Curry this season"
-→ RULE 6. Two players, same era, season summary. Use all_players_regular_2024_2025.
-SELECT player_name,
-  SUM(pts) AS total_pts, SUM(reb) AS total_reb, SUM(ast) AS total_ast,
-  (CAST(SUM(fgm)  AS DOUBLE PRECISION) / NULLIF(SUM(fga),  0)) AS fg_pct,
-  (CAST(SUM(fg3m) AS DOUBLE PRECISION) / NULLIF(SUM(fg3a), 0)) AS fg3_pct,
-  (CAST(SUM(ftm)  AS DOUBLE PRECISION) / NULLIF(SUM(fta),  0)) AS ft_pct
-FROM all_players_regular_2024_2025
-WHERE player_name ILIKE '%LeBron James%' OR player_name ILIKE '%Stephen Curry%'
-GROUP BY player_name LIMIT 50;
+→ RULE 6. Two players, same era, season summary. Use player_pergame_regularseason_2024_2025.
+SELECT DISTINCT player, team, gp, pts, reb, ast, fgm, fga, "fg%", "3pm", "3pa", "3p%", ftm, fta, "ft%"
+FROM player_pergame_regularseason_2024_2025
+WHERE player ILIKE '%LeBron James%' OR player ILIKE '%Stephen Curry%'
+LIMIT 50;
 
 Q: "What were Kevin Durant's stats 2015"
 → RULE 4 + RULE 11. Single-player season profile, no aggregation.
-SELECT DISTINCT player_name, team_abbreviation, age, gp, min, w_pct,
-  pts, reb, ast, tov, stl, blk, pf, plus_minus, fgm, fga,
-  fg_pct, fg3_pct, ft_pct, fg3m, fg3a, ftm, fta,
-  pts_rank, fg_pct_rank, fg3_pct_rank, ft_pct_rank, fgm_rank, fga_rank, fg3m_rank, fg3a_rank, ftm_rank, fta_rank, min_rank,
-  reb_rank, dreb_rank, oreb_rank, ast_rank, tov_rank, stl_rank, blk_rank, pf_rank,
-  dreb, oreb, dd2, td3, dd2_rank, td3_rank
-FROM all_players_regular_2015_2016
-WHERE player_name ILIKE '%Kevin Durant%'
+SELECT DISTINCT player, team, age, gp, min, w, l,
+  pts, reb, ast, tov, stl, blk, pf, fgm, fga, "fg%", "3pm", "3pa", "3p%", ftm, fta, "ft%",
+  dreb, oreb, dd2, td3, "+/-"
+FROM player_pergame_regularseason_2015_2016
+WHERE player ILIKE '%Kevin Durant%'
 LIMIT 50;
 
 Q: "Who are the top 10 scorers this season"
-→ RULE 8. Leaderboard. Use all_players_regular_2024_2025.
-SELECT player_name, team_abbreviation, pts, pts_rank, gp, fg_pct, fg3_pct, fg3m, fg3a, ftm, fta, ft_pct
-FROM all_players_regular_2024_2025
-ORDER BY pts_rank ASC NULLS LAST LIMIT 10;
+→ RULE 8. Leaderboard. Use player_pergame_regularseason_2024_2025.
+SELECT DISTINCT player, team, pts, gp, "fg%", "3p%", "3pm", "3pa", ftm, fta, "ft%"
+FROM player_pergame_regularseason_2024_2025
+ORDER BY pts DESC NULLS LAST LIMIT 10;
 
 Q: "Who are the best scorers from 2000-2001"
 → RULE 4 + RULE 8. Specific season leaderboard from one table, no aggregation.
-SELECT DISTINCT player_name, team_abbreviation, pts, pts_rank, gp, fg_pct, fg3_pct, fg3m, fg3a, ftm, fta, ft_pct
-FROM all_players_regular_2000_2001
-ORDER BY pts_rank ASC NULLS LAST LIMIT 5;
+SELECT DISTINCT player, team, pts, gp, "fg%", "3p%", "3pm", "3pa", ftm, fta, "ft%"
+FROM player_pergame_regularseason_2000_2001
+ORDER BY pts DESC NULLS LAST LIMIT 5;
 
 Q: "Show me Steph Curry's career stats"
-→ RULE 5. Career = UNION ALL across all yearly tables.
-SELECT player_name,
-  SUM(pts) AS total_pts, SUM(reb) AS total_reb, SUM(ast) AS total_ast,
-  (CAST(SUM(fgm)  AS DOUBLE PRECISION) / NULLIF(SUM(fga),  0)) AS fg_pct,
-  (CAST(SUM(fg3m) AS DOUBLE PRECISION) / NULLIF(SUM(fg3a), 0)) AS fg3_pct
-FROM (
-  SELECT player_name, pts, reb, ast, fgm, fga, fg3m, fg3a FROM all_players_regular_2012_2013 WHERE player_name ILIKE '%Stephen Curry%'
-  UNION ALL
-  SELECT player_name, pts, reb, ast, fgm, fga, fg3m, fg3a FROM all_players_regular_2013_2014 WHERE player_name ILIKE '%Stephen Curry%'
-  UNION ALL
-  SELECT player_name, pts, reb, ast, fgm, fga, fg3m, fg3a FROM all_players_regular_2014_2015 WHERE player_name ILIKE '%Stephen Curry%'
-  UNION ALL
-  SELECT player_name, pts, reb, ast, fgm, fga, fg3m, fg3a FROM all_players_regular_2024_2025 WHERE player_name ILIKE '%Stephen Curry%'
-) AS career GROUP BY player_name LIMIT 50;
+→ RULE 5. Career = UNION ALL across yearly tables (raw rows, no SQL aggregates).
+SELECT player, gp, pts, reb, ast, fgm, fga, "fg%", "3pm", "3pa", "3p%" FROM player_pergame_regularseason_2012_2013 WHERE player ILIKE '%Stephen Curry%'
+UNION ALL
+SELECT player, gp, pts, reb, ast, fgm, fga, "fg%", "3pm", "3pa", "3p%" FROM player_pergame_regularseason_2013_2014 WHERE player ILIKE '%Stephen Curry%'
+UNION ALL
+SELECT player, gp, pts, reb, ast, fgm, fga, "fg%", "3pm", "3pa", "3p%" FROM player_pergame_regularseason_2014_2015 WHERE player ILIKE '%Stephen Curry%'
+UNION ALL
+SELECT player, gp, pts, reb, ast, fgm, fga, "fg%", "3pm", "3pa", "3p%" FROM player_pergame_regularseason_2024_2025 WHERE player ILIKE '%Stephen Curry%'
+LIMIT 500;
 
 Q: "Is Giannis on a hot streak"
 → RULE 3. Streak = game log recency. Use player_game_logs.
-SELECT player_name, game_date, matchup, wl, pts, reb, ast,
-  (CAST(fgm  AS DOUBLE PRECISION) / NULLIF(fga,  0)) AS fg_pct
+SELECT player_name, game_date, matchup, wl, pts, reb, ast, fgm, fga, fg3m, fg3a, ftm, fta, min
 FROM player_game_logs
 WHERE player_name ILIKE '%Giannis%'
   AND season_id = '22025'
@@ -1890,42 +2214,47 @@ WHERE player_name ILIKE '%Giannis%'
 ORDER BY game_date DESC LIMIT 10;
 
 Q: "Compare LeBron and Jordan career stats"
-→ RULE 7. Different eras. UNION ALL per player.
-SELECT player_name,
-  SUM(pts) AS total_pts, SUM(reb) AS total_reb, SUM(ast) AS total_ast,
-  (CAST(SUM(fgm)  AS DOUBLE PRECISION) / NULLIF(SUM(fga),  0)) AS fg_pct
-FROM (
-  SELECT player_name, pts, reb, ast, fgm, fga FROM all_players_regular_1996_1997 WHERE player_name ILIKE '%Michael Jordan%'
-  UNION ALL
-  SELECT player_name, pts, reb, ast, fgm, fga FROM all_players_regular_1997_1998 WHERE player_name ILIKE '%Michael Jordan%'
-  UNION ALL
-  SELECT player_name, pts, reb, ast, fgm, fga FROM all_players_regular_2003_2004 WHERE player_name ILIKE '%LeBron James%'
-  UNION ALL
-  SELECT player_name, pts, reb, ast, fgm, fga FROM all_players_regular_2024_2025 WHERE player_name ILIKE '%LeBron James%'
-) AS combined GROUP BY player_name LIMIT 50;
+→ RULE 7. Different eras. UNION ALL per table (raw rows).
+SELECT player, gp, pts, reb, ast, fgm, fga, "fg%" FROM player_pergame_regularseason_1996_1997 WHERE player ILIKE '%Michael Jordan%'
+UNION ALL
+SELECT player, gp, pts, reb, ast, fgm, fga, "fg%" FROM player_pergame_regularseason_1997_1998 WHERE player ILIKE '%Michael Jordan%'
+UNION ALL
+SELECT player, gp, pts, reb, ast, fgm, fga, "fg%" FROM player_pergame_regularseason_2003_2004 WHERE player ILIKE '%LeBron James%'
+UNION ALL
+SELECT player, gp, pts, reb, ast, fgm, fga, "fg%" FROM player_pergame_regularseason_2024_2025 WHERE player ILIKE '%LeBron James%'
+LIMIT 500;
+
+Q: "Giannis 2024-25 per-game stats and his advanced numbers for that season"
+→ RULE 11 + RULE 12. JOIN same-season per-game and advance_totals (confirm join column names in DATABASE SCHEMA; often `player` on both sides).
+SELECT pg.player, pg.team, pg.gp, pg.pts, pg.reb, pg.ast, pg."fg%", adv.ts
+FROM player_pergame_regularseason_2024_2025 pg
+INNER JOIN advance_totals_regularseason_2024_2025 adv ON pg.player = adv.player
+WHERE pg.player ILIKE '%Giannis%'
+LIMIT 50;
 
 ════════════════════════════════════════════════════════════════════════
 SECTION 6: COMMON MISTAKES — NEVER DO THESE
 ════════════════════════════════════════════════════════════════════════
 
-❌ SELECT season_id FROM all_players_playoffs_2024_2025    -- does not exist in summary tables
-❌ SELECT game_date FROM all_players_regular_2024_2025     -- does not exist in summary tables
-❌ SELECT fg_pct FROM player_game_logs                     -- does not exist, must calculate
+❌ SELECT season_id FROM player_totals_playoffseason_2024_2025    -- does not exist in summary tables
+❌ SELECT game_date FROM player_pergame_regularseason_2024_2025     -- does not exist in summary tables
+❌ SELECT fg_pct FROM player_game_logs                     -- not a column; use fgm, fga or a summary table
 ❌ SELECT oreb FROM player_game_logs                       -- does not exist in game logs
 ❌ WHERE season_type = 'Playoffs' on a summary table       -- column does not exist there
 ❌ WHERE season_id = '22025' on a summary table            -- column does not exist there
-❌ player_name ILIKE 'Jordan%'                             -- matches wrong players
-❌ player_name ILIKE 'Harris'                              -- missing wildcards
-❌ fgm / fga                                               -- unsafe, use NULLIF
+❌ player ILIKE 'Jordan%' on summary tables                 -- matches wrong players
+❌ player ILIKE 'Harris'                                   -- missing wildcards
+❌ fgm / fga or CAST(...)/NULLIF in SQL                    -- no arithmetic in SELECT (use table columns)
 ❌ SELECT * FROM any table                                  -- always name columns explicitly
-❌ Using all_players_playoffs_2018_2019 when no year given  -- always default to 2024_2025
+❌ Using wrong playoff season table when no year given       -- default to latest player_totals_playoffseason_* in schema
 ❌ Using player_game_logs for "analyze playoff performance" -- use season summary tables
-❌ AVG(fg_pct) from season summary tables                  -- use SUM(fgm)/SUM(fga) instead
+❌ SUM(...), GROUP BY, or AVG(...) in SQL                  -- read stats from table columns only
 ❌ ORDER BY game_date on a season summary table            -- game_date does not exist there
 ❌ WHERE season_id = '22024' for current 2025-26 games     -- current season is '22025'
-❌ Using all_players_regular_2024_2025 for "last X games"  -- no game_date column there
+❌ Using player_pergame_regularseason_2024_2025 for "last X games"  -- no game_date column there
 ❌ Assuming player_game_logs is outdated                   -- it has data through Feb 2026
 ❌ SELECT gp FROM player_game_logs                         -- use COUNT(*) AS games_played
+❌ Ignoring a second table when the user explicitly asks for fields only found there -- use RULE 12 JOIN if schema keys match
 
 ════════════════════════════════════════════════════════════════════════
 OUTPUT FORMAT
@@ -1961,6 +2290,7 @@ Generate the SQL:"""
         logger.error("OpenAI API error: %s", e)
         return None
 
+    sql_query = _canonicalize_nba_stats_sql(sql_query)
     sql_query = _enforce_start_year_table_mapping(sql_query, user_input_param)
     sql_query = _enforce_nth_season_table_mapping(sql_query, user_input_param, conn)
     sql_query = _rewrite_nth_season_comparison_sql(sql_query, user_input_param, conn)
@@ -1985,6 +2315,7 @@ Generate the SQL:"""
                 schema_description=schema_description,
                 user_input=user_input_param
             )
+            sql_query = _canonicalize_nba_stats_sql(sql_query)
             sql_query = _enforce_start_year_table_mapping(sql_query, user_input_param)
             sql_query = _enforce_nth_season_table_mapping(sql_query, user_input_param, conn)
             sql_query = _rewrite_nth_season_comparison_sql(sql_query, user_input_param, conn)
@@ -2010,6 +2341,15 @@ Generate the SQL:"""
         try:
             logger.debug("Attempt %d executing query...", attempt + 1)
             logger.info("Final SQL being executed:\n%s", sql_query)
+            tables_used = _extract_tables_from_sql(sql_query)
+            global _LAST_TABLES_USED
+            _LAST_TABLES_USED = list(tables_used)
+            if tables_used:
+                logger.info("TABLES USED: %s", ", ".join(tables_used))
+                print(f"TABLES USED: {', '.join(tables_used)}")
+            else:
+                logger.info("TABLES USED: <none detected>")
+                print("TABLES USED: <none detected>")
             return execute_query(conn, sql_query)
 
         except Exception as e:
@@ -2027,6 +2367,7 @@ Generate the SQL:"""
                     schema_description=schema_description,
                     user_input=user_input_param
                 )
+                sql_query = _canonicalize_nba_stats_sql(sql_query)
 
                 sql_query = _enforce_start_year_table_mapping(sql_query, user_input_param)
                 sql_query = _enforce_nth_season_table_mapping(sql_query, user_input_param, conn)
@@ -2072,14 +2413,18 @@ def debug_query_routing(user_input: str, model_sql: str):
     conn = get_connection()
     cursor = conn.cursor()
     try:
+        schema_description = get_db_schema(conn)
         cursor.execute(
             "SELECT current_database(), current_user, current_schema(), current_setting('search_path'), inet_server_addr(), inet_server_port();"
         )
         db_identity = cursor.fetchone()
 
-        sql_after_year = _enforce_start_year_table_mapping(model_sql or "", user_input or "")
+        canon_sql = _canonicalize_nba_stats_sql(model_sql or "")
+        sql_after_year = _enforce_start_year_table_mapping(canon_sql, user_input or "")
         sql_after_nth = _enforce_nth_season_table_mapping(sql_after_year, user_input or "", conn)
-        sql_after_advanced = _enforce_advanced_table_mapping(sql_after_nth, user_input or "")
+        sql_after_advanced = _enforce_advanced_table_mapping(
+            sql_after_nth, user_input or "", schema_description
+        )
         sql_after_name = _expand_player_name_filters_for_encoding(sql_after_advanced)
         sql_after_profile = _ensure_profile_columns_in_sql(sql_after_name, user_input or "")
         final_sql = _enforce_raw_data_only_sql(sql_after_profile)
@@ -2128,7 +2473,7 @@ def debug_query_routing(user_input: str, model_sql: str):
             SELECT table_name
             FROM information_schema.tables
             WHERE table_schema = 'public'
-              AND table_name ILIKE 'nba%%advanced%%'
+              AND (table_name ILIKE 'advance%%totals%%' OR table_name ILIKE 'nba%%advanced%%')
             ORDER BY table_name
             LIMIT 100;
             """

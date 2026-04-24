@@ -100,6 +100,44 @@ def _resolve_df_output(module: Optional[Any]) -> Optional[pd.DataFrame]:
     return None
 
 
+def _normalize_stats_df_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Align DataFrame column names with what formatters expect, using names as returned
+    from PostgreSQL (quoted identifiers like fg%, 3pm) without recomputing stats.
+    """
+    if df is None or getattr(df, "empty", True):
+        return df
+    out = df.copy()
+    cols = list(out.columns)
+    colset = set(cols)
+    renames: Dict[str, str] = {}
+
+    def _add(src: str, dst: str) -> None:
+        if src in colset and dst not in colset:
+            renames[src] = dst
+
+    _add("player", "player_name")
+    for _src in ("fg%", "FG%"):
+        _add(_src, "fg_pct")
+    for _src in ("3p%", "3P%"):
+        _add(_src, "fg3_pct")
+    for _src in ("ft%", "FT%"):
+        _add(_src, "ft_pct")
+    _add("3pm", "fg3m")
+    _add("3pa", "fg3a")
+    _add("c_3p", "fg3_pct")
+    _add("+/-", "plus_minus")
+    # Playoff totals-style tables store shooting rates in fg / ft without separate fgm/ftm.
+    if "fg_pct" not in colset and "fg" in colset and "fgm" not in colset:
+        _add("fg", "fg_pct")
+    if "ft_pct" not in colset and "ft" in colset and "ftm" not in colset:
+        _add("ft", "ft_pct")
+
+    if renames:
+        out = out.rename(columns=renames)
+    return out
+
+
 # -------------------------
 # Composite scoring utilities
 # -------------------------
@@ -1481,6 +1519,8 @@ def analyze_dataframe() -> str:
     if client is None:
         return "Error: OpenAI client not available. Set OPENAI_API_KEY or expose 'client' in query_bot."
 
+    df_output = _normalize_stats_df_columns(df_output)
+
     if _is_spatial_shot_dataframe(df_output):
         return _format_spatial_shots_narrative(df_output, user_input, client)
 
@@ -1643,6 +1683,8 @@ def analyze_question(question: str) -> str:
     if client is None:
         return "Error: OpenAI client not available. Set OPENAI_API_KEY or expose 'client' in query_bot."
 
+    df = _normalize_stats_df_columns(df)
+
     if _is_spatial_shot_dataframe(df):
         return _format_spatial_shots_narrative(df, question, client)
 
@@ -1782,6 +1824,8 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
             "No data was found for this query. The player may not have participated "
             "in the requested season or playoffs, or the name was not recognized."
         )
+
+    df = _normalize_stats_df_columns(df)
 
     # Shot-chart / court coordinate data: narrative style, pre-aggregated — avoid rigid table dumps.
     if _is_spatial_shot_dataframe(df):

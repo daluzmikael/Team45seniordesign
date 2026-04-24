@@ -50,6 +50,8 @@ def get_connection():
 _RELEVANT_TABLE_PATTERNS = [
     r"all_players_regular_\d{4}_\d{4}$",
     r"all_players_playoffs_\d{4}_\d{4}$",
+    r"teams_pergame_regularseason_\d{4}_\d{4}$",
+    r"teams_pergame_playoffseason_\d{4}_\d{4}$",
     r"nba_advanced_season_\d{4}_\d{2}_season_type_(regular_season|playoffs)_per_mode_p",
     r"player_game_logs$",
     r"court_shots$",
@@ -79,8 +81,17 @@ def get_db_schema(conn):
     # Categorize by type
     regular_tables = sorted([t for t in tables if re.match(r"all_players_regular_\d{4}_\d{4}$", t)])
     playoffs_tables = sorted([t for t in tables if re.match(r"all_players_playoffs_\d{4}_\d{4}$", t)])
+    team_regular_tables = sorted([t for t in tables if re.match(r"teams_pergame_regularseason_\d{4}_\d{4}$", t)])
+    team_playoff_tables = sorted([t for t in tables if re.match(r"teams_pergame_playoffseason_\d{4}_\d{4}$", t)])
     advanced_tables = sorted([t for t in tables if t.startswith("nba_advanced_season_")])
-    other_tables = [t for t in tables if t not in regular_tables and t not in playoffs_tables and t not in advanced_tables]
+    other_tables = [
+        t for t in tables
+        if t not in regular_tables
+        and t not in playoffs_tables
+        and t not in team_regular_tables
+        and t not in team_playoff_tables
+        and t not in advanced_tables
+    ]
 
     schema_parts = []
 
@@ -145,6 +156,48 @@ def get_db_schema(conn):
             f"Table pattern: nba_advanced_season_YYYY_YY_season_type_TYPE_per_mode_p\n"
             f"Columns (same for all): {columns}\n"
             f"Available tables ({len(advanced_tables)}): {', '.join(advanced_tables[:5])}... and {len(advanced_tables) - 5} more\n"
+        )
+
+    # Team regular season per-game tables
+    if team_regular_tables:
+        cursor.execute(f"""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = '{team_regular_tables[-1]}'
+            ORDER BY ordinal_position;
+        """)
+        columns = ", ".join([col[0] for col in cursor.fetchall()])
+        years = []
+        for t in team_regular_tables:
+            m = re.match(r"teams_pergame_regularseason_(\d{4})_(\d{4})$", t)
+            if m:
+                years.append(f"{m.group(1)}-{m.group(2)}")
+        schema_parts.append(
+            f"=== Team Regular Season Tables ===\n"
+            f"Table pattern: teams_pergame_regularseason_YYYY_YYYY\n"
+            f"Columns (same for all): {columns}\n"
+            f"Available tables ({len(team_regular_tables)}): {', '.join(years)}\n"
+        )
+
+    # Team playoff per-game tables
+    if team_playoff_tables:
+        cursor.execute(f"""
+            SELECT column_name
+            FROM information_schema.columns
+            WHERE table_name = '{team_playoff_tables[-1]}'
+            ORDER BY ordinal_position;
+        """)
+        columns = ", ".join([col[0] for col in cursor.fetchall()])
+        years = []
+        for t in team_playoff_tables:
+            m = re.match(r"teams_pergame_playoffseason_(\d{4})_(\d{4})$", t)
+            if m:
+                years.append(f"{m.group(1)}-{m.group(2)}")
+        schema_parts.append(
+            f"=== Team Playoff Tables ===\n"
+            f"Table pattern: teams_pergame_playoffseason_YYYY_YYYY\n"
+            f"Columns (same for all): {columns}\n"
+            f"Available tables ({len(team_playoff_tables)}): {', '.join(years)}\n"
         )
 
     # Other unique tables — list columns individually

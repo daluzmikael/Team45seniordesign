@@ -582,6 +582,117 @@ def _is_single_player_stats_question(question: str, df: pd.DataFrame) -> bool:
     return unique_players == 1
 
 
+def _is_clutch_question_or_frame(question: str, df: pd.DataFrame) -> bool:
+    q = (question or "").lower()
+    has_clutch_intent = any(k in q for k in ["clutch", "close game", "last 5 minutes"])
+    cols = {str(c).lower() for c in (df.columns.tolist() if df is not None else [])}
+    clutch_markers = {"w_pct", "w", "w_l", "c_3p", "plus_minus"}
+    has_clutch_like_cols = len(cols.intersection(clutch_markers)) > 0
+    return has_clutch_intent or has_clutch_like_cols
+
+
+def _format_single_player_clutch_profile(df: pd.DataFrame, question: str) -> str:
+    def _is_missing(v: Any) -> bool:
+        try:
+            return pd.isna(v)
+        except Exception:
+            return v is None
+
+    def _fmt_num(v: Any, digits: int = 1) -> str:
+        if _is_missing(v):
+            return "N/A"
+        try:
+            return f"{float(v):.{digits}f}"
+        except Exception:
+            return "N/A"
+
+    def _fmt_int(v: Any) -> str:
+        if _is_missing(v):
+            return "N/A"
+        try:
+            return str(int(float(v)))
+        except Exception:
+            return "N/A"
+
+    def _fmt_pct(v: Any, digits: int = 1) -> str:
+        if _is_missing(v):
+            return "N/A"
+        try:
+            num = float(v)
+            if 0 <= num <= 1:
+                num *= 100.0
+            return f"{num:.{digits}f}%"
+        except Exception:
+            return "N/A"
+
+    working = df.copy()
+    if "player_name" in working.columns:
+        working = working.dropna(subset=["player_name"])
+    if "gp" in working.columns:
+        working = working.sort_values(by=["gp"], ascending=[False], na_position="last")
+    if "player_name" in working.columns:
+        working = working.drop_duplicates(subset=["player_name"], keep="first")
+    if working.empty:
+        return "\nNo clutch stats were available for this question."
+
+    row = working.iloc[0]
+    name = str(row.get("player_name", "N/A")) if not _is_missing(row.get("player_name")) else "N/A"
+    team = str(row.get("team_abbreviation", "N/A")) if not _is_missing(row.get("team_abbreviation")) else "N/A"
+    gp = _fmt_int(row.get("gp"))
+
+    metric_specs = [
+        ("PTS", "pts", _fmt_num),
+        ("AST", "ast", _fmt_num),
+        ("REB", "reb", _fmt_num),
+        ("TOV", "tov", _fmt_num),
+        ("STL", "stl", _fmt_num),
+        ("BLK", "blk", _fmt_num),
+        ("FG%", "fg_pct", _fmt_pct),
+        ("3P%", "fg3_pct", _fmt_pct),
+        ("FT%", "ft_pct", _fmt_pct),
+        ("W%", "w_pct", _fmt_pct),
+        ("+/-", "plus_minus", _fmt_num),
+    ]
+    available_metrics = [(label, col, fmt) for label, col, fmt in metric_specs if col in working.columns]
+    if not available_metrics:
+        return f"\n## **{name}** ({team})\n\nNo clutch metric columns were returned for this query."
+
+    header = "| " + " | ".join(label for label, _, _ in available_metrics) + " |"
+    divider = "|" + "|".join(["---:" for _ in available_metrics]) + "|"
+    values = "| " + " | ".join(fmt(row.get(col)) for _, col, fmt in available_metrics) + " |"
+
+    pts = _fmt_num(row.get("pts")) if "pts" in working.columns else "N/A"
+    ast = _fmt_num(row.get("ast")) if "ast" in working.columns else "N/A"
+    clutch_summary = (
+        f"In clutch situations this season, {name} played {gp} games"
+        + (f", scored {pts} points" if pts != "N/A" else "")
+        + (f", and added {ast} assists" if ast != "N/A" else "")
+        + "."
+    )
+    if "pts" in working.columns and gp != "N/A":
+        try:
+            ppg = float(row.get("pts")) / max(float(gp), 1.0)
+            clutch_summary += f" That is {ppg:.2f} points per clutch game."
+        except Exception:
+            pass
+
+    return "\n" + "\n".join(
+        [
+            f"## **{name}** ({team})",
+            "",
+            f"_Clutch sample: {gp} games_",
+            "",
+            header,
+            divider,
+            values,
+            "",
+            clutch_summary,
+            "",
+            "Want me to break down his clutch shot profile next?",
+        ]
+    )
+
+
 def _is_single_player_season_trend_question(question: str, df: pd.DataFrame) -> bool:
     q = (question or "").lower()
     if df is None or df.empty or "player_name" not in df.columns:
@@ -1564,6 +1675,7 @@ def analyze_dataframe() -> str:
     is_simple_top_scorers = _is_simple_top_scorers_question(user_input, domain)
     is_single_player_trend = _is_single_player_season_trend_question(user_input, df_output)
     is_single_player_stats = _is_single_player_stats_question(user_input, df_output)
+    is_clutch_profile = is_single_player_stats and _is_clutch_question_or_frame(user_input, df_output)
     is_games_played_q = _is_games_played_question(user_input, df_output)
     is_concise_season_lookup = _is_concise_single_player_season_lookup_question(user_input, df_output)
 
@@ -1576,6 +1688,8 @@ def analyze_dataframe() -> str:
         trend_text = _format_single_player_season_trend_response(df_output, user_input, client)
         if trend_text:
             return trend_text
+    if is_clutch_profile:
+        return _format_single_player_clutch_profile(df_output, user_input)
     if is_single_player_stats:
         return _format_single_player_stats_profile(df_output, user_input, client)
     elif is_simple_top_scorers:
@@ -1724,6 +1838,7 @@ def analyze_question(question: str) -> str:
     is_simple_top_scorers = _is_simple_top_scorers_question(question, domain)
     is_single_player_trend = _is_single_player_season_trend_question(question, df)
     is_single_player_stats = _is_single_player_stats_question(question, df)
+    is_clutch_profile = is_single_player_stats and _is_clutch_question_or_frame(question, df)
     is_games_played_q = _is_games_played_question(question, df)
     is_concise_season_lookup = _is_concise_single_player_season_lookup_question(question, df)
 
@@ -1736,6 +1851,8 @@ def analyze_question(question: str) -> str:
         trend_text = _format_single_player_season_trend_response(df, question, client)
         if trend_text:
             return trend_text
+    if is_clutch_profile:
+        return _format_single_player_clutch_profile(df, question)
     if is_single_player_stats:
         return _format_single_player_stats_profile(df, question, client)
     elif is_simple_top_scorers:
@@ -1869,6 +1986,7 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
     is_simple_top_scorers = _is_simple_top_scorers_question(question, domain)
     is_single_player_trend = _is_single_player_season_trend_question(question, df)
     is_single_player_stats = _is_single_player_stats_question(question, df)
+    is_clutch_profile = is_single_player_stats and _is_clutch_question_or_frame(question, df)
     is_games_played_q = _is_games_played_question(question, df)
     is_concise_season_lookup = _is_concise_single_player_season_lookup_question(question, df)
 
@@ -1881,6 +1999,8 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
         trend_text = _format_single_player_season_trend_response(df, question, client)
         if trend_text:
             return trend_text
+    if is_clutch_profile:
+        return _format_single_player_clutch_profile(df, question)
     if is_single_player_stats:
         return _format_single_player_stats_profile(df, question, client)
     elif is_simple_top_scorers:

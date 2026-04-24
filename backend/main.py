@@ -283,6 +283,15 @@ async def analysis_endpoint(
         elif request.conversationId and not authorization:
             history_context_reason = "guest_without_request_history"
 
+        # Force current-season interpretation for undated regular-season performance asks.
+        q_lower = (effective_question or "").lower()
+        has_explicit_year = re.search(r"\b(19\d{2}|20\d{2})\b", q_lower) is not None
+        has_regular_perf_intent = ("regular season" in q_lower) and any(
+            k in q_lower for k in ["performance", "season stats", "season stat", "season averages", "stats"]
+        )
+        if has_regular_perf_intent and not has_explicit_year:
+            effective_question = f"{effective_question.strip()} in 2025-26 season"
+
         # Run the query ONCE here — do not let query_analyzer run it again
         query_result = run_query(effective_question)
 
@@ -293,14 +302,24 @@ async def analysis_endpoint(
 
         # Handle empty or failed queries with a helpful message instead of crashing
         if query_result is None or query_result.empty:
-            payload = {
-                "success": True,
-                "analysis": (
+            q_lower = (request.question or "").lower()
+            if "playoff" in q_lower or "postseason" in q_lower:
+                empty_message = (
+                    "No playoff data was found for this query in the available playoff tables.\n"
+                    "- This player may not have records in the currently selected playoff seasons.\n"
+                    "- Try a specific playoff year (example: 'Giannis 2021 playoff performance').\n"
+                    "- If you want, ask for regular-season stats instead."
+                )
+            else:
+                empty_message = (
                     "No data was found for this query. This could mean:\n"
                     "- The player did not participate in the most recent playoffs or season.\n"
                     "- The player name may be misspelled or not recognized.\n"
                     "- Try specifying a season year, e.g. 'Giannis 2023 playoff performance'."
-                ),
+                )
+            payload = {
+                "success": True,
+                "analysis": empty_message,
                 "data": [],
                 "question": request.question,
                 "tablesUsed": tables_used,

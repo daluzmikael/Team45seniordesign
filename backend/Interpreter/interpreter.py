@@ -2835,6 +2835,8 @@ TYPE C — EXTENDED NBA DATA FAMILIES (from current_working_data schema):
   IMPORTANT:
   - These tables are highly structured by name (season, season_type, per_mode, endpoint naming).
   - ALWAYS rely on DATABASE SCHEMA below to pick exact columns; never invent columns.
+  - Clutch intent maps to last-5-minutes game context.
+  - `clutch_totals_*` values are totals from clutch situations; treat them as totals (do not reinterpret as per-game unless explicitly requested).
   - If user asks for clutch/hustle/lineup/schedule/standings, do NOT force player_pergame_regularseason_* or player_game_logs.
   - Use table-name pattern matching by intent first, then schema-confirmed columns.
 
@@ -2845,6 +2847,7 @@ SECTION 2: TABLE SELECTION RULES — FOLLOW IN ORDER, FIRST MATCH WINS
 RULE 0 — INTENT ROUTING FOR EXTENDED TABLE FAMILIES:
   If question clearly targets one of these domains, use that family first:
   - "clutch", "in close games", "last 5 minutes"        → `clutch_totals_regularseason_*` / `clutch_totals_playoffseason_*`
+                                                          (clutch means last 5 minutes context; table values are totals, not per-game rates)
   - "hustle", "deflections", "box outs", "contested"    → `nba__hustle__...`
   - "lineup", "5-man unit", "best lineup", "on/off 5"   → `nba__lineups__...`
   - "schedule", "next games", "calendar"                → `nba__schedule__...`

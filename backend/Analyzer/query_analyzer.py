@@ -667,23 +667,17 @@ def _format_single_player_clutch_profile(df: pd.DataFrame, question: str) -> str
     pts = _fmt_num(row.get("pts")) if "pts" in working.columns else "N/A"
     ast = _fmt_num(row.get("ast")) if "ast" in working.columns else "N/A"
     clutch_summary = (
-        f"In clutch situations this season, {name} played {gp} games"
-        + (f", scored {pts} points" if pts != "N/A" else "")
-        + (f", and added {ast} assists" if ast != "N/A" else "")
-        + "."
+        f"This clutch view represents last-5-minutes context totals. {name} appeared in {gp} clutch games"
+        + (f", with {pts} total clutch points" if pts != "N/A" else "")
+        + (f" and {ast} total clutch assists" if ast != "N/A" else "")
+        + ". Values shown are totals from the clutch table, not per-game rates."
     )
-    if "pts" in working.columns and gp != "N/A":
-        try:
-            ppg = float(row.get("pts")) / max(float(gp), 1.0)
-            clutch_summary += f" That is {ppg:.2f} points per clutch game."
-        except Exception:
-            pass
 
     return "\n" + "\n".join(
         [
             f"## **{name}** ({team})",
             "",
-            f"_Clutch sample: {gp} games_",
+            f"_Clutch sample (last 5 minutes context): {gp} games_",
             "",
             header,
             divider,

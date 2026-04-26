@@ -587,7 +587,7 @@ Still follow the main schema exactly, and only output valid JSON."""
     messages.append({"role": "user", "content": user_question})
 
     response = client.chat.completions.create(
-        model="gpt-4o",
+        model="gpt-4.1-mini",
         messages=messages,
         temperature=0.1,
         response_format={"type": "json_object"}

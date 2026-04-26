@@ -29,10 +29,10 @@ export default function Home() {
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4 w-full max-w-2xl">
           {[
-            "Compare LeBron and Jordan's career stats",
+            "Compare LeBron James and Stephen Curry's career stats",
             "Show me Steph Curry's 3-point percentage by season",
-            "What are the Lakers' win-loss records this season?",
-            "Analyze Giannis' playoff performance",
+            "What are the Lakers' win-loss records in 2022?",
+            "Analyze Giannis Antetokounmpo's playoff performance in 2023",
           ].map((example) => (
             <div
               key={example}

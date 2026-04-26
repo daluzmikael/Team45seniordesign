@@ -685,7 +685,7 @@ def _format_single_player_season_trend_response(df: pd.DataFrame, question: str,
         try:
             sample = working[[season_col] + [c for _, c in available]].head(8).to_dict(orient="records")
             resp = client.chat.completions.create(
-                model="gpt-4o-mini",
+                model="gpt-4.1-mini",
                 messages=[
                     {"role": "system", "content": "Write 2 concise sentences summarizing the trend in these season-by-season stats. Use plain language and include at least one concrete stat reference."},
                     {"role": "user", "content": f"Question: {question}\nPlayers: {unique_players or [player_name]}\nSeason rows: {sample}"},
@@ -802,7 +802,7 @@ def _generate_natural_player_season_summary(
 
     try:
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4.1-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -1447,7 +1447,7 @@ def _format_spatial_shots_narrative(df: pd.DataFrame, question: str, client: Any
     user_prompt = f"Question:\n{question}\n\n{summary}\n\nAnswer in a relaxed, broadcast tone."
     try:
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4.1-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -1585,7 +1585,7 @@ def analyze_dataframe() -> str:
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4.1-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -1743,7 +1743,7 @@ def analyze_question(question: str) -> str:
 
     try:
         response = _resolve_client(query_bot_module).chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -1885,7 +1885,7 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4.1-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},

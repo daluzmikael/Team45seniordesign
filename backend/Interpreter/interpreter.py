@@ -413,8 +413,10 @@ _PLAYER_ALIAS_MAP = {
     "steph": ["Stephen Curry", "Steph Curry"],
     "steph curry": ["Stephen Curry", "Steph Curry"],
     "bron": ["LeBron James"],
+    "lebron": ["LeBron James"],
     "king james": ["LeBron James"],
     "greek freak": ["Giannis Antetokounmpo", "Giannis"],
+    "giannis": ["Giannis Antetokounmpo"],
     "kd": ["Kevin Durant"],
     "ad": ["Anthony Davis"],
     "kawhi": ["Kawhi Leonard"],
@@ -423,26 +425,78 @@ _PLAYER_ALIAS_MAP = {
     "russ": ["Russell Westbrook"],
     "pg": ["Paul George"],
     "pg13": ["Paul George"],
+    "luka": ["Luka Doncic"],
+    "kobe": ["Kobe Bryant"],
+    "shaq": ["Shaquille O'Neal"],
+    "magic": ["Magic Johnson"],
+    "jokic": ["Nikola Jokic"],
+    "embiid": ["Joel Embiid"],
+    "tatum": ["Jayson Tatum"],
+    "sga": ["Shai Gilgeous-Alexander"],
+}
+
+
+# Words that are never part of a player name. Any candidate token that lowercases
+# to one of these is dropped. Eliminates ghosts like "Compare LeBron James" and
+# "Michael Jordan career stat" produced by the loose regex extractors.
+_NAME_BLOCK_WORDS = {
+    "compare", "vs", "versus", "between", "and", "than", "better", "best",
+    "worse", "worst", "career", "careers", "stats", "stat", "statistic",
+    "statistics", "season", "seasons", "year", "years", "playoff",
+    "playoffs", "postseason", "performance", "profile", "show", "tell",
+    "give", "me", "us", "the", "a", "an", "for", "of", "in", "during",
+    "from", "to", "by", "per", "over", "across", "through", "thru", "all",
+    "time", "rookie", "history", "historical", "alltime",
+    "did", "does", "do", "was", "were", "is", "are", "what", "who", "which",
+    "how", "when", "where", "why", "him", "her", "them", "his", "their",
+    "this", "that", "these", "those",
 }
 
 
 def _normalize_player_candidate(raw: str) -> str:
     candidate = (raw or "").strip()
-    candidate = re.sub(
-        r"(?i)^(than|and|vs|versus|between|to|from|was|is|are|were|whether|who|what|show|me|did|does|do)\s+",
-        "",
-        candidate,
-    ).strip()
-    candidate = re.sub(r"(?i)\b(in|during|for|from|through|thru|to|over|by|per|the|playoffs?|postseason)\b.*$", "", candidate).strip()
-    candidate = candidate.strip(" ,.;:!?")
     if not candidate:
         return ""
-    parts = [p for p in candidate.split() if p]
-    if parts:
-        last = parts[-1]
-        if last.lower().endswith("s") and last.lower() not in {"james"} and len(last) > 3:
-            parts[-1] = last[:-1]
-    return " ".join(parts).strip()
+    candidate = candidate.strip(" ,.;:!?'\"")
+    if not candidate:
+        return ""
+    parts = [p for p in re.split(r"\s+", candidate) if p]
+
+    # Strip possessive 's (straight and curly) from each token BEFORE
+    # the block-word filter and validation. Bug case: "Stephen Curry's"
+    # in "Compare LeBron James and Stephen Curry's career stats" was
+    # surviving as a candidate, then failing DB validation silently.
+    cleaned_tokens = []
+    for tok in parts:
+        # strip trailing 's, 's, s' (curly + straight, plus stray apostrophe)
+        tok = re.sub(r"(['’]s|['’])$", "", tok)
+        if tok and tok.lower() not in _NAME_BLOCK_WORDS:
+            cleaned_tokens.append(tok)
+
+    if not cleaned_tokens:
+        return ""
+    if len(cleaned_tokens) < 2:
+        return ""
+    if not all(re.match(r"^[A-Za-z][A-Za-z\.\-']*$", p) for p in cleaned_tokens):
+        return ""
+    if not all(p[0].isupper() for p in cleaned_tokens):
+        return ""
+    return " ".join(cleaned_tokens).strip()
+
+def _career_by_season_columns() -> list[str]:
+    """
+    Lean column set for career / by-season / multi-season views. Drops the
+    _rank columns (per-season ranks don't aggregate meaningfully) and rare
+    stats. Reduces analyzer prompt size by ~75% on career compares.
+    """
+    return [
+        "player_id", "player_name", "team_abbreviation", "age",
+        "gp", "w", "l", "w_pct", "min",
+        "fgm", "fga", "fg_pct", "fg3m", "fg3a", "fg3_pct",
+        "ftm", "fta", "ft_pct",
+        "oreb", "dreb", "reb", "ast", "tov", "stl", "blk",
+        "pf", "pts", "plus_minus",
+    ]
 
 
 def _extract_player_names_from_question(question_text: str) -> list[str]:
@@ -452,25 +506,32 @@ def _extract_player_names_from_question(question_text: str) -> list[str]:
 
     names: list[str] = []
     lower_q = q.lower()
+
+    # Aliases first — these are unambiguous shorthands.
     for alias, expanded in _PLAYER_ALIAS_MAP.items():
         if re.search(rf"(?i)\b{re.escape(alias)}\b", q):
             names.extend(expanded)
 
-    possessive_pattern = re.compile(
-        r"(?i)\b([A-Za-z][A-Za-z\.\-]*(?:\s+[A-Za-z][A-Za-z\.\-]*){0,2})(?:['’]s)\b"
+    # Pre-strip filler tokens that pollute regex grabs. Removing these here
+    # (rather than relying on per-candidate cleanup alone) lets the pair
+    # patterns terminate at the right boundary.
+    cleaned_q = re.sub(
+        r"(?i)\b(career|careers|stats|stat|statistics?|profile|performance|"
+        r"history|historical|all[- ]?time|season|seasons|year|years)\b",
+        " ",
+        q,
     )
-    for match in possessive_pattern.finditer(q):
-        candidate = _normalize_player_candidate(match.group(1))
-        if candidate:
-            names.append(candidate)
+    cleaned_q = re.sub(r"\s+", " ", cleaned_q).strip()
 
+    # Pair patterns: "compare X and Y", "between X and Y", "X vs Y", "X better than Y"
     pair_patterns = [
-        re.compile(r"(?i)\bcompare\s+(.+?)\s+(?:and|vs|versus)\s+(.+?)(?:\bfrom\b|\bin\b|\bduring\b|$)"),
-        re.compile(r"(?i)\bbetween\s+(.+?)\s+and\s+(.+?)(?:\bfrom\b|\bin\b|\bduring\b|$)"),
-        re.compile(r"(?i)\b(.+?)\s+\bthan\b\s+(.+?)(?:\bfrom\b|\bin\b|\bduring\b|$)"),
+        re.compile(r"(?i)\bcompare\s+(.+?)\s+(?:and|vs|versus)\s+(.+?)(?:\bfrom\b|\bin\b|\bduring\b|\bover\b|$)"),
+        re.compile(r"(?i)\bbetween\s+(.+?)\s+and\s+(.+?)(?:\bfrom\b|\bin\b|\bduring\b|\bover\b|$)"),
+        re.compile(r"(?i)\b([A-Z][\w\.\-]+(?:\s+[A-Z][\w\.\-]+){0,2})\s+(?:vs|versus)\s+([A-Z][\w\.\-]+(?:\s+[A-Z][\w\.\-]+){0,2})"),
+        re.compile(r"(?i)\b([A-Z][\w\.\-]+(?:\s+[A-Z][\w\.\-]+){0,2})\s+\bthan\b\s+([A-Z][\w\.\-]+(?:\s+[A-Z][\w\.\-]+){0,2})"),
     ]
     for pattern in pair_patterns:
-        match = pattern.search(q)
+        match = pattern.search(cleaned_q)
         if not match:
             continue
         for idx in (1, 2):
@@ -478,8 +539,18 @@ def _extract_player_names_from_question(question_text: str) -> list[str]:
             if candidate:
                 names.append(candidate)
 
+    # Possessives: "LeBron's", "Curry's"
+    possessive_pattern = re.compile(
+        r"(?i)\b([A-Z][a-zA-Z\.\-]*(?:\s+[A-Z][a-zA-Z\.\-]*){0,2})(?:['’]s)\b"
+    )
+    for match in possessive_pattern.finditer(cleaned_q):
+        candidate = _normalize_player_candidate(match.group(1))
+        if candidate:
+            names.append(candidate)
+
+    # Capitalized 2-3 token sequences — fallback when no pair pattern hit.
     capitalized_pattern = re.compile(r"\b([A-Z][a-zA-Z\.\-]+(?:\s+[A-Z][a-zA-Z\.\-]+){1,2})\b")
-    for match in capitalized_pattern.finditer(q):
+    for match in capitalized_pattern.finditer(cleaned_q):
         candidate = _normalize_player_candidate(match.group(1))
         if candidate:
             names.append(candidate)
@@ -487,15 +558,54 @@ def _extract_player_names_from_question(question_text: str) -> list[str]:
     if not names and re.search(r"(?i)\b(player|players)\b", lower_q):
         return []
 
-    deduped: list[str] = []
-    seen = set()
-    for name in names:
-        key = name.lower()
-        if key in seen:
+    # Dedupe + drop substring duplicates: if "LeBron James" and "James" both
+    # show up, keep only the longer canonical form.
+    by_length = sorted(set(names), key=len, reverse=True)
+    kept = []
+    for name in by_length:
+        nlow = name.lower()
+        if any(nlow in existing.lower() and nlow != existing.lower() for existing in kept):
             continue
-        seen.add(key)
-        deduped.append(name)
-    return deduped
+        kept.append(name)
+
+    # Restore original first-appearance order
+    ordered: list[str] = []
+    seen_lower: set[str] = set()
+    for n in names:
+        if n in kept and n.lower() not in seen_lower:
+            ordered.append(n)
+            seen_lower.add(n.lower())
+    return ordered
+
+
+def _filter_valid_player_names(conn, candidates: list[str]) -> list[str]:
+    if not candidates or conn is None:
+        return list(candidates or [])
+    cursor = conn.cursor()
+    valid: list[str] = []
+    # One query per candidate, but using existence on both tables in a single round trip.
+    for name in candidates:
+        like = f"%{name.replace('%', '').replace('_', '')}%"
+        try:
+            cursor.execute(
+                """
+                SELECT 1 WHERE EXISTS (
+                    SELECT 1 FROM public.all_players_regular_2024_2025
+                    WHERE player_name ILIKE %s
+                    UNION ALL
+                    SELECT 1 FROM public.all_players_regular_1996_1997
+                    WHERE player_name ILIKE %s
+                ) LIMIT 1;
+                """,
+                (like, like),
+            )
+            if cursor.fetchone():
+                valid.append(name)
+            else:
+                logger.debug("Dropped unverified player candidate: %r", name)
+        except Exception:
+            valid.append(name)
+    return valid
 
 
 def _extract_player_names_from_sql(sql_query: str) -> list[str]:
@@ -522,11 +632,29 @@ def _extract_player_names_from_sql(sql_query: str) -> list[str]:
     return deduped
 
 
-def _extract_named_players(user_input: str, sql_query: str) -> list[str]:
+def _extract_named_players(user_input: str, sql_query: str, conn=None) -> list[str]:
     question_text = _extract_current_question_text(user_input)
     names = _extract_player_names_from_question(question_text)
-    if not names:
-        names = _extract_player_names_from_sql(sql_query)
+
+    # If the question alone yielded fewer than 2 names, supplement with names
+    # parsed out of the model's emitted ILIKE filters. Comparison questions in
+    # particular often have one name fully spelled (e.g. "LeBron James") and
+    # another given as a bare surname ("Jordan") that we won't alias-map.
+    sql_names = _extract_player_names_from_sql(sql_query) if sql_query else []
+    if len(names) < 2 and sql_names:
+        existing_lower = {n.lower() for n in names}
+        for s in sql_names:
+            slow = s.lower()
+            if slow in existing_lower:
+                continue
+            # Don't pull obvious junk (single tokens with no full-name shape)
+            if " " not in s.strip():
+                continue
+            names.append(s)
+            existing_lower.add(slow)
+
+    if conn is not None and names:
+        names = _filter_valid_player_names(conn, names)
     return names
 
 
@@ -835,11 +963,13 @@ def _rewrite_implicit_head_to_head_to_career_sql(sql_query: str, user_input: str
     raw = sql_query or ""
     q_low = raw.lower().strip()
 
-    named = _extract_named_players(user_input, raw)
+    named = _extract_named_players(user_input, raw, conn=conn)
     if len(named) < 2:
+        logger.debug("rewriter:implicit_h2h skipped (only %d named player(s))", len(named))
         return sql_query
 
     if "union all" in q_low and raw.lower().count("all_players_regular_") > 1:
+        logger.debug("rewriter:implicit_h2h skipped (model already emitted multi-table UNION)")
         return sql_query
 
     plays = ("playoff" in _extract_current_question_text(user_input).lower()) or (
@@ -910,16 +1040,29 @@ def _rewrite_career_aggregate_to_by_season(sql_query: str, user_input: str, conn
     if has_union_sum_rollup and not wants_total:
         asks_over_time = True
 
-    named_players = _extract_named_players(user_input, q)
+    named_players = _extract_named_players(user_input, q, conn=conn)
     requested_span = _extract_requested_season_start_span(user_input)
     asks_full_row_player_slice = bool(named_players) and (
         requested_span is not None or nth_request is not None or rookie_year_request
     )
     if not asks_over_time and not asks_full_row_player_slice:
+        logger.debug(
+            "rewriter:career_aggregate skipped (no over-time/profile signal) "
+            "named_players=%s mentions_career=%s",
+            named_players, mentions_career,
+        )
         return sql_query
 
     if "all_players_regular_" not in q_lower and "all_players_playoffs_" not in q_lower:
+        logger.debug("rewriter:career_aggregate skipped (no season-summary table in SQL)")
         return q
+
+    logger.debug(
+        "rewriter:career_aggregate applying — named_players=%s "
+        "mentions_career=%s wants_total=%s nth=%s rookie=%s span=%s",
+        named_players, mentions_career, wants_total, nth_request,
+        rookie_year_request, requested_span,
+    )
 
     table_type = "playoffs" if (("playoff" in q_input) or ("postseason" in q_input) or ("all_players_playoffs_" in q_lower)) else "regular"
 
@@ -934,7 +1077,16 @@ def _rewrite_career_aggregate_to_by_season(sql_query: str, user_input: str, conn
         except Exception:
             continue
     if named_players:
-        full_cols = _all_players_full_row_columns()
+        is_comparison_or_trend = (
+            len(named_players) > 1
+            or mentions_career
+            or asks_over_time
+        )
+        full_cols = (
+            _career_by_season_columns()
+            if is_comparison_or_trend
+            else _all_players_full_row_columns()
+        )
         col_sql = ", ".join(full_cols)
         available_starts = _available_season_starts(conn, table_type) if conn is not None else []
         legs = []
@@ -972,6 +1124,35 @@ def _rewrite_career_aggregate_to_by_season(sql_query: str, user_input: str, conn
                     for season_start in range(start_year, end_year + 1)
                     if not available_starts or season_start in available_starts
                 ]
+            elif mentions_career and available_starts:
+                # PURE CAREER REQUEST: no nth, no rookie, no explicit span.
+                # Use EVERY available season for this player. The model's
+                # emitted SQL is ignored here because it's commonly a copy
+                # of a truncated prompt example (e.g. only 4 of 28 seasons).
+                # _first_season_start_for_where finds the player's first
+                # actual appearance so we don't emit dozens of empty legs
+                # for years the player wasn't in the league.
+                first_start = (
+                    _first_season_start_for_where(
+                        conn, table_type, player_where, available_starts
+                    )
+                    if conn is not None
+                    else None
+                )
+                if first_start is not None:
+                    season_starts = [s for s in available_starts if s >= first_start]
+                    logger.debug(
+                        "rewriter:career_aggregate pure-career expansion for %r — "
+                        "%d seasons starting at %d",
+                        player_name, len(season_starts), first_start,
+                    )
+                else:
+                    season_starts = list(available_starts)
+                    logger.debug(
+                        "rewriter:career_aggregate pure-career expansion for %r — "
+                        "%d seasons (no first-start probe)",
+                        player_name, len(season_starts),
+                    )
             elif unique_tables:
                 season_starts = sorted({start for start, _ in unique_tables.values()})
 
@@ -985,6 +1166,10 @@ def _rewrite_career_aggregate_to_by_season(sql_query: str, user_input: str, conn
                 )
 
         if legs:
+            logger.info(
+                "rewriter:career_aggregate emitted %d UNION legs across %d player(s)",
+                len(legs), len(named_players),
+            )
             return (
                 "SELECT DISTINCT season_start, season_label, "
                 f"{col_sql} FROM ({' UNION ALL '.join(legs)}) AS by_season LIMIT 500;"
@@ -1304,7 +1489,7 @@ Do NOT include any additional text or markdown.
 """
 
     response = client.chat.completions.create(
-        model="gpt-4o-mini",
+        model="gpt-4.1-mini",
         messages=[
             {"role": "system", "content": "Return ONLY valid SQL."},
             {"role": "user", "content": r_prompt}
@@ -1420,12 +1605,12 @@ TYPE B — GAME LOGS TABLE:
 
 TYPE C — EXTENDED NBA DATA FAMILIES (from current_working_data schema):
   These tables exist and should be used when user intent clearly matches them:
-  - `nba__advanced__...`  (advanced metrics / impact context)
-  - `nba__clutch__...`    (late-game / clutch situations)
-  - `nba__hustle__...`    (hustle events: deflections, contested stats, etc.)
-  - `nba__lineups__...`   (lineup combinations and lineup performance)
-  - `nba__schedule__...`  (game schedules)
-  - `nba__standings__...` (team standings / rank / records)
+  - `nba_advanced_...`  (advanced metrics / impact context)
+  - `nba_clutch_...`    (late-game / clutch situations)
+  - `nba_hustle_...`    (hustle events: deflections, contested stats, etc.)
+  - `nba_lineups_...`   (lineup combinations and lineup performance)
+  - `nba_schedule_...`  (game schedules)
+  - `nba_standings_...` (team standings / rank / records)
 
   IMPORTANT:
   - These tables are highly structured by name (season, season_type, per_mode, endpoint naming).
@@ -1439,12 +1624,12 @@ SECTION 2: TABLE SELECTION RULES — FOLLOW IN ORDER, FIRST MATCH WINS
 
 RULE 0 — INTENT ROUTING FOR EXTENDED TABLE FAMILIES:
   If question clearly targets one of these domains, use that family first:
-  - "clutch", "in close games", "last 5 minutes"        → `nba__clutch__...`
-  - "hustle", "deflections", "box outs", "contested"    → `nba__hustle__...`
-  - "lineup", "5-man unit", "best lineup", "on/off 5"   → `nba__lineups__...`
-  - "schedule", "next games", "calendar"                → `nba__schedule__...`
-  - "standings", "seed", "conference rank", "record"    → `nba__standings__...`
-  - "advanced metrics", "advanced stats profile"         → `nba__advanced__...`
+  - "clutch", "in close games", "last 5 minutes"        → `nba_clutch_...`
+  - "hustle", "deflections", "box outs", "contested"    → `nba_hustle_...`
+  - "lineup", "5-man unit", "best lineup", "on/off 5"   → `nba_lineups_...`
+  - "schedule", "next games", "calendar"                → `nba_schedule_...`
+  - "standings", "seed", "conference rank", "record"    → `nba_standings_...`
+  - "advanced metrics", "advanced stats profile"         → `nba_advanced_...`
   Use all_players_regular_*/playoffs_* only when the question is season-summary player stats.
   Use player_game_logs only when question is game-by-game recency/log context.
 
@@ -1890,16 +2075,31 @@ WHERE player_name ILIKE '%Giannis%'
 ORDER BY game_date DESC LIMIT 10;
 
 Q: "Compare LeBron and Jordan career stats"
-→ RULE 7. Different eras. UNION ALL per player.
+→ RULE 7. Different eras. UNION ALL per player. CRITICAL: The shape below is
+   shown ABBREVIATED for readability. You MUST emit ONE leg PER AVAILABLE
+   SEASON listed in DATABASE SCHEMA above for each player's actual era.
+   Do NOT copy these legs verbatim — the post-processor cannot add legs you
+   did not emit. For Jordan, include every available all_players_regular_*
+   table from 1996_1997 through 2002_2003. For LeBron, include every
+   available all_players_regular_* table from 2003_2004 through 2024_2025
+   (every season in between, no gaps).
 SELECT player_name,
   SUM(pts) AS total_pts, SUM(reb) AS total_reb, SUM(ast) AS total_ast,
   (CAST(SUM(fgm)  AS DOUBLE PRECISION) / NULLIF(SUM(fga),  0)) AS fg_pct
 FROM (
+  -- Michael Jordan: ONE leg per available season in his era (1996-97 through 2002-03)
   SELECT player_name, pts, reb, ast, fgm, fga FROM all_players_regular_1996_1997 WHERE player_name ILIKE '%Michael Jordan%'
   UNION ALL
   SELECT player_name, pts, reb, ast, fgm, fga FROM all_players_regular_1997_1998 WHERE player_name ILIKE '%Michael Jordan%'
   UNION ALL
+  -- ... include 2001_2002 and 2002_2003 as well ...
+  UNION ALL
+  -- LeBron James: ONE leg per available season (2003-04 through 2024-25, every season)
   SELECT player_name, pts, reb, ast, fgm, fga FROM all_players_regular_2003_2004 WHERE player_name ILIKE '%LeBron James%'
+  UNION ALL
+  SELECT player_name, pts, reb, ast, fgm, fga FROM all_players_regular_2004_2005 WHERE player_name ILIKE '%LeBron James%'
+  UNION ALL
+  -- ... continue for 2005_2006, 2006_2007, ..., 2023_2024 ...
   UNION ALL
   SELECT player_name, pts, reb, ast, fgm, fga FROM all_players_regular_2024_2025 WHERE player_name ILIKE '%LeBron James%'
 ) AS combined GROUP BY player_name LIMIT 50;
@@ -1944,7 +2144,7 @@ Generate the SQL:"""
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4.1-mini",
             messages=[
                 {"role": "system", "content": "You are a SQL query generator. Return ONLY valid SQL queries."},
                 {"role": "user", "content": prompt}

@@ -78,7 +78,7 @@ def get_uid_from_authorization(authorization: Optional[str]) -> str:
 
 
 def _build_contextual_question(
-    current_question: str, history_messages: List[Dict[str, Any]], max_messages: int = 4
+    current_question: str, history_messages: List[Dict[str, Any]], max_messages: int = 8
 ) -> str:
     """
     Build a compact context wrapper so follow-up questions can resolve references
@@ -97,8 +97,8 @@ def _build_contextual_question(
         if not content:
             continue
         content = content.replace("\n", " ").strip()
-        if len(content) > 150:
-            content = content[:150] + "..."
+        if len(content) > 300:
+            content = content[:300] + "..."
         speaker = "User" if role == "user" else "Assistant"
         context_lines.append(f"{speaker}: {content}")
 

@@ -501,12 +501,14 @@ def _extract_season_reference_text(question: str) -> Optional[str]:
     q = (question or "").lower()
     is_playoffs = "playoff" in q or "postseason" in q
 
-    range_match = re.search(r"\b(19\d{2}|20\d{2})\s*[-/]\s*(\d{2,4})\b", q)
+    range_match = re.search(r"\b(19\d{2}|20\d{2})\s*[-/_]\s*(\d{2,4})\b", q)
     if range_match:
         start = int(range_match.group(1))
         end_raw = range_match.group(2)
         if len(end_raw) == 2:
             end = int(f"{str(start)[:2]}{end_raw}")
+            if end < start:
+                end += 100
         else:
             end = int(end_raw)
         if is_playoffs:
@@ -520,6 +522,8 @@ def _extract_season_reference_text(question: str) -> Optional[str]:
             start = year - 1
             end = year
             return f"{start}-{str(end)[-2:]} playoffs"
+        # Bare regular-season year references are treated as season START year.
+        # Example: "2020 season" -> 2020-21.
         start = year
         end = year + 1
         return f"{start}-{str(end)[-2:]} season"
@@ -1407,6 +1411,11 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
         except Exception:
             return "N/A"
 
+    def _display_name(name: str, team: str) -> str:
+        if team == "N/A":
+            return name
+        return f"{name} ({team})"
+
     def _first_present(candidates: List[str], available_cols: set[str]) -> Optional[str]:
         for col in candidates:
             if col in available_cols:
@@ -1430,7 +1439,7 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
             "table_header": "| # | Player | REB | OREB | DREB | Games |",
             "table_divider": "|---|---|---:|---:|---:|---:|",
             "row_builder": lambda idx, row, name, team: (
-                f"| {idx} | **{name}** ({team}) | {_fmt_num(row.get('reb'))} reb | "
+                f"| {idx} | **{_display_name(name, team)}** | {_fmt_num(row.get('reb'))} reb | "
                 f"{_fmt_num(row.get('oreb'))} oreb | {_fmt_num(row.get('dreb'))} dreb | {_fmt_games(row.get('gp'))} |"
             ),
         },
@@ -1443,7 +1452,7 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
             "table_header": "| # | Player | AST | TOV | Games |",
             "table_divider": "|---|---|---:|---:|---:|",
             "row_builder": lambda idx, row, name, team: (
-                f"| {idx} | **{name}** ({team}) | {_fmt_num(row.get('ast'))} ast | "
+                f"| {idx} | **{_display_name(name, team)}** | {_fmt_num(row.get('ast'))} ast | "
                 f"{_fmt_num(row.get('tov'))} tov | {_fmt_games(row.get('gp'))} |"
             ),
         },
@@ -1456,7 +1465,7 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
             "table_header": "| # | Player | STL | BLK | Games |",
             "table_divider": "|---|---|---:|---:|---:|",
             "row_builder": lambda idx, row, name, team: (
-                f"| {idx} | **{name}** ({team}) | {_fmt_num(row.get('stl'))} stl | "
+                f"| {idx} | **{_display_name(name, team)}** | {_fmt_num(row.get('stl'))} stl | "
                 f"{_fmt_num(row.get('blk'))} blk | {_fmt_games(row.get('gp'))} |"
             ),
         },
@@ -1469,7 +1478,7 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
             "table_header": "| # | Player | BLK | STL | Games |",
             "table_divider": "|---|---|---:|---:|---:|",
             "row_builder": lambda idx, row, name, team: (
-                f"| {idx} | **{name}** ({team}) | {_fmt_num(row.get('blk'))} blk | "
+                f"| {idx} | **{_display_name(name, team)}** | {_fmt_num(row.get('blk'))} blk | "
                 f"{_fmt_num(row.get('stl'))} stl | {_fmt_games(row.get('gp'))} |"
             ),
         },
@@ -1482,7 +1491,7 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
             "table_header": "| # | Player | 3PM | 3PA | 3P | Games |",
             "table_divider": "|---|---|---:|---:|---:|---:|",
             "row_builder": lambda idx, row, name, team: (
-                f"| {idx} | **{name}** ({team}) | {_fmt_num(row.get('fg3m'))} 3pm | "
+                f"| {idx} | **{_display_name(name, team)}** | {_fmt_num(row.get('fg3m'))} 3pm | "
                 f"{_fmt_num(row.get('fg3a'))} 3pa | {_fmt_pct(row.get('fg3_pct'))} 3p | {_fmt_games(row.get('gp'))} |"
             ),
         },
@@ -1503,7 +1512,7 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
             "table_header": "| # | Player | PPG | FG | 3P | Games |",
             "table_divider": "|---|---|---:|---:|---:|---:|",
             "row_builder": lambda idx, row, name, team: (
-                f"| {idx} | **{name}** ({team}) | {_fmt_num(row.get('pts'))} ppg | "
+                f"| {idx} | **{_display_name(name, team)}** | {_fmt_num(row.get('pts'))} ppg | "
                 f"{_fmt_pct(row.get('fg_pct'))} fg | {_fmt_pct(row.get('fg3_pct'))} 3p | {_fmt_games(row.get('gp'))} |"
             ),
         }
@@ -1513,12 +1522,21 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
     if metric_col is None:
         metric_col = "pts" if "pts" in cols else ("reb" if "reb" in cols else "")
 
-    if rank_col in cols and metric_col in cols:
-        working = working.sort_values(by=[rank_col, metric_col], ascending=[True, False], na_position="last")
-    elif rank_col in cols:
-        working = working.sort_values(by=[rank_col], ascending=[True], na_position="last")
-    elif metric_col in cols:
-        working = working.sort_values(by=[metric_col], ascending=[False], na_position="last")
+    numeric_rank_col: Optional[str] = None
+    numeric_metric_col: Optional[str] = None
+    if rank_col in cols:
+        numeric_rank_col = "__rank_num__"
+        working[numeric_rank_col] = pd.to_numeric(working[rank_col], errors="coerce")
+    if metric_col in cols and metric_col:
+        numeric_metric_col = "__metric_num__"
+        working[numeric_metric_col] = pd.to_numeric(working[metric_col], errors="coerce")
+
+    if numeric_rank_col and numeric_metric_col:
+        working = working.sort_values(by=[numeric_rank_col, numeric_metric_col], ascending=[True, False], na_position="last")
+    elif numeric_rank_col:
+        working = working.sort_values(by=[numeric_rank_col], ascending=[True], na_position="last")
+    elif numeric_metric_col:
+        working = working.sort_values(by=[numeric_metric_col], ascending=[False], na_position="last")
 
     if "player_name" in cols:
         working = working.dropna(subset=["player_name"])

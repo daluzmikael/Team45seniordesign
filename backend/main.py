@@ -119,6 +119,49 @@ def _is_affirmative_followup(question: str) -> bool:
     return q in {"yes", "yeah", "yep", "yup", "sure", "ok", "okay", "do it", "go ahead"}
 
 
+def _has_explicit_season_reference(question: str) -> bool:
+    q = (question or "").lower()
+    return (
+        re.search(r"\b(19\d{2}|20\d{2})\b", q) is not None
+        or re.search(r"\b(19\d{2}|20\d{2})\s*[-/_]\s*(\d{2}|19\d{2}|20\d{2})\b", q) is not None
+        or "this season" in q
+        or "current season" in q
+        or "last season" in q
+        or "this playoff" in q
+        or "current playoff" in q
+        or "last playoff" in q
+        or "this postseason" in q
+        or "current postseason" in q
+        or "last postseason" in q
+    )
+
+
+def _should_force_previous_context(question: str) -> bool:
+    q = (question or "").strip().lower()
+    if not q or _has_explicit_season_reference(q):
+        return False
+
+    vague_markers = [
+        "compare",
+        "vs",
+        "versus",
+        "between",
+        "them",
+        "those two",
+        "both",
+        "who is better",
+        "which one",
+        "what about",
+        "how about",
+        "and ",
+    ]
+    if any(marker in q for marker in vague_markers):
+        return True
+
+    token_count = len(re.findall(r"\w+", q))
+    return token_count <= 6
+
+
 def _extract_latest_player_and_season_from_history(
     history_messages: List[Dict[str, Any]]
 ) -> tuple[Optional[str], Optional[str]]:
@@ -235,20 +278,24 @@ async def analysis_endpoint(
         history_messages: List[Dict[str, Any]] = _sanitize_history_messages(request.history)
 
         # Prefer history passed by the frontend (works for both guest and auth chats).
-        if history_messages and _should_apply_history_context(request.question):
+        # Always apply available history so sequential questions consistently keep context.
+        if history_messages:
             effective_question = _build_contextual_question(request.question, history_messages)
-            if _is_affirmative_followup(request.question):
-                player_name, season_label = _extract_latest_player_and_season_from_history(history_messages)
-                if player_name and season_label:
+            player_name, season_label = _extract_latest_player_and_season_from_history(history_messages)
+            if season_label and (_is_affirmative_followup(request.question) or _should_force_previous_context(request.question)):
+                effective_question += (
+                    "\n\nFollow-up constraint: preserve previously established context unless user explicitly changes it. "
+                    f"Use the same season context: {season_label}. "
+                    "(Do not change to a different season unless the user asks for one.)"
+                )
+                if player_name:
                     effective_question += (
-                        "\n\nFollow-up constraint: keep the SAME player and SAME season as the last answer. "
-                        f"Use player_name ILIKE '%{player_name}%' and season_label '{season_label}' context "
-                        "(do not advance to a different season)."
+                        f" Keep player context anchored to {player_name} when resolving pronouns/references."
                     )
             history_context_applied = True
             history_context_reason = "request_history_used"
         # Fallback for older clients: load persisted history for authenticated users.
-        elif request.conversationId and authorization and _should_apply_history_context(request.question):
+        elif request.conversationId and authorization:
             try:
                 uid = get_uid_from_authorization(authorization)
                 history_result = get_conversation_messages(uid, request.conversationId.strip())
@@ -258,13 +305,16 @@ async def analysis_endpoint(
                         effective_question = _build_contextual_question(
                             request.question, fetched_history
                         )
-                        if _is_affirmative_followup(request.question):
-                            player_name, season_label = _extract_latest_player_and_season_from_history(fetched_history)
-                            if player_name and season_label:
+                        player_name, season_label = _extract_latest_player_and_season_from_history(fetched_history)
+                        if season_label and (_is_affirmative_followup(request.question) or _should_force_previous_context(request.question)):
+                            effective_question += (
+                                "\n\nFollow-up constraint: preserve previously established context unless user explicitly changes it. "
+                                f"Use the same season context: {season_label}. "
+                                "(Do not change to a different season unless the user asks for one.)"
+                            )
+                            if player_name:
                                 effective_question += (
-                                    "\n\nFollow-up constraint: keep the SAME player and SAME season as the last answer. "
-                                    f"Use player_name ILIKE '%{player_name}%' and season_label '{season_label}' context "
-                                    "(do not advance to a different season)."
+                                    f" Keep player context anchored to {player_name} when resolving pronouns/references."
                                 )
                         history_context_applied = True
                         history_context_reason = "stored_history_used"
@@ -277,9 +327,9 @@ async def analysis_endpoint(
                 print(f"History context skipped: {history_error}")
                 history_context_reason = "history_lookup_exception"
         elif history_messages:
-            history_context_reason = "history_not_needed_for_standalone_question"
+            history_context_reason = "request_history_present_but_unused"
         elif request.conversationId and authorization:
-            history_context_reason = "stored_history_not_needed_for_standalone_question"
+            history_context_reason = "stored_history_unavailable"
         elif request.conversationId and not authorization:
             history_context_reason = "guest_without_request_history"
 
@@ -312,10 +362,10 @@ async def analysis_endpoint(
                 )
             else:
                 empty_message = (
-                    "No data was found for this query. This could mean:\n"
-                    "- The player did not participate in the most recent playoffs or season.\n"
-                    "- The player name may be misspelled or not recognized.\n"
-                    "- Try specifying a season year, e.g. 'Giannis 2023 playoff performance'."
+                    "No data matched this query.\n"
+                    "- The player name may be misspelled or formatted differently in the database.\n"
+                    "- The requested season/split may not exist in the currently available tables.\n"
+                    "- Try a specific season, e.g. 'Giannis 2020 season' or 'Giannis 2023 playoff performance'."
                 )
             payload = {
                 "success": True,

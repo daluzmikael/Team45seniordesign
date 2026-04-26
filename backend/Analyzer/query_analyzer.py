@@ -1005,6 +1005,12 @@ def _format_single_player_stats_profile(df: pd.DataFrame, question: str, client:
     def _v(row: pd.Series, key: str, default: str = "N/A") -> Any:
         return row.get(key, default)
 
+    def _v_any(row: pd.Series, keys: List[str], default: str = "N/A") -> Any:
+        for key in keys:
+            if key in row.index:
+                return row.get(key)
+        return default
+
     working = df.copy()
     if "player_name" in working.columns:
         working = working.dropna(subset=["player_name"])
@@ -1202,6 +1208,18 @@ def _format_single_player_stats_profile(df: pd.DataFrame, question: str, client:
             ("TOV", _fmt_num(_v(row, "tov"))),
             ("AST Rank", _fmt_int(_v(row, "ast_rank"))),
             ("TOV Rank", _fmt_int(_v(row, "tov_rank"))),
+        ],
+    )
+    _append_filtered_table(
+        lines,
+        "### Advanced",
+        [
+            ("TS%", _fmt_pct(_v_any(row, ["ts", "ts_pct", "ts%", "TS", "TS%"]))),
+            ("USG%", _fmt_num(_v_any(row, ["usg", "usg_pct", "usg%", "USG", "USG%"]))),
+            ("OFFRTG", _fmt_num(_v_any(row, ["offrtg", "off_rtg", "off_rating", "OFFRTG"]))),
+            ("DEFRTG", _fmt_num(_v_any(row, ["defrtg", "def_rtg", "def_rating", "DEFRTG"]))),
+            ("NETRTG", _fmt_num(_v_any(row, ["netrtg", "net_rtg", "net_rating", "NETRTG"]))),
+            ("PIE", _fmt_num(_v_any(row, ["pie", "PIE"]))),
         ],
     )
     _append_filtered_table(

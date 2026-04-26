@@ -289,8 +289,17 @@ def _minmax(series: pd.Series) -> np.ndarray:
 
 
 def compute_scores(df: pd.DataFrame, cfg: ScoreConfig) -> pd.DataFrame:
+    entity_col = "player_name"
     if "player_name" not in df.columns:
-        raise ValueError("DataFrame must include 'player_name'.")
+        if "TEAM_NAME" in df.columns:
+            entity_col = "TEAM_NAME"
+        elif "TeamName" in df.columns:
+            entity_col = "TeamName"
+        elif "team_abbreviation" in df.columns:
+            entity_col = "team_abbreviation"
+        else:
+            raise ValueError("DataFrame must include 'player_name' or a valid team column.")
+
     present = [c for c in cfg.weights if c in df.columns]
     if not present:
         raise ValueError("No required metric columns found for this domain.")
@@ -322,7 +331,7 @@ def compute_scores(df: pd.DataFrame, cfg: ScoreConfig) -> pd.DataFrame:
         contribs.sort(key=lambda x: x[1], reverse=True)
         rows.append(
             {
-                "player_name": df.iloc[i]["player_name"],
+                entity_col: df.iloc[i][entity_col],
                 "composite_score": float(score[i]),
                 "top_contributors": contribs[:3],
             }
@@ -333,6 +342,11 @@ def compute_scores(df: pd.DataFrame, cfg: ScoreConfig) -> pd.DataFrame:
 def infer_domain(user_q: str, cols: List[str]) -> str:
     uq = (user_q or "").lower()
     txt = " ".join(cols).lower()
+
+    if any(k in uq for k in ["team", "franchise", "standings", "winrate"]) or any(
+        k in txt for k in ["teamname", "team_name", "w_pct", "wins", "net_rating"]
+    ):
+        return "team_performance"
 
     if any(k in uq for k in ["rebound", "boards", "glass", "oreb", "dreb"]) or any(
         k in txt for k in ["trb_per_game", "trb_pct", "oreb_pct", "dreb_pct", "contested_reb"]
@@ -1326,7 +1340,16 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
         return "\nNo leaderboard data was available for this question."
 
     lead_row = top.iloc[0]
-    lead_name = str(lead_row.get("player_name", "N/A")) if not _is_missing(lead_row.get("player_name")) else "N/A"
+
+    def get_entity_name(row):
+        for col in ["player_name", "TEAM_NAME", "TeamName", "team_abbreviation"]:
+            if col in row and not pd.isna(row[col]):
+                return str(row[col])
+        return "N/A"
+
+    lead_row = top.iloc[0]
+    lead_name = get_entity_name(lead_row) # This now works perfectly
+    
     lead_metric = _fmt_num(lead_row.get(metric_col))
     season_text = _extract_season_reference_text(question)
     if season_text:
@@ -1339,8 +1362,14 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
     lines = [lead_line, "", selected["table_header"], selected["table_divider"]]
 
     for idx, (_, row) in enumerate(top.iterrows(), start=1):
-        name = str(row.get("player_name", "N/A")) if not _is_missing(row.get("player_name")) else "N/A"
+        # FIXED: Call your function here for every row
+        name = get_entity_name(row) 
         team = str(row.get("team_abbreviation", "N/A")) if not _is_missing(row.get("team_abbreviation")) else "N/A"
+        
+        # Optional safeguard: prevents printing "GSW (GSW)" if the name is already the team abbreviation
+        if name == team:
+            team = "Team"
+            
         lines.append(selected["row_builder"](idx, row, name, team))
 
     lines.append("")

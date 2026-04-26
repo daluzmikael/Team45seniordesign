@@ -328,7 +328,7 @@ def _rewrite_nth_season_comparison_sql(sql_query: str, user_input: str, conn) ->
 def _enforce_start_year_table_mapping(sql_query: str, user_input: str) -> str:
     if not sql_query:
         return sql_query
-    if " union " in sql_query.lower():
+    if "union" in sql_query.lower():
         return sql_query
 
     req = _extract_bare_year_request(user_input)
@@ -583,12 +583,33 @@ def _filter_valid_player_names(conn, candidates: list[str]) -> list[str]:
         return list(candidates or [])
     cursor = conn.cursor()
     valid: list[str] = []
-    # One query per candidate, but using existence on both tables in a single round trip.
+    
     for name in candidates:
-        like = f"%{name.replace('%', '').replace('_', '')}%"
-        try:
-            cursor.execute(
-                """
+        raw_name = name.replace('%', '').replace('_', '')
+        parts = [p for p in raw_name.split() if p]
+        
+        if len(parts) >= 2:
+            first = parts[0]
+            # Safely grab the first 3 letters of the last name to bypass any accents/special characters
+            # (e.g., "Doncic" or "Dončić" -> "Don", "Jokic" -> "Jok")
+            last_prefix = parts[-1][:3]
+            
+            query = """
+                SELECT 1 WHERE EXISTS (
+                    SELECT 1 FROM public.all_players_regular_2024_2025
+                    WHERE player_name ILIKE %s OR (player_name ILIKE %s AND player_name ILIKE %s)
+                    UNION ALL
+                    SELECT 1 FROM public.all_players_regular_1996_1997
+                    WHERE player_name ILIKE %s OR (player_name ILIKE %s AND player_name ILIKE %s)
+                ) LIMIT 1;
+            """
+            params = (
+                f"%{raw_name}%", f"%{first}%", f"%{last_prefix}%",
+                f"%{raw_name}%", f"%{first}%", f"%{last_prefix}%"
+            )
+        else:
+            like = f"%{raw_name}%"
+            query = """
                 SELECT 1 WHERE EXISTS (
                     SELECT 1 FROM public.all_players_regular_2024_2025
                     WHERE player_name ILIKE %s
@@ -596,15 +617,18 @@ def _filter_valid_player_names(conn, candidates: list[str]) -> list[str]:
                     SELECT 1 FROM public.all_players_regular_1996_1997
                     WHERE player_name ILIKE %s
                 ) LIMIT 1;
-                """,
-                (like, like),
-            )
+            """
+            params = (like, like)
+
+        try:
+            cursor.execute(query, params)
             if cursor.fetchone():
                 valid.append(name)
             else:
                 logger.debug("Dropped unverified player candidate: %r", name)
         except Exception:
-            valid.append(name)
+            valid.append(name) # Fallback to keeping it if query fails
+            logger.exception("Error occurred while filtering player name: %r", name)
     return valid
 
 
@@ -1265,6 +1289,11 @@ def _ensure_all_players_broad_columns(sql_query: str, user_input: str) -> str:
     # Restrict to simple single-season season-summary selects.
     if "all_players_regular_" not in q_lower and "all_players_playoffs_" not in q_lower:
         return q
+    
+    # Bail out if this is a team-grouped query, even if it hits player tables.
+    if "distinct team" in q_lower or "group by team" in q_lower or "team_name" in q_lower:
+        return q
+    
     # Never inject base-table columns into derived/subquery shapes like by_season.
     if " as by_season" in q_lower or re.search(r"(?is)\bfrom\s*\(", q):
         return q
@@ -1799,6 +1828,57 @@ RULE 11 — SINGLE PLAYER GENERAL STATS PROFILE (season summary):
      dreb, oreb, dd2, td3, dd2_rank, td3_rank
   → Use DISTINCT if needed to avoid duplicate player rows
 
+RULE 12 — TEAM AND FRANCHISE QUERIES (CRITICAL):
+  Trigger phrases: "top teams", "best NBA teams", "team winrate", "team standings"
+  If the question is asking to rank, compare, or evaluate TEAMS (not players):
+  → ALWAYS use `team_advanced_season_YYYY_YY_regular_season_pergame` or `nba_standings_season_YYYY_YY_leaguestandingsv3`
+  → NEVER use `all_players_regular` or `player_game_logs`.
+  → For team advanced tables, the columns are UPPERCASE: TEAM_ID, TEAM_NAME, GP, W, L, W_PCT, OFF_RATING, DEF_RATING, NET_RATING
+  → For standings tables, the columns are CamelCase: TeamName, WINS, LOSSES, PlayoffRank, ConferenceRecord
+  Example question: "Statistically, what were the top 3 NBA teams by winrate in 2014"
+  Correct table: team_advanced_season_2014_15_regular_season_pergame
+  Correct SQL: SELECT TEAM_NAME, W_PCT FROM team_advanced_season_2014_15_regular_season_pergame ORDER BY W_PCT DESC LIMIT 3;
+
+RULE 13 — SPECIALTY STATS & TRACKING (STRICT 63-CHAR TABLE NAMES):
+  CRITICAL: PostgreSQL forcefully truncated these table names at exactly 63 characters. You are currently hallucinating longer table names. 
+  DO NOT write "regular_se", "regular_season", or "per_mode_per" for the tracking tables. You MUST copy these exact strings character-for-character:
+  
+  → "deflections", "contested shots", "charges":
+      Regular Season: `nba_hustle_season_YYYY_YY_season_type_regular_season_per_mo`
+      Playoffs: `nba_hustle_season_YYYY_YY_season_type_playoffs_per_mode_per`
+      
+  → "clutch", "last 5 minutes":
+      Regular Season: `nba_clutch_season_YYYY_YY_season_type_regular_season_per_mo`
+      Playoffs: `nba_clutch_season_YYYY_YY_season_type_playoffs_per_mode_per`
+      
+  → "drives":
+      Regular Season: `nba_player_tracking_pt_drives_season_YYYY_YY_season_type_re`
+      Playoffs: `nba_player_tracking_pt_drives_season_YYYY_YY_season_type_pl`
+      
+  → "passing":
+      Regular Season: `nba_player_tracking_pt_passing_season_YYYY_YY_season_type_r`
+      Playoffs: `nba_player_tracking_pt_passing_season_YYYY_YY_season_type_p`
+      
+  → "catch and shoot": `nba_player_tracking_pt_catchshoot_season_YYYY_YY_season_typ`
+  → "post-ups": `nba_player_tracking_pt_posttouch_season_YYYY_YY_season_type`
+  → "paint touches": `nba_player_tracking_pt_painttouch_season_YYYY_YY_season_typ`
+  → "pull up": `nba_player_tracking_pt_pullupshot_season_YYYY_YY_season_typ`
+
+RULE 14 — ADVANCED METRICS AND UPPERCASE COLUMNS (CRITICAL):
+  This database uses official NBA metrics. It does NOT contain "PER" or "Win Shares".
+  For "PER", "Win Shares", or "overall impact", use `"PIE"` (Player Impact Estimate) or `"NET_RATING"` from the advanced tables.
+  Advanced table patterns: `nba_advanced_season_YYYY_YY_season_type_regular_season_per` OR `nba_advanced_season_YYYY_YY_season_type_playoffs_per_mode_p`
+  
+  UPPERCASE COLUMN REQUIREMENT: 
+  For ALL tables in Rules 12, 13, and 14 (Advanced, Hustle, Clutch, Tracking, Teams), the columns are stored in uppercase. You MUST wrap EVERY column name in double quotes to prevent PostgreSQL from lowercasing them.
+  DO THIS: SELECT "PLAYER_NAME", "TEAM_ABBREVIATION", "DRIVES", "OFF_RATING"
+  NEVER DO THIS: SELECT PLAYER_NAME, TEAM_ABBREVIATION
+
+  When using `player_game_logs` for "last 10 games" or recency:
+  → DO NOT filter by `season_id` unless absolutely required. Just use `ORDER BY game_date DESC LIMIT X`.
+  → DO NOT calculate percentages (e.g. `fgm / fga`) or use `CAST()`. Just SELECT raw columns `fgm` and `fga` directly.
+  → The system actively blocks math in SELECT. Keep it raw data.
+
 ════════════════════════════════════════════════════════════════════════
 SECTION 3: MANDATORY QUERY CONSTRUCTION RULES
 ════════════════════════════════════════════════════════════════════════
@@ -1887,15 +1967,17 @@ STANDARD GAME LOG SELECT BLOCK:
     fg3a,
     ftm,
     fta,
-    min,
-    (CAST(fgm  AS DOUBLE PRECISION) / NULLIF(fga,  0)) AS fg_pct,
-    (CAST(fg3m AS DOUBLE PRECISION) / NULLIF(fg3a, 0)) AS fg3_pct,
-    (CAST(ftm  AS DOUBLE PRECISION) / NULLIF(fta,  0)) AS ft_pct
+    min
+  DO NOT INCLUDE MATH OR PERCENTAGE CALCULATIONS.
 
 DIVISION SAFETY:
   - ALWAYS wrap division denominators with NULLIF(..., 0)
   - ALWAYS cast numerator to DOUBLE PRECISION before dividing
   - NEVER do raw division like fgm / fga — always use the safe pattern above
+
+DATE FILTERING:
+  - NEVER use EXTRACT() or DATE_TRUNC().
+  - If a user asks for a specific month (e.g., "March 2024"), filter dates using standard string comparisons: WHERE game_date >= '2024-03-01' AND game_date <= '2024-03-31'
 
 GENERAL:
   - Do NOT add a generic LIMIT (e.g. LIMIT 50) unless the user asks for top-N, last-X games, or a bounded sample.

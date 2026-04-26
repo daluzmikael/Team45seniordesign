@@ -1314,39 +1314,25 @@ def _ensure_all_players_broad_columns(sql_query: str, user_input: str) -> str:
 
 
 def _expand_player_name_filters_for_encoding(sql_query: str) -> str:
-    """
-    Expand exact full-name ILIKE filters with a robust fallback:
-      player_name ILIKE '%First Last%'
-    becomes:
-      (player_name ILIKE '%First Last%' OR
-       (player_name ILIKE '%First%' AND player_name ILIKE '%LastPrefix%'))
-
-    This helps match mojibake/diacritics corruption in DB values
-    (e.g., Jokić stored as JokiÄ) without modifying database data.
-    """
     if not sql_query:
         return sql_query
 
-    pattern = re.compile(r"(?i)player_name\s+ILIKE\s+'%([^%']+)%'")
+    # Capture the column name (with or without quotes) in group 1
+    pattern = re.compile(r"(?i)(\"?player_name\"?)\s+ILIKE\s+'%([^%']+)%'")
 
     def repl(match: re.Match) -> str:
-        raw_name = match.group(1).strip()
+        col_name = match.group(1) # Keeps "PLAYER_NAME" or player_name intact
+        raw_name = match.group(2).strip()
         parts = [p for p in raw_name.split() if p]
         if len(parts) < 2:
             return match.group(0)
 
         first = parts[0]
-        last = parts[-1]
-
-        # Keep only letters for prefix logic, but preserve original full-name match too.
-        last_clean = re.sub(r"[^A-Za-z]", "", last)
-        if len(last_clean) < 3:
-            return match.group(0)
-
-        last_prefix = last_clean[:4]
-        full_clause = f"player_name ILIKE '%{raw_name}%'"
+        last_prefix = parts[-1][:3] # Safe 3-letter prefix for accents (Doncic, Jokic)
+        
+        full_clause = f"{col_name} ILIKE '%{raw_name}%'"
         fallback_clause = (
-            f"(player_name ILIKE '%{first}%' AND player_name ILIKE '%{last_prefix}%')"
+            f"({col_name} ILIKE '%{first}%' AND {col_name} ILIKE '%{last_prefix}%')"
         )
         return f"({full_clause} OR {fallback_clause})"
 
@@ -1652,232 +1638,138 @@ SECTION 2: TABLE SELECTION RULES — FOLLOW IN ORDER, FIRST MATCH WINS
 ════════════════════════════════════════════════════════════════════════
 
 RULE 0 — INTENT ROUTING FOR EXTENDED TABLE FAMILIES:
-  If question clearly targets one of these domains, use that family first:
+  If a question clearly targets one of these domains, use that family first:
   - "clutch", "in close games", "last 5 minutes"        → `nba_clutch_...`
-  - "hustle", "deflections", "box outs", "contested"    → `nba_hustle_...`
-  - "lineup", "5-man unit", "best lineup", "on/off 5"   → `nba_lineups_...`
-  - "schedule", "next games", "calendar"                → `nba_schedule_...`
-  - "standings", "seed", "conference rank", "record"    → `nba_standings_...`
-  - "advanced metrics", "advanced stats profile"         → `nba_advanced_...`
-  Use all_players_regular_*/playoffs_* only when the question is season-summary player stats.
-  Use player_game_logs only when question is game-by-game recency/log context.
+  - "hustle", "deflections", "box outs", "charges"      → `nba_hustle_...`
+  - "tracking", "drives", "touches", "distance", "speed"→ `nba_player_tracking_...`
+  - "shot chart", "shot distance", "step back", "dunks" → `court_shots`
+  - "lineup", "5-man unit", "best lineup"               → `nba_lineups_...`
+  - "standings", "seed", "conference rank"              → `nba_standings_...`
+  - "advanced metrics", "true shooting", "net rating"   → `nba_advanced_...`
 
-RULE 1 — MOST RECENT PLAYOFF PERFORMANCE (most common case):
-  Trigger phrases: "playoff performance", "playoffs", "analyze playoffs", "postseason",
-                   "how did X do in the playoffs", "X playoff stats", "X in the playoffs"
-  With NO specific year or "all time" mentioned:
+RULE 1 — MOST RECENT PLAYOFF PERFORMANCE:
+  Trigger phrases: "playoff performance", "playoffs", "analyze playoffs", "postseason"
+  With NO specific year mentioned:
   → ALWAYS use: `all_players_playoffs_2024_2025`
   → ALWAYS use SUM() aggregation with GROUP BY player_name
-  → NEVER use player_game_logs for this
-  → NEVER guess an older year like 2018_2019 or 2023_2024
-  Example question: "Analyze Giannis playoff performance"
-  Example question: "How did Jayson Tatum do in the playoffs"
-  Example question: "Show me Steph Curry's playoff stats"
-  Correct table: all_players_playoffs_2024_2025
 
-RULE 2 — MOST RECENT REGULAR SEASON PERFORMANCE (season summary):
-  Trigger phrases: "season stats", "season averages", "how did X do this season",
-                   "season performance", "season totals", top scorers, leaderboards,
-                   rank-based questions, questions needing oreb/dreb/plus_minus/age/gp
+RULE 2 — MOST RECENT REGULAR SEASON PERFORMANCE:
+  Trigger phrases: "season stats", "season averages", "top scorers", "leaderboards"
   With NO specific year mentioned:
-  → Use: `all_players_regular_2024_2025`
-  → Use this table when rank columns (_rank) or columns like oreb, dreb, age, gp are needed
-  → NEVER use player_game_logs for leaderboards or rank-based questions
-  Example question: "Who are the top 10 scorers this season"
-  Example question: "Show me the league leaders in assists"
-  Correct table: all_players_regular_2024_2025
+  → ALWAYS use: `all_players_regular_2024_2025`
+  → Use this table when rank columns (_rank) or oreb, dreb, age, gp are needed.
 
-RULE 3 — CURRENT FORM / RECENT ACTIVITY (use player_game_logs):
-  Trigger phrases: "lately", "recently", "how is X playing", "current form",
-                   "this season so far", "how has X been", "is X hot", "is X cold",
-                   "last X games", "past X games", "recent games", "game log",
-                   "game by game", "hot streak", "cold streak", "this week",
-                   "last week", "last night", "tonight", "last month",
-                   "matchup history", "vs [team]", "against [team]"
-  → ALWAYS use player_game_logs — it has data through February 2026
+RULE 3 — CURRENT FORM / RECENT ACTIVITY:
+  Trigger phrases: "lately", "recently", "last X games", "hot streak", "game log"
+  → ALWAYS use `player_game_logs` — it has data through February 2026.
   → For 2025-26 season: WHERE season_id = '22025' AND season_type = 'Regular Season'
-  → For 2025 playoffs: WHERE season_id = '22025' AND season_type = 'Playoffs'
-  → ALWAYS ORDER BY game_date DESC when recency matters
-  → ALWAYS calculate percentages — never reference fg_pct, fg3_pct, ft_pct directly
-  → Use LIMIT to restrict to the number of games requested (e.g., last 10 → LIMIT 10)
-  Example question: "Show me LeBron's last 10 games"
-  Example question: "How has Steph been playing lately"
-  Example question: "Is Giannis on a hot streak"
-  Correct table: player_game_logs WHERE season_id = '22025'
+  → ALWAYS ORDER BY game_date DESC LIMIT X.
 
 RULE 4 — SPECIFIC YEAR OR SEASON REQUESTED:
-  If user mentions a specific year like "2019", "2022-23", "last year", "2018 playoffs":
-  → Map to the correct table using this logic:
-      START-YEAR RULE (regular season): a bare year means the season that STARTS that year.
-        "2020" or "2020 season"        → all_players_regular_2020_2021
-        "2016 season"                  → all_players_regular_2016_2017
-      PLAYOFF EXCEPTION: a playoff year refers to playoffs at the END of that season.
-        "2016 playoffs"                → all_players_playoffs_2015_2016
-        "2020 playoffs"                → all_players_playoffs_2019_2020
-      Explicit ranges still map directly by start and end:
-        "2018-19 playoffs"             → all_players_playoffs_2018_2019
-        "2022-23 season"               → all_players_regular_2022_2023
-      Relative references:
-        "last season" (current year is 2026)   → all_players_regular_2024_2025
-  → Table name format is ALWAYS: all_players_[regular|playoffs]_STARTYEAR_ENDYEAR
-  → The ENDYEAR is always STARTYEAR + 1
-  Example question: "How did Kobe do in the 2009 playoffs"
-  Correct table: all_players_playoffs_2008_2009
+  START-YEAR RULE: A bare year means the season that STARTS that year.
+    "2020" or "2020 season" → all_players_regular_2020_2021
+  PLAYOFF EXCEPTION: A playoff year refers to playoffs at the END of that season.
+    "2020 playoffs" → all_players_playoffs_2019_2020
 
-RULE 5 — CAREER / ALL TIME STATS:
-  Trigger phrases: "career", "all time", "entire career", "over his career",
-                   "throughout his career", "historically", "all seasons"
-  → Use UNION ALL across ALL available yearly tables for that player's era
-  → NEVER use player_game_logs for career stats
-  → Wrap in a subquery and aggregate with SUM() or AVG() and GROUP BY player_name
-  Example question: "Show me LeBron's career regular season stats"
-  → UNION ALL across all_players_regular_2003_2004 through all_players_regular_2024_2025
+RULE 5 — CAREER STATS & TRENDS:
+  → For "career" stats: UNION ALL across ALL available yearly tables for that player, then wrap in a subquery with SUM() and GROUP BY.
+  → For "by season" or "trends over time": UNION ALL across relevant season tables, but return ONE ROW PER SEASON (do NOT use SUM or GROUP BY).
 
-RULE 5B — OVER-TIME / BY-SEASON TRENDS (NOT CAREER AGGREGATE):
-  Trigger phrases: "by season", "per season", "season by season", "over the years",
-                   "through the years", "year by year", "across seasons", "trend over time",
-                   "over his career" / "throughout his career" when asking for rate stats,
-                   "rookie year to YYYY", "2010s decade", or explicit ranges like "from 2012 to 2024"
-  → Use UNION ALL across relevant season tables, but return ONE ROW PER SEASON (no rollup).
-  → Do NOT use SUM(), AVG(), COUNT(*), or GROUP BY player_name for this intent.
-  → If model produced SUM()+GROUP BY over UNION for these asks, rewrite to per-season direct columns.
-  → Pull per-season columns directly from each season table (including gp for games played).
-  Example question: "Show me LeBron's blocks per season"
-  → Return season_start, season_label, player_name, blk, blk_rank, gp by season order.
+RULE 6 — COMPARING PLAYERS:
+  → Specific season ("this season"): Use ONE `all_players_regular` table.
+  → No year context ("Who is better X or Y?"): Treat as a CAREER comparison. UNION ALL across every table and calculate career weighted averages.
+  → Different eras: UNION ALL per player from their respective era tables.
 
-RULE 6 — COMPARING TWO OR MORE PLAYERS WHEN A SEASON IS SPECIFIED ("this season", "last season", explicit year/range):
-  → Use ONE season summary table for all players in that query
-  → Use OR with ILIKE for multiple players:
-     player_name ILIKE '%LeBron%' OR player_name ILIKE '%Curry%'
-  → NEVER use player_game_logs for season-level comparisons
-  Example question: "Compare LeBron and Curry this season"
-  Correct table: all_players_regular_2024_2025
+RULE 7 — TOP PLAYERS / LEADERBOARD QUESTIONS:
+  → Use ONE season summary table directly. Do NOT use SUM(), GROUP BY, or UNION.
+  → ALWAYS ORDER BY the requested stat (e.g., ORDER BY pts_rank ASC NULLS LAST).
 
-RULE 6B — WHO IS BETTER / BETWEEN A AND B WITH NO YEAR OR SEASON CONTEXT:
-  If the question compares players or stats — who is better, better rebounder/scorer/player, between X and Y, vs., than —
-  and it does NOT mention any specific season/year, ordinal season (first/second season, rookie/sophomore year),
-  decade, or dated range ("last season", "2023-24", "this year"):
-  → Treat it as CAREER comparison (regular season unless they clearly mean playoffs).
-  → UNION ALL across every `all_players_regular_*` table in the schema for those players' careers.
-  → Aggregate with GROUP BY player_name.
-  → For per-game columns (pts, reb, ast, min, etc.), use career weighted averages:
-       SUM(column * gp) / NULLIF(SUM(gp), 0)
-     Shooting percentages: SUM(fgm)/NULLIF(SUM(fga),0), SUM(fg3m)/NULLIF(SUM(fg3a),0), SUM(ftm)/NULLIF(SUM(fta),0).
-  Example question: "Who is the better rebounder between Bol Bol and Anthony Davis"
-  → Career weighted reb per game across all regular-season tables — NOT only all_players_regular_2024_2025.
-
-RULE 7 — COMPARING TWO PLAYERS (different eras / career):
-  → Use UNION ALL — one SELECT per player from their respective era tables
-  → Wrap in outer query to aggregate
-  Example question: "Compare LeBron and Jordan career stats"
-  → LeBron from all_players_regular_2003_2004 through 2024_2025
-  → Jordan from all_players_regular_1996_1997 through 2002_2003
-
-RULE 8 — TOP PLAYERS / LEADERBOARD QUESTIONS:
-  → Use season summary tables only — they have pre-built rank columns
-  → NEVER use player_game_logs for rankings
-  → For single-season leaderboard questions, query ONE season table directly.
-  → Do NOT use SUM(), GROUP BY, or UNION unless the user explicitly asks for career/all-time across seasons.
-  → If the relevant _rank column exists, use it for ordering.
-  → For top/best scorers, ALWAYS ORDER BY `pts_rank ASC NULLS LAST` (not by SUM(pts)).
-  → If a _rank column is not selected, order by the relevant stat DESC (example: pts DESC).
-  → For top scorers specifically, use `pts` (and optionally `pts_rank`) from that season table.
-  → If the user asks for "top scorers", "best scorers", or "leading scorers":
-      - SELECT from one `all_players_regular_YYYY_YYYY` table only
-      - include `player_name, team_abbreviation, pts, pts_rank, gp, fg_pct, fg3_pct, fg3m, fg3a, ftm, fta, ft_pct`
-      - use DISTINCT to prevent duplicate player rows when source data has repeats
-      - ORDER BY `pts_rank ASC NULLS LAST`
-      - use LIMIT requested by user; if no number is provided, default to LIMIT 5
-      - IMPORTANT: These extra scoring-context columns are for follow-up questions;
-        keep the primary response concise, but still return them in query results.
-  Example question: "Who are the top 10 scorers this season"
-  Correct: SELECT player_name, team_abbreviation, pts, pts_rank, gp, fg_pct, fg3_pct
-           FROM all_players_regular_2024_2025
-           ORDER BY pts_rank ASC NULLS LAST
-           LIMIT 10
-
-RULE 9 — PLAYER DID NOT PLAY / ZERO ROWS RETURNED:
-  → Do NOT switch tables or guess a different year
-  → Return the query as-is and let the application handle the empty result
-  → A player not appearing in a playoffs table means they did not make the playoffs that year
-
-RULE 10 — WHEN player_game_logs IS BETTER THAN SEASON SUMMARY TABLES:
-  player_game_logs is updated through February 2026 and is the freshest data available.
-  Prefer it over season summary tables when:
-  - The user wants anything about the current 2025-26 season on a game-by-game level
-  - The user uses words like "lately", "recently", "now", "currently", "this year so far"
-  - The user wants "last X games" regardless of season
-  - The user wants game dates, opponents, win/loss results
-  HOWEVER, keep using all_players_regular_2024_2025 when:
-  - The user wants season rankings or leaderboards (needs _rank columns)
-  - The user needs oreb, dreb, plus_minus, age, or gp columns
-  - The user asks for season shooting percentage columns directly (fg_pct etc.)
-
-RULE 11 — SINGLE PLAYER GENERAL STATS PROFILE (season summary):
-  Trigger phrases: "what were X stats", "X stats in 20YY", "show X season stats",
-                   "player profile", "general stats"
-  If this is for one player and one season table:
-  → Use ONE `all_players_regular_YYYY_YYYY` table (or playoffs table only if user explicitly says playoffs)
-  → Do NOT use SUM(), GROUP BY, or UNION
-  → Return a broad stat set for downstream profile tables:
-     player_name, team_abbreviation, age, gp, min, w_pct,
-     pts, reb, ast, tov, stl, blk, pf, plus_minus, fgm, fga,
-     fg_pct, fg3_pct, ft_pct, fg3m, fg3a, ftm, fta,
-     pts_rank, fg_pct_rank, fg3_pct_rank, ft_pct_rank, fgm_rank, fga_rank, fg3m_rank, fg3a_rank, ftm_rank, fta_rank, min_rank,
-     reb_rank, dreb_rank, oreb_rank, ast_rank, tov_rank, stl_rank, blk_rank, pf_rank,
-     dreb, oreb, dd2, td3, dd2_rank, td3_rank
-  → Use DISTINCT if needed to avoid duplicate player rows
-
-RULE 12 — TEAM AND FRANCHISE QUERIES (CRITICAL):
+RULE 8 — TEAM AND FRANCHISE QUERIES:
   Trigger phrases: "top teams", "best NBA teams", "team winrate", "team standings"
-  If the question is asking to rank, compare, or evaluate TEAMS (not players):
   → ALWAYS use `team_advanced_season_YYYY_YY_regular_season_pergame` or `nba_standings_season_YYYY_YY_leaguestandingsv3`
-  → NEVER use `all_players_regular` or `player_game_logs`.
-  → For team advanced tables, the columns are UPPERCASE: TEAM_ID, TEAM_NAME, GP, W, L, W_PCT, OFF_RATING, DEF_RATING, NET_RATING
-  → For standings tables, the columns are CamelCase: TeamName, WINS, LOSSES, PlayoffRank, ConferenceRecord
-  Example question: "Statistically, what were the top 3 NBA teams by winrate in 2014"
-  Correct table: team_advanced_season_2014_15_regular_season_pergame
-  Correct SQL: SELECT TEAM_NAME, W_PCT FROM team_advanced_season_2014_15_regular_season_pergame ORDER BY W_PCT DESC LIMIT 3;
+  → Advanced table columns are UPPERCASE: "TEAM_ID", "TEAM_NAME", "W_PCT", "OFF_RATING", "DEF_RATING" (Wrap in double quotes).
+  → Standings columns are CamelCase: "TeamName", "WINS", "LOSSES".
 
-RULE 13 — SPECIALTY STATS & TRACKING (STRICT 63-CHAR TABLE NAMES):
-  CRITICAL: PostgreSQL forcefully truncated these table names at exactly 63 characters. You are currently hallucinating longer table names. 
-  DO NOT write "regular_se", "regular_season", or "per_mode_per" for the tracking tables. You MUST copy these exact strings character-for-character:
+RULE 9 — SHOT CHARTS, DISTANCE, AND PLAY-BY-PLAY (court_shots):
+  Trigger phrases: "shot chart", "where does X shoot from", "average shot distance", "dunks", "layups", "step back"
+  → ALWAYS use the `court_shots` table.
+  → `court_shots` is ONE massive table. Do NOT append years to the table name.
+  → Filter by `game_date` or `player_name` using standard WHERE clauses.
+  → Columns are lowercase: game_id, player_name, team_name, game_date, action_type, shot_type, shot_zone_basic, shot_distance, loc_x, loc_y, shot_made_flag
+
+RULE 10 — LINEUPS AND 5-MAN UNITS (STRICT 63-CHAR TABLE NAMES):
+  Trigger phrases: "best 5-man lineup", "lineup net rating"
+  → PostgreSQL forcefully truncated these table names at exactly 63 characters.
+  → You MUST use this exact suffix: `nba_lineups_group_5_season_YYYY_YY_season_type_playoffs_pe` (Ends in _pe)
+
+RULE 11 — SPECIALTY STATS & TRACKING (STRICT 63-CHAR TABLE NAMES):
+  CRITICAL: PostgreSQL forcefully truncated these table names at exactly 63 characters. 
+  DO NOT write "regular_season" or "per_mode_per" for the tracking tables. You MUST copy these exact suffix patterns character-for-character:
   
-  → "deflections", "contested shots", "charges":
+  → Hustle ("deflections", "contested shots", "charges", "screen assists"):
       Regular Season: `nba_hustle_season_YYYY_YY_season_type_regular_season_per_mo`
       Playoffs: `nba_hustle_season_YYYY_YY_season_type_playoffs_per_mode_per`
+      Columns to use: "SCREEN_ASSISTS", "SCREEN_AST_PTS", "DEFLECTIONS", "CHARGES_DRAWN"
       
-  → "clutch", "last 5 minutes":
-      Regular Season: `nba_clutch_season_YYYY_YY_season_type_regular_season_per_mo`
+  → Clutch ("clutch", "last 5 minutes"):
+      Regular: `nba_clutch_season_YYYY_YY_season_type_regular_season_per_mo`
       Playoffs: `nba_clutch_season_YYYY_YY_season_type_playoffs_per_mode_per`
       
-  → "drives":
-      Regular Season: `nba_player_tracking_pt_drives_season_YYYY_YY_season_type_re`
+  → Drives ("drives"):
+      Regular: `nba_player_tracking_pt_drives_season_YYYY_YY_season_type_re`
       Playoffs: `nba_player_tracking_pt_drives_season_YYYY_YY_season_type_pl`
       
-  → "passing":
-      Regular Season: `nba_player_tracking_pt_passing_season_YYYY_YY_season_type_r`
+  → Passing ("passing", "assists created"):
+      Regular: `nba_player_tracking_pt_passing_season_YYYY_YY_season_type_r`
       Playoffs: `nba_player_tracking_pt_passing_season_YYYY_YY_season_type_p`
+
+  → Defense ("defense", "opponent points at rim", "rim protection", "give up"):
+      Regular: `nba_player_tracking_pt_defense_season_YYYY_YY_season_type_r`
+      Columns to use: "DEF_RIM_FGM", "DEF_RIM_FGA", "DEF_RIM_FG_PCT", "STL", "BLK" (Do not use OPP_PTS, it does not exist).
+      IMPORTANT: DO NOT use the `SUM(pts)` aggregation block for defense tables. Use RAW columns.
       
-  → "catch and shoot": `nba_player_tracking_pt_catchshoot_season_YYYY_YY_season_typ`
-  → "post-ups": `nba_player_tracking_pt_posttouch_season_YYYY_YY_season_type`
-  → "paint touches": `nba_player_tracking_pt_painttouch_season_YYYY_YY_season_typ`
-  → "pull up": `nba_player_tracking_pt_pullupshot_season_YYYY_YY_season_typ`
+  → Tracking endpoints that DO NOT split by regular/playoffs (append this EXACT suffix to the season year):
+      "catch and shoot": `nba_player_tracking_pt_catchshoot_season_YYYY_YY_season_typ`
+      "post-ups": `nba_player_tracking_pt_posttouch_season_YYYY_YY_season_type`
+      "paint touches": `nba_player_tracking_pt_painttouch_season_YYYY_YY_season_typ`
+      "pull up": `nba_player_tracking_pt_pullupshot_season_YYYY_YY_season_typ`
+      "efficiency" / "drive points": `nba_player_tracking_pt_efficiency_season_YYYY_YY_season_typ`
+      → Tracking endpoints that DO NOT split by regular/playoffs:
+      "possessions" / "seconds per touch" / "time of possession": `nba_player_tracking_pt_possessions_season_YYYY_YY_season_ty`
+        → Use column "AVG_SEC_PER_TOUCH" for seconds per touch.
+      "rebounding" / "rebound chances": `nba_player_tracking_pt_rebounding_season_YYYY_YY_season_typ`
+      "speed and distance" / "miles run": `nba_player_tracking_pt_speeddistance_season_YYYY_YY_season`
 
-RULE 14 — ADVANCED METRICS AND UPPERCASE COLUMNS (CRITICAL):
-  This database uses official NBA metrics. It does NOT contain "PER" or "Win Shares".
-  For "PER", "Win Shares", or "overall impact", use `"PIE"` (Player Impact Estimate) or `"NET_RATING"` from the advanced tables.
-  Advanced table patterns: `nba_advanced_season_YYYY_YY_season_type_regular_season_per` OR `nba_advanced_season_YYYY_YY_season_type_playoffs_per_mode_p`
-  
-  UPPERCASE COLUMN REQUIREMENT: 
-  For ALL tables in Rules 12, 13, and 14 (Advanced, Hustle, Clutch, Tracking, Teams), the columns are stored in uppercase. You MUST wrap EVERY column name in double quotes to prevent PostgreSQL from lowercasing them.
-  DO THIS: SELECT "PLAYER_NAME", "TEAM_ABBREVIATION", "DRIVES", "OFF_RATING"
-  NEVER DO THIS: SELECT PLAYER_NAME, TEAM_ABBREVIATION
+  UPPERCASE COLUMNS: You MUST wrap the column names in double quotes for ALL these tables. 
+  ALWAYS include `"TEAM_ABBREVIATION"` and `"GP"` (Games Played) in your SELECT statement for tracking tables so the user can distinguish between regular season rows, playoff rows, and mid-season trades. Example: SELECT "PLAYER_NAME", "TEAM_ABBREVIATION", "GP", "AVG_SEC_PER_TOUCH" ...
 
-  When using `player_game_logs` for "last 10 games" or recency:
-  → DO NOT filter by `season_id` unless absolutely required. Just use `ORDER BY game_date DESC LIMIT X`.
-  → DO NOT calculate percentages (e.g. `fgm / fga`) or use `CAST()`. Just SELECT raw columns `fgm` and `fga` directly.
-  → The system actively blocks math in SELECT. Keep it raw data.
+RULE 12 — ADVANCED METRICS:
+  For "PER", "Win Shares", or "impact", use `"PIE"` or `"NET_RATING"` from the advanced tables.
+  Advanced table patterns: `nba_advanced_season_YYYY_YY_season_type_regular_season_per`
+  Remember to wrap UPPERCASE columns in double quotes.
+
+RULE 13 — MATCHUPS AND OPPONENTS (VS / AGAINST):
+  Trigger phrases: "vs [Team]", "against the [Team]", "when playing the [Team]"
+  → ALWAYS use the `player_game_logs` table.
+  → Use the `matchup` column to filter for the opponent using a wildcard. 
+  → The matchup format is "TEAM vs. OPP" or "TEAM @ OPP". 
+  → EXAMPLE: For "against the Nuggets", use `WHERE matchup ILIKE '%DEN%'`.
+  → (Note: ALWAYS convert team mascots to their 3-letter abbreviations for the ILIKE filter).
+
+RULE 14 — FANTASY BASKETBALL:
+  Trigger phrases: "fantasy points", "best fantasy player", "fantasy value"
+  → Use the `all_players_regular_YYYY_YYYY` tables.
+  → Select the `nba_fantasy_pts` and `nba_fantasy_pts_rank` columns. Do NOT attempt to calculate fantasy points manually.
+
+RULE 15 — SPECIFIC ADVANCED ACRONYMS (TS%, eFG%, USG%):
+  If the user asks for specific advanced shooting/usage metrics:
+  → Use the `nba_advanced_season_...` tables.
+  → "True Shooting" or "TS%" = `"TS_PCT"`
+  → "Effective Field Goal" or "eFG%" = `"EFG_PCT"`
+  → "Usage Rate" or "USG%" = `"USG_PCT"`
+  → "Assist Percentage" = `"AST_PCT"`
+  → "Rebound Percentage" = `"REB_PCT"`
+  CRITICAL: You MUST wrap these uppercase column names in double quotes.
 
 ════════════════════════════════════════════════════════════════════════
 SECTION 3: MANDATORY QUERY CONSTRUCTION RULES

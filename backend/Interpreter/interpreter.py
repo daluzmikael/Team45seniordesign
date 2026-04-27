@@ -1743,9 +1743,11 @@ RULE 11 — SPECIALTY STATS & TRACKING (STRICT 63-CHAR TABLE NAMES):
   UPPERCASE COLUMNS: You MUST wrap the column names in double quotes for ALL these tables. 
   ALWAYS include `"TEAM_ABBREVIATION"` and `"GP"` (Games Played) in your SELECT statement for tracking tables so the user can distinguish between regular season rows, playoff rows, and mid-season trades. Example: SELECT "PLAYER_NAME", "TEAM_ABBREVIATION", "GP", "AVG_SEC_PER_TOUCH" ...
 
-RULE 12 — ADVANCED METRICS:
+RULE 12 — ADVANCED METRICS (STRICT 63-CHAR TABLE NAMES):
   For "PER", "Win Shares", or "impact", use `"PIE"` or `"NET_RATING"` from the advanced tables.
-  Advanced table patterns: `nba_advanced_season_YYYY_YY_season_type_regular_season_per`
+  CRITICAL: PostgreSQL forcefully truncated the advanced table names. You MUST use these exact suffixes:
+  → Regular Season: `nba_advanced_season_YYYY_YY_season_type_regular_season_per`
+  → Playoffs: `nba_advanced_season_YYYY_YY_season_type_playoffs_per_mode_p`
   Remember to wrap UPPERCASE columns in double quotes.
 
 RULE 13 — MATCHUPS AND OPPONENTS (VS / AGAINST):

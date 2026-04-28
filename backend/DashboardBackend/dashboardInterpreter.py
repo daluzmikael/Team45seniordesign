@@ -687,20 +687,31 @@ def interpret_question(user_question: str) -> Dict[str, Any]:
             final_data = process_comparison_data(raw_data)
 
         elif chart_type in {"CategoricalBreakdown", "CompareCategoricalBreakdown"}:
-            player_names = chart_config.get("playerNames", []) or []
-            unique_labels = set()
+            # Use an ordered list instead of a set to keep colors consistent
+            unique_labels = []
             for row in raw_data:
                 name = row.get("player_name") or row.get("full_name") or "Unknown"
                 season = row.get("season")
                 label = f"{name} ({season})" if season else name
-                unique_labels.add(label)
+                
+                if label not in unique_labels:
+                    unique_labels.append(label)
+                
+                # Assign the unique label back to the row for pivoting
+                if "player_name" in row:
+                    row["player_name"] = label
+                elif "full_name" in row:
+                    row["full_name"] = label
 
-            inferred_count = max(len(unique_labels), len(player_names), len(raw_data))
+            inferred_count = len(unique_labels)
 
             if inferred_count > 1:
                 chart_type = "CompareCategoricalBreakdown"
             else:
                 chart_type = "CategoricalBreakdown"
+
+            chart_config["playerNames"] = unique_labels
+
             final_data = process_categorical_data(raw_data, inferred_count)
 
         elif chart_type == "ShotChart":

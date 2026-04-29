@@ -13,6 +13,7 @@ import CompareCategoricalBreakdown from "@/components/recharts/CompareCategorica
 import Leaderboard from "@/components/recharts/Leaderboard"
 
 import ShotChart from "@/components/recharts/ShotChart"
+import Scatter from "@/components/recharts/Scatter"
 
 interface AnalysisResult {
   success: boolean
@@ -26,6 +27,8 @@ interface AnalysisResult {
     timeFrame?: string
     statDisplayName?: string
     mode?: "volume" | "accuracy" | "hotspots" | "coldspots"
+    xAxisLabel?: string
+    yAxisLabel?: string
   }
   error?: string
 }
@@ -74,6 +77,16 @@ const EXAMPLE_CATEGORIES = [
       "Show me LeBron's best shooting zones against the Celtics",
       "Show me Steph Curry's shooting percentages heat map",
       "Show me Shaquille O'Neal's worst shooting zone within 15 feet",
+    ],
+  },
+  {
+    label: "Scatter Plots",
+    examples: [
+      "Scatter plot of points per game vs age in the 2021-22 playoffs",
+      "Scatterplot of TS% vs PPG for 2023-24",
+      "Show me a scatter of true shooting percentages in 2018-19",
+      "Plot rebounds per game vs assists per game in 2022-23 playoffs",
+      "Scatter plot of total points vs ppg in the 2021-22 playoffs",
     ],
   },
 ]
@@ -161,7 +174,7 @@ export default function DashboardsPage() {
             Not sure what to ask? Pick a category to see examples.
           </p>
 
-          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-3 w-full max-w-3xl">
+          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 w-full max-w-3xl">
             {EXAMPLE_CATEGORIES.map((category) => (
               <div
                 key={category.label}
@@ -282,6 +295,20 @@ export default function DashboardsPage() {
                   statDisplayName: result.config.statDisplayName || "Shot Chart",
                   timeFrame: result.config.timeFrame,
                   mode: (result.config as any).mode || "volume",
+                }}
+              />
+            </div>
+          )}
+
+          {result.chartType === "Scatter" && (
+            <div className="border rounded-xl p-6 bg-card shadow-sm">
+              <Scatter
+                data={result.data}
+                config={{
+                  statDisplayName: result.config.statDisplayName || "Scatter Plot",
+                  xAxisLabel: result.config.xAxisLabel ?? "",
+                  yAxisLabel: result.config.yAxisLabel ?? "",
+                  timeFrame: result.config.timeFrame,
                 }}
               />
             </div>

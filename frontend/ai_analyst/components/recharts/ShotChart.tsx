@@ -275,10 +275,10 @@ export default function ShotChart({ data, config }: ShotChartProps) {
           {` • ${data.length.toLocaleString()} shots`}
         </CardDescription>
       </CardHeader>
-      <CardContent className="flex justify-center pb-6">
+      <CardContent className="pb-6 px-2">
         <svg
           viewBox={`0 0 ${SVG_W} ${SVG_H}`}
-          className="w-full max-w-[550px]"
+          className="w-full"
           style={{ background: courtBg, borderRadius: "12px" }}
         >
           {(() => {

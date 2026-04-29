@@ -101,8 +101,8 @@ OUTPUT SHAPE RULES (VERY IMPORTANT):
     aliased as `player_name` and `y_value`. No `x_value` column at all.
   * x_value and y_value MUST be numeric. For text-storage families (nba_advanced_*, nba_clutch_*,
     nba_hustle_*, nba_player_tracking_pt_*, nba_lineups_*, team_advanced_*, nba_standings_*),
-    cast with `CAST(NULLIF("COL", '') AS numeric)`. For the `all_players_*` and `player_game_logs`
-    tables, raw column references work directly.
+    cast with `CAST(NULLIF("COL", '') AS numeric)` AND quote `"PLAYER_NAME"` AS player_name in the SELECT.
+    For the `all_players_*` and `player_game_logs` tables, raw lowercase column references work directly.
   * Apply a meaningful sample filter so noise dots do not dominate:
       `WHERE gp >= 20` for `all_players_*`, or
       `WHERE CAST(NULLIF("GP", '') AS numeric) >= 20` for text-storage families.
@@ -112,6 +112,23 @@ OUTPUT SHAPE RULES (VERY IMPORTANT):
   * If x and y are stored in different tables, JOIN on player_name (case-insensitive ILIKE if needed).
   * statDisplayName, xAxisLabel, and yAxisLabel are REQUIRED in chartConfig for Scatter so the chart
     renders human-readable axes. For single-axis, set xAxisLabel to "" (empty string).
+
+  * STAT → TABLE ROUTING (CRITICAL — pick the RIGHT table for the stat):
+    The `nba_advanced_*` table does NOT contain every stat. Stats that exist ONLY in `all_players_*`:
+      - fg3_pct, fg3m, fg3a (3-point shooting)         → use all_players_regular_YYYY_YYYY
+      - ft_pct, ftm, fta (free throws)                  → use all_players_regular_YYYY_YYYY
+      - oreb, dreb (rebound splits)                     → use all_players_regular_YYYY_YYYY
+      - stl, blk, tov, pf (defensive box stats)         → use all_players_regular_YYYY_YYYY
+      - pts, reb, ast (raw box totals)                  → use all_players_regular_YYYY_YYYY
+      - dd2, td3 (double-double / triple-double counts) → use all_players_regular_YYYY_YYYY
+    Stats that exist ONLY in `nba_advanced_*`:
+      - ts_pct, efg_pct (true shooting / effective FG)
+      - off_rating, def_rating, net_rating
+      - usg_pct (usage rate), ast_pct, reb_pct, oreb_pct, dreb_pct
+      - pie (PER equivalent), pace
+    Stats that exist in BOTH: fg_pct (overall FG%), gp, age, w, l. Prefer `all_players_*` for these
+    because it has proper numeric types — no casts needed.
+    When the user asks for a 3-point or free-throw scatter, ALWAYS use all_players_regular/playoffs.
 """
 
 
@@ -288,6 +305,23 @@ EXAMPLES:
    - Config: {{ "statDisplayName": "PIE vs Usage Rate", "xAxisLabel": "Usage Rate", "yAxisLabel": "PIE (PER equivalent)" }}
    - NOTE: When the user asks for "PER", we substitute "PIE" (the closest equivalent in our schema). Reflect that in yAxisLabel.
 
+29. **"Give me a scatter plot of 3 point shooting percentages in 2020"** (Scatter — single-axis, fg3_pct ONLY in all_players_*)
+   - Type: "Scatter"
+   - SQL: "SELECT player_name, fg3_pct AS y_value FROM all_players_regular_2020_2021 WHERE gp >= 20 LIMIT 500"
+   - Config: {{ "statDisplayName": "3-Point % Distribution (2020-21)", "xAxisLabel": "", "yAxisLabel": "3-Point %" }}
+   - NOTE: fg3_pct does NOT exist in nba_advanced_*. ALWAYS use all_players_regular_YYYY_YYYY (numeric type, no casts needed).
+
+30. **"Scatter of free throw percentages vs points per game in 2024"** (Scatter — both stats live in all_players_*)
+   - Type: "Scatter"
+   - SQL: "SELECT player_name, pts AS x_value, ft_pct AS y_value FROM all_players_regular_2024_2025 WHERE gp >= 20 LIMIT 500"
+   - Config: {{ "statDisplayName": "FT% vs PPG (2024-25)", "xAxisLabel": "Points Per Game", "yAxisLabel": "Free Throw %" }}
+   - NOTE: ft_pct, fg3_pct, oreb, dreb, stl, blk, tov are ONLY in all_players_*. No JOIN, no casts.
+
+31. **"Scatter of steals vs blocks per game in 2023"** (Scatter — defensive box stats, all_players_* only)
+   - Type: "Scatter"
+   - SQL: "SELECT player_name, blk AS x_value, stl AS y_value FROM all_players_regular_2023_2024 WHERE gp >= 20 LIMIT 500"
+   - Config: {{ "statDisplayName": "Steals vs Blocks (2023-24)", "xAxisLabel": "Blocks Per Game", "yAxisLabel": "Steals Per Game" }}
+
 CRITICAL RULES FOR RADAR CHARTS:
 - ALWAYS include `player_name` in your SELECT — even for single player radars. Without it, multi-player comparisons break.
 - When comparing players from DIFFERENT seasons, use UNION ALL across different season tables and include a `season` string literal column.
@@ -304,6 +338,12 @@ CRITICAL RULES FOR LEADERBOARDS:
 CRITICAL RULES FOR SCATTER CHARTS:
 - The output column aliases MUST BE EXACTLY `player_name`, `x_value`, `y_value` (or `player_name` and `y_value` for single-axis). No other column names. No extras like `season`, `team_abbreviation`, or `rank`.
 - Both axes must be NUMERIC. For text-storage families, wrap with CAST(NULLIF("COL", '') AS numeric). For numeric-typed tables (all_players_*, player_game_logs), use the raw column.
+- ROUTING DECISION (do this BEFORE writing the SQL):
+  * If EITHER stat is one of: fg3_pct, fg3m, fg3a, ft_pct, ftm, fta, oreb, dreb, stl, blk, tov, pf, pts, reb, ast, dd2, td3 → use `all_players_regular_YYYY_YYYY` (or playoffs equivalent).
+  * If BOTH stats are advanced (ts_pct, efg_pct, off_rating, def_rating, net_rating, usg_pct, ast_pct, reb_pct, oreb_pct, dreb_pct, pie, pace) → use `nba_advanced_season_YYYY_YY_...`.
+  * If ONE stat is advanced and ONE is from all_players_* → JOIN them (example 25 shows the pattern).
+  * NEVER pick `nba_advanced_*` for fg3_pct, ft_pct, stl, blk, etc. — those columns DO NOT EXIST there.
+- IDENTIFIER CASE: When using `nba_advanced_*` or any text-storage family, you MUST wrap column names in double quotes AND use uppercase (`"PLAYER_NAME"`, `"TS_PCT"`, `"GP"`). Postgres folds unquoted identifiers to lowercase, so `player_name` will fail. When using `all_players_*` or `player_game_logs`, lowercase unquoted columns work fine (`player_name`, `pts`, `gp`).
 - Always include a sample-size filter: `gp >= 20` (regular) or `gp >= 5` (playoffs) for numeric tables, or the casted equivalent for text-storage tables.
 - Always include `LIMIT 500`.
 - DEDUPLICATE traded players. If a single-table query, wrap the FROM clause in `(SELECT DISTINCT ON (player_name) ... ORDER BY player_name, gp DESC)` so each player appears at most once.
@@ -961,6 +1001,173 @@ Still follow the main schema exactly, and only output valid JSON."""
     return interpretation
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SCATTER SQL SAFETY NETS
+# These run after the LLM emits SQL and before we execute it. The prompt rules
+# and examples push the model toward correct output; these helpers catch the
+# common slip-ups deterministically so users don't see backend errors.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Stats that ONLY exist in all_players_* (NOT in nba_advanced_*).
+_BOX_ONLY_STAT_COLS = (
+    "fg3_pct", "fg3m", "fg3a",
+    "ft_pct", "ftm", "fta",
+    "oreb", "dreb",
+    "stl", "blk", "tov", "pf", "pfd",
+    "pts", "reb", "ast",
+    "dd2", "td3",
+    "plus_minus",
+)
+
+# Tables whose columns are stored as TEXT and whose identifiers must be quoted
+# uppercase. Same list as in interpreter.py for consistency.
+_TEXT_STORAGE_TABLE_PREFIXES = (
+    "nba_advanced_",
+    "nba_clutch_",
+    "nba_hustle_",
+    "nba_player_tracking_pt_",
+    "nba_lineups_",
+    "team_advanced_",
+    "nba_standings_",
+)
+
+
+def _sql_targets_text_storage_family(sql: str) -> bool:
+    if not sql:
+        return False
+    q = sql.lower()
+    return any(p in q for p in _TEXT_STORAGE_TABLE_PREFIXES)
+
+
+def _route_scatter_to_correct_table(sql: str) -> str:
+    """Reroute scatter SQL away from nba_advanced_* when the user asked for a
+    box-only stat (fg3_pct, ft_pct, stl, blk, etc.) that doesn't exist there.
+    Replaces the table with the same-year all_players_regular_* table.
+
+    SKIPS this rewrite when the SQL already references all_players_* in a
+    JOIN — that's a legitimate cross-table query and the box stats live on
+    the all_players side, not the advanced side.
+    """
+    if not sql:
+        return sql
+    q_lower = sql.lower()
+    # Only rewrite if (a) we hit nba_advanced_ AND (b) a box-only column is referenced.
+    if "nba_advanced_" not in q_lower:
+        return sql
+    # If the SQL already references an all_players_* table, this is a
+    # legitimate cross-table JOIN — the box stats belong on the all_players
+    # side and the advanced stats on the advanced side. Don't touch.
+    if re.search(r"\ball_players_(regular|playoffs)_\d{4}_\d{4}\b", q_lower):
+        return sql
+
+    referenced_box_stats = [c for c in _BOX_ONLY_STAT_COLS if re.search(rf"\b{c}\b", q_lower)]
+    if not referenced_box_stats:
+        return sql
+
+    # Extract the year window from the advanced table name.
+    adv_match = re.search(
+        r"(?i)nba_advanced_season_(\d{4})_(\d{2})_season_type_(regular_season|playoffs)_[a-z0-9_]+",
+        sql,
+    )
+    if not adv_match:
+        return sql
+    start = int(adv_match.group(1))
+    end_yy = adv_match.group(2)
+    season_type = adv_match.group(3).lower()
+    end = int(f"{str(start)[:2]}{end_yy}")
+
+    if season_type == "playoffs":
+        target_table = f"all_players_playoffs_{start}_{end}"
+    else:
+        target_table = f"all_players_regular_{start}_{end}"
+
+    # Rewrite the table reference. Drop any CAST(NULLIF(...)) wrappers around
+    # known box-stat columns since all_players_* stores them numerically.
+    new_sql = re.sub(
+        r"(?i)nba_advanced_season_\d{4}_\d{2}_season_type_(?:regular_season|playoffs)_[a-z0-9_]+",
+        target_table,
+        sql,
+    )
+    # Strip CAST(NULLIF("COL", '') AS numeric) → col for box-stat columns and GP.
+    for col in list(_BOX_ONLY_STAT_COLS) + ["gp", "GP"]:
+        new_sql = re.sub(
+            rf"""(?ix)
+                CAST\s*\(\s*NULLIF\s*\(\s*"?{re.escape(col)}"?\s*,\s*''\s*\)\s*AS\s+numeric\s*\)
+            """,
+            col.lower(),
+            new_sql,
+        )
+    # Also turn quoted "PLAYER_NAME" AS player_name → player_name.
+    new_sql = re.sub(r'(?i)"PLAYER_NAME"\s+AS\s+player_name', "player_name", new_sql)
+    new_sql = re.sub(r'(?i)"PLAYER_NAME"', "player_name", new_sql)
+
+    print(f"[ScatterFix] Routed nba_advanced_* → {target_table} (box stat referenced: {referenced_box_stats[0]})")
+    return new_sql
+
+
+def _fix_text_storage_identifier_case(sql: str) -> str:
+    """When SQL targets a text-storage table, replace bare lowercase
+    `player_name` (and friends) references with quoted uppercase form,
+    aliasing back to lowercase so downstream code (and the validator that
+    checks `cols`) still sees `player_name` in the result.
+
+    Postgres folds unquoted identifiers to lowercase, so a column physically
+    named PLAYER_NAME is invisible to `player_name` but accessible via
+    "PLAYER_NAME".
+
+    Skips:
+      - already-quoted occurrences ("PLAYER_NAME")
+      - alias positions following AS (so we don't double-rewrite)
+    """
+    if not _sql_targets_text_storage_family(sql):
+        return sql
+    if not sql:
+        return sql
+
+    # If the SQL already contains "PLAYER_NAME" (quoted uppercase), assume
+    # the model did the right thing and leave it alone — most legitimate
+    # advanced queries already use this form.
+    if re.search(r'"PLAYER_NAME"', sql):
+        # Still fix any *additional* unquoted lowercase player_name that
+        # isn't an alias. But the safer move is to leave it alone entirely.
+        return sql
+
+    new_sql = sql
+    # Match bare `player_name` that is NOT:
+    #   - preceded by `"`        (already quoted)
+    #   - preceded by `AS `      (alias position)
+    #   - preceded by a `.`      (qualified like t.player_name — different concern)
+    pattern = re.compile(r'(?<!["\.])(?<!AS )(?<!as )\bplayer_name\b(?!")')
+    if pattern.search(new_sql):
+        # Replace ALL such bare occurrences with `"PLAYER_NAME"`.
+        # Then the SELECT-list one needs an explicit AS alias so the result
+        # set still uses the lowercase name. Add it ONLY for the first
+        # post-SELECT occurrence.
+        new_sql_quoted = pattern.sub('"PLAYER_NAME"', new_sql)
+        # Find the SELECT-list version and tack on AS player_name if missing.
+        # Look for `"PLAYER_NAME"` directly after SELECT (with optional whitespace
+        # and DISTINCT) and not already followed by `AS`.
+        new_sql_quoted = re.sub(
+            r'(?i)(\bSELECT\b\s+(?:DISTINCT\s+(?:ON\s*\([^)]*\)\s+)?)?)"PLAYER_NAME"(?!\s+AS\b)',
+            r'\1"PLAYER_NAME" AS player_name',
+            new_sql_quoted,
+            count=1,
+        )
+        new_sql = new_sql_quoted
+        print(f"[ScatterFix] Quoted lowercase player_name for text-storage table")
+
+    return new_sql
+
+
+def _post_process_scatter_sql(sql: str, chart_type: str) -> str:
+    """Apply both safety-net rewrites for Scatter queries."""
+    if chart_type != "Scatter":
+        return sql
+    sql = _route_scatter_to_correct_table(sql)
+    sql = _fix_text_storage_identifier_case(sql)
+    return sql
+
+
 def interpret_question(user_question: str) -> Dict[str, Any]:
     conn = None
     try:
@@ -973,6 +1180,9 @@ def interpret_question(user_question: str) -> Dict[str, Any]:
         chart_type = interpretation.get("chartType", "")
         sql_query = interpretation.get("sqlQuery", "")
         chart_config = interpretation.get("chartConfig", {})
+
+        # Apply scatter SQL safety-net rewrites (no-op for non-scatter chartTypes).
+        sql_query = _post_process_scatter_sql(sql_query, chart_type)
 
         print(f"Chart Type: {chart_type}")
         print(f"Generated SQL: {sql_query}")
@@ -1016,6 +1226,9 @@ def interpret_question(user_question: str) -> Dict[str, Any]:
             chart_type = interpretation.get("chartType", "")
             sql_query = interpretation.get("sqlQuery", "")
             chart_config = interpretation.get("chartConfig", {})
+
+            # Apply scatter SQL safety-net rewrites on the retry too.
+            sql_query = _post_process_scatter_sql(sql_query, chart_type)
 
             print(f"[Retry] Chart Type: {chart_type}")
             print(f"[Retry] Generated SQL: {sql_query}")

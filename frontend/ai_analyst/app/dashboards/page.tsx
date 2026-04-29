@@ -287,7 +287,7 @@ export default function DashboardsPage() {
           )}
 
           {result.chartType === "ShotChart" && (
-            <div className="border rounded-xl p-6 bg-card shadow-sm">
+            <div className="-mx-6 border rounded-none sm:rounded-xl p-0 bg-card shadow-sm overflow-hidden">
               <ShotChart
                 data={result.data}
                 config={{

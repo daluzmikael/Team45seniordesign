@@ -7,8 +7,10 @@ from sqlglot.errors import ParseError
 import json
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Optional
+from threading import Lock
 
 from dotenv import load_dotenv
 
@@ -16,6 +18,9 @@ from dotenv import load_dotenv
 # this import, or uvicorn). Avoid basicConfig here so we do not steal first configuration
 # and hide DEBUG lines in the interpreter.
 logger = logging.getLogger(__name__)
+
+_SCHEMA_CACHE_LOCK = Lock()
+_SCHEMA_CACHE: dict[str, tuple[float, str]] = {}
 
 
 def _load_backend_dotenv() -> None:
@@ -73,6 +78,15 @@ def _is_relevant_table(table_name: str) -> bool:
 
 def get_db_schema(conn):
     logger.debug("Fetching database schema (compact + whitelisted)...")
+    cache_ttl = int(os.getenv("SCHEMA_CACHE_TTL_SECONDS", "600"))
+    cache_key = f"{getattr(conn, 'dsn', '')}|public"
+    now = time.time()
+    with _SCHEMA_CACHE_LOCK:
+        cached = _SCHEMA_CACHE.get(cache_key)
+        if cached and (now - cached[0]) < cache_ttl:
+            logger.debug("Using cached DB schema (age=%.1fs)", now - cached[0])
+            return cached[1]
+
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -223,6 +237,8 @@ def get_db_schema(conn):
 
     schema_description = "\n".join(schema_parts)
     logger.debug("Compact schema size: %d chars (%d tables included)", len(schema_description), len(tables))
+    with _SCHEMA_CACHE_LOCK:
+        _SCHEMA_CACHE[cache_key] = (time.time(), schema_description)
     return schema_description
 
 
@@ -261,7 +277,12 @@ def set_query_timeout(conn, timeout_ms=3000):
     cursor.execute(f"SET LOCAL statement_timeout = {timeout_ms};")
 
 def _query_plan_cost_disabled() -> bool:
-    """Env: DISABLE_QUERY_COST_CHECK=1/true or QUERY_PLAN_COST_MAX=off|0|unlimited."""
+    """
+    Default to disabled for lower latency; opt in by setting QUERY_COST_CHECK_ENABLED=1.
+    Legacy disables still respected (DISABLE_QUERY_COST_CHECK / QUERY_PLAN_COST_MAX=off).
+    """
+    if os.getenv("QUERY_COST_CHECK_ENABLED", "").strip().lower() not in ("1", "true", "yes"):
+        return True
     if os.getenv("DISABLE_QUERY_COST_CHECK", "").strip().lower() in ("1", "true", "yes"):
         return True
     raw = os.getenv("QUERY_PLAN_COST_MAX", "").strip().lower()

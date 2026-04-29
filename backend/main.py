@@ -24,8 +24,49 @@ from Interpreter.interpreter import run_query, debug_query_routing, get_last_tab
 import numpy as np
 import pandas as pd
 import re
+import time
+from threading import Lock
 
 app = FastAPI()
+
+_RESPONSE_CACHE_LOCK = Lock()
+_RESPONSE_CACHE: dict[str, tuple[float, Dict[str, Any]]] = {}
+
+
+def _cache_ttl_seconds() -> int:
+    return int(os.getenv("RESPONSE_CACHE_TTL_SECONDS", "45"))
+
+
+def _cache_max_items() -> int:
+    return int(os.getenv("RESPONSE_CACHE_MAX_ITEMS", "128"))
+
+
+def _make_cache_key(question: str, effective_question: str, history: List[Dict[str, Any]]) -> str:
+    # Include effective question and compact history footprint so follow-ups stay correct.
+    return f"{question.strip()}||{effective_question.strip()}||{repr(history[-4:])}"
+
+
+def _get_cached_response(cache_key: str) -> Optional[Dict[str, Any]]:
+    ttl = _cache_ttl_seconds()
+    now = time.time()
+    with _RESPONSE_CACHE_LOCK:
+        row = _RESPONSE_CACHE.get(cache_key)
+        if not row:
+            return None
+        ts, payload = row
+        if (now - ts) > ttl:
+            _RESPONSE_CACHE.pop(cache_key, None)
+            return None
+        return dict(payload)
+
+
+def _set_cached_response(cache_key: str, payload: Dict[str, Any]) -> None:
+    with _RESPONSE_CACHE_LOCK:
+        if len(_RESPONSE_CACHE) >= _cache_max_items():
+            # Remove oldest item (insertion-order dict in modern Python).
+            oldest_key = next(iter(_RESPONSE_CACHE))
+            _RESPONSE_CACHE.pop(oldest_key, None)
+        _RESPONSE_CACHE[cache_key] = (time.time(), dict(payload))
 
 @app.get("/")
 async def root():
@@ -342,6 +383,14 @@ async def analysis_endpoint(
         if has_regular_perf_intent and not has_explicit_year:
             effective_question = f"{effective_question.strip()} in 2025-26 season"
 
+        cache_key = _make_cache_key(request.question, effective_question, history_messages)
+        cached_payload = _get_cached_response(cache_key)
+        if cached_payload is not None:
+            if _analysis_debug_enabled():
+                cached_payload.setdefault("debug", {})
+                cached_payload["debug"]["cacheHit"] = True
+            return cached_payload
+
         # Run the query ONCE here — do not let query_analyzer run it again
         query_result = run_query(effective_question)
 
@@ -355,6 +404,7 @@ async def analysis_endpoint(
             q_lower = (request.question or "").lower()
             if "playoff" in q_lower or "postseason" in q_lower:
                 empty_message = (
+                    "I don't currently have enough playoff data to answer this question confidently.\n"
                     "No playoff data was found for this query in the available playoff tables.\n"
                     "- This player may not have records in the currently selected playoff seasons.\n"
                     "- Try a specific playoff year (example: 'Giannis 2021 playoff performance').\n"
@@ -362,6 +412,7 @@ async def analysis_endpoint(
                 )
             else:
                 empty_message = (
+                    "I don't currently have enough data in the database to answer this question confidently.\n"
                     "No data matched this query.\n"
                     "- The player name may be misspelled or formatted differently in the database.\n"
                     "- The requested season/split may not exist in the currently available tables.\n"
@@ -380,6 +431,7 @@ async def analysis_endpoint(
                     "historyContextReason": history_context_reason,
                     "conversationId": request.conversationId,
                 }
+            _set_cached_response(cache_key, payload)
             return payload
 
         # Clean NaN before JSON serialization
@@ -410,6 +462,7 @@ async def analysis_endpoint(
                 "historyContextReason": history_context_reason,
                 "conversationId": request.conversationId,
             }
+        _set_cached_response(cache_key, payload)
         return payload
 
     except Exception as e:

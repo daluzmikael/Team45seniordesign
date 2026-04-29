@@ -945,6 +945,12 @@ def _all_players_full_row_columns() -> list[str]:
 
 
 _PLAYER_ALIAS_MAP = {
+    "lebron": ["LeBron James"],
+    "lebron james": ["LeBron James"],
+    "kobe": ["Kobe Bryant"],
+    "kobe bryant": ["Kobe Bryant"],
+    "embiid": ["Joel Embiid"],
+    "joel embiid": ["Joel Embiid"],
     "steph": ["Stephen Curry", "Steph Curry"],
     "steph curry": ["Stephen Curry", "Steph Curry"],
     "jokic": ["Nikola Jokic", "Jokic", "Jokić"],
@@ -2556,6 +2562,109 @@ def _enforce_top_scorers_query(sql_query: str, user_input: str, schema_descripti
     )
 
 
+def _enforce_hidden_efficiency_query(sql_query: str, user_input: str, schema_description: str = "") -> str:
+    q_text = _extract_current_question_text(user_input).lower()
+    asks_hidden_efficiency = (
+        ("hidden" in q_text and "efficien" in q_text)
+        or ("non-star" in q_text and "impact" in q_text)
+        or ("box score" in q_text and "impact" in q_text and "efficien" in q_text)
+    )
+    if not asks_hidden_efficiency:
+        return sql_query
+
+    start, end, _ = _extract_requested_season_window(user_input)
+    existing = _extract_schema_table_names(schema_description)
+    adv_table = None
+    pg_table = None
+
+    # Prefer a season suffix where both required families exist to avoid empty joins.
+    candidate_pairs = [(start, end), (start - 1, end - 1), (start + 1, end + 1)]
+    for s, e in candidate_pairs:
+        adv_candidate = f"advance_totals_regularseason_{s}_{e}"
+        pg_candidate = f"player_pergame_regularseason_{s}_{e}"
+        if adv_candidate in existing and pg_candidate in existing:
+            adv_table = adv_candidate
+            pg_table = pg_candidate
+            break
+
+    if not adv_table or not pg_table:
+        adv_table = _resolve_table_for_season(
+            "advance_totals_regularseason_", start, end, schema_description
+        )
+        pg_table = _resolve_table_for_season(
+            "player_pergame_regularseason_", start, end, schema_description
+        )
+    if not adv_table or not pg_table:
+        return sql_query
+
+    # "Hidden efficiency monsters": high impact/efficiency but not top-scoring raw box output.
+    return (
+        "SELECT pg.player AS player_name, pg.team AS team_abbreviation, pg.gp, pg.pts, pg.reb, pg.ast, "
+        "adv.ts, adv.usg, adv.offrtg, adv.defrtg, adv.netrtg, adv.pie "
+        f"FROM {_qualified_public_table_ref(pg_table)} pg "
+        f"JOIN {_qualified_public_table_ref(adv_table)} adv ON pg.player = adv.player AND pg.team = adv.team "
+        "WHERE NULLIF(regexp_replace(pg.gp::text, '[^0-9\\.-]', '', 'g'), '')::double precision >= 20 "
+        "AND NULLIF(regexp_replace(pg.pts::text, '[^0-9\\.-]', '', 'g'), '')::double precision < 28 "
+        "AND NULLIF(regexp_replace(adv.ts::text, '[^0-9\\.-]', '', 'g'), '')::double precision >= 54 "
+        "AND NULLIF(regexp_replace(adv.pie::text, '[^0-9\\.-]', '', 'g'), '')::double precision IS NOT NULL "
+        "ORDER BY NULLIF(regexp_replace(adv.pie::text, '[^0-9\\.-]', '', 'g'), '')::double precision DESC NULLS LAST "
+        "LIMIT 12;"
+    )
+
+
+def _enforce_high_usg_ts_query(sql_query: str, user_input: str, schema_description: str = "") -> str:
+    q_text = _extract_current_question_text(user_input).lower()
+    asks_combo = (
+        (("usg" in q_text or "usage" in q_text) and ("ts" in q_text or "true shooting" in q_text))
+        or ("high usg" in q_text and "high ts" in q_text)
+    )
+    if not asks_combo:
+        return sql_query
+
+    start, end, _ = _extract_requested_season_window(user_input)
+    table = _resolve_table_for_season(
+        "advance_totals_regularseason_", start, end, schema_description
+    )
+    if not table:
+        return sql_query
+
+    return (
+        "SELECT player, team, gp, ts, usg, offrtg, defrtg, netrtg, pie "
+        f"FROM {_qualified_public_table_ref(table)} "
+        "WHERE NULLIF(regexp_replace(gp::text, '[^0-9\\.-]', '', 'g'), '')::double precision >= 20 "
+        "AND NULLIF(regexp_replace(ts::text, '[^0-9\\.-]', '', 'g'), '')::double precision >= 56 "
+        "AND NULLIF(regexp_replace(usg::text, '[^0-9\\.-]', '', 'g'), '')::double precision >= 26 "
+        "ORDER BY NULLIF(regexp_replace(ts::text, '[^0-9\\.-]', '', 'g'), '')::double precision DESC NULLS LAST, "
+        "NULLIF(regexp_replace(usg::text, '[^0-9\\.-]', '', 'g'), '')::double precision DESC NULLS LAST "
+        "LIMIT 12;"
+    )
+
+
+def _enforce_rebounders_query(sql_query: str, user_input: str, schema_description: str = "") -> str:
+    q_text = _extract_current_question_text(user_input).lower()
+    asks_rebounders = (
+        ("rebounder" in q_text or "rebounders" in q_text or "best rebound" in q_text or "top rebound" in q_text)
+        and ("regular season" in q_text or "season" in q_text or re.search(r"\b(19|20)\d{2}", q_text))
+    )
+    if not asks_rebounders:
+        return sql_query
+
+    start, end, _ = _extract_requested_season_window(user_input)
+    table = _resolve_table_for_season(
+        "player_pergame_regularseason_", start, end, schema_description
+    )
+    if not table:
+        return sql_query
+
+    return (
+        "SELECT player, team, gp, reb, oreb, dreb, pts, ast "
+        f"FROM {_qualified_public_table_ref(table)} "
+        "WHERE NULLIF(regexp_replace(gp::text, '[^0-9\\.-]', '', 'g'), '')::double precision >= 20 "
+        "ORDER BY NULLIF(regexp_replace(reb::text, '[^0-9\\.-]', '', 'g'), '')::double precision DESC NULLS LAST "
+        "LIMIT 10;"
+    )
+
+
 def _ensure_all_players_broad_columns(sql_query: str, user_input: str) -> str:
     q = sql_query or ""
     q_lower = q.lower()
@@ -3428,6 +3537,9 @@ Generate the SQL:"""
     sql_query = _enforce_advanced_table_mapping(sql_query, user_input_param, schema_description)
     sql_query = _enforce_multi_family_stats_join(sql_query, user_input_param, schema_description)
     sql_query = _enforce_top_scorers_query(sql_query, user_input_param, schema_description)
+    sql_query = _enforce_high_usg_ts_query(sql_query, user_input_param, schema_description)
+    sql_query = _enforce_rebounders_query(sql_query, user_input_param, schema_description)
+    sql_query = _enforce_hidden_efficiency_query(sql_query, user_input_param, schema_description)
     sql_query = _enforce_team_table_mapping(sql_query, user_input_param, schema_description)
     sql_query = _enforce_best_team_record_query(sql_query, user_input_param, schema_description)
     sql_query = _enforce_playoff_compare_template(sql_query, user_input_param, schema_description)
@@ -3470,6 +3582,9 @@ Generate the SQL:"""
             sql_query = _enforce_advanced_table_mapping(sql_query, user_input_param, schema_description)
             sql_query = _enforce_multi_family_stats_join(sql_query, user_input_param, schema_description)
             sql_query = _enforce_top_scorers_query(sql_query, user_input_param, schema_description)
+            sql_query = _enforce_high_usg_ts_query(sql_query, user_input_param, schema_description)
+            sql_query = _enforce_rebounders_query(sql_query, user_input_param, schema_description)
+            sql_query = _enforce_hidden_efficiency_query(sql_query, user_input_param, schema_description)
             sql_query = _enforce_team_table_mapping(sql_query, user_input_param, schema_description)
             sql_query = _enforce_best_team_record_query(sql_query, user_input_param, schema_description)
             sql_query = _enforce_playoff_compare_template(sql_query, user_input_param, schema_description)
@@ -3506,6 +3621,9 @@ Generate the SQL:"""
             sql_query = _enforce_team_table_mapping(sql_query, user_input_param, schema_description)
             sql_query = _enforce_multi_family_stats_join(sql_query, user_input_param, schema_description)
             sql_query = _enforce_top_scorers_query(sql_query, user_input_param, schema_description)
+            sql_query = _enforce_high_usg_ts_query(sql_query, user_input_param, schema_description)
+            sql_query = _enforce_rebounders_query(sql_query, user_input_param, schema_description)
+            sql_query = _enforce_hidden_efficiency_query(sql_query, user_input_param, schema_description)
             sql_query = _enforce_best_team_record_query(sql_query, user_input_param, schema_description)
             sql_query = _enforce_playoff_compare_template(sql_query, user_input_param, schema_description)
             sql_query = _enforce_extended_family_table_mapping(sql_query, user_input_param, schema_description)
@@ -3602,6 +3720,9 @@ Generate the SQL:"""
                 sql_query = _enforce_advanced_table_mapping(sql_query, user_input_param, schema_description)
                 sql_query = _enforce_multi_family_stats_join(sql_query, user_input_param, schema_description)
                 sql_query = _enforce_top_scorers_query(sql_query, user_input_param, schema_description)
+                sql_query = _enforce_high_usg_ts_query(sql_query, user_input_param, schema_description)
+                sql_query = _enforce_rebounders_query(sql_query, user_input_param, schema_description)
+                sql_query = _enforce_hidden_efficiency_query(sql_query, user_input_param, schema_description)
                 sql_query = _enforce_team_table_mapping(sql_query, user_input_param, schema_description)
                 sql_query = _enforce_best_team_record_query(sql_query, user_input_param, schema_description)
                 sql_query = _enforce_playoff_compare_template(sql_query, user_input_param, schema_description)

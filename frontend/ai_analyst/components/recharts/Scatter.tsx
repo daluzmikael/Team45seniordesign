@@ -1,6 +1,7 @@
 "use client"
 
-import { useMemo } from "react"
+import { useMemo, useState, useEffect } from "react"
+import { useTheme } from "next-themes"
 import {
   CartesianGrid,
   Scatter,
@@ -117,6 +118,13 @@ const chartConfig = {
 
 export default function ScatterComponent({ data, config }: ScatterProps) {
   const { statDisplayName = "Scatter Plot", xAxisLabel = "", yAxisLabel = "", timeFrame } = config || {}
+
+  const { resolvedTheme } = useTheme()
+  const [mounted, setMounted] = useState(false)
+  useEffect(() => { setMounted(true) }, [])
+  
+  const isDark = mounted ? resolvedTheme === "dark" : false
+  const dotColor = isDark ? "#ffffff" : "#000000" // White in dark mode, black in light mode
 
   // Normalize rows: parse numerics, drop nulls, detect single-axis mode.
   // We do this client-side as a safety net even though the backend validator
@@ -253,15 +261,15 @@ export default function ScatterComponent({ data, config }: ScatterProps) {
                 }
                 cursor={{ strokeDasharray: "3 3" }}
               />
-              <Scatter
+            <Scatter
                 name={statDisplayName}
                 data={rows}
-                fill="hsl(var(--chart-1))"
-                fillOpacity={0.7}
-                stroke="hsl(var(--chart-1))"
-                strokeOpacity={0.9}
-                strokeWidth={1}
-              />
+                fill={dotColor}
+                fillOpacity={0.4}
+                stroke={dotColor}
+                strokeOpacity={0.4}
+                strokeWidth={0.1}
+            />
             </ScatterChart>
           </ResponsiveContainer>
         </ChartContainer>

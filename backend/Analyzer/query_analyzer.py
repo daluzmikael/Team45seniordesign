@@ -1015,6 +1015,14 @@ def _format_single_player_stats_profile(df: pd.DataFrame, question: str, client:
         return "\nNo player stats were available for this question."
 
     row = working.iloc[0]
+    q_lower = (question or "").lower()
+    is_totals_frame = any(
+        c in working.columns for c in ["c_3pm", "c_3pa", "c_3p"]
+    ) or ("fg" in working.columns and "fg_pct" not in working.columns)
+    explicit_totals_ask = any(
+        t in q_lower for t in ["total", "totals", "minutes", "min", "across", "combined", "sum"]
+    )
+    use_totals_language = is_totals_frame or explicit_totals_ask
     name = str(_v(row, "player_name")) if not _is_missing(_v(row, "player_name")) else "N/A"
     team = str(_v(row, "team_abbreviation")) if not _is_missing(_v(row, "team_abbreviation")) else "N/A"
     age = _fmt_num(_v(row, "age"), digits=1)
@@ -1115,20 +1123,36 @@ def _format_single_player_stats_profile(df: pd.DataFrame, question: str, client:
             return f"top {rank_i} in the league"
         return f"ranked {rank_i}th in the league"
 
-    season_summary = _generate_natural_player_season_summary(row, question, season_text, client)
+    season_summary = None if use_totals_language else _generate_natural_player_season_summary(row, question, season_text, client)
     if not season_summary:
         summary_sentences = []
-        summary_sentences.append(
-            f"{name} averaged {_fmt_num(_v(row, 'pts'))} points per game, {_top_or_rank(_rank_to_int(pts_rank))}, while shooting {fg_text} from the field."
-        )
-        if fga_rank_i is not None and fg3a_rank_i is not None:
+        if use_totals_language:
             summary_sentences.append(
-                f"He did that on {_fmt_num(_v(row, 'fga'))} field-goal attempts per game (#{fga_rank}) and {_fmt_num(_v(row, 'fg3a'))} three-point attempts per game (#{fg3a_rank}), which adds context to his {fg_text} FG and {fg3_text} 3P efficiency."
+                f"In {season_text or 'the requested season'}, {name} logged {_fmt_num(_v(row, 'min'))} total minutes across {gp} games."
             )
-        if gp_i is not None and gp_i < 50:
+            if not _is_missing(_v(row, "pts")):
+                summary_sentences.append(
+                    f"His scoring total was {_fmt_num(_v(row, 'pts'))} points."
+                )
+            if not _is_missing(_v(row, "ast")) or not _is_missing(_v(row, "reb")):
+                summary_sentences.append(
+                    f"He added {_fmt_num(_v(row, 'reb'))} total rebounds and {_fmt_num(_v(row, 'ast'))} total assists."
+                )
             summary_sentences.append(
-                f"He played {gp} games, so this season line comes from a relatively small sample."
+                "These values are season totals from the totals table and are not per-game calculations."
             )
+        else:
+            summary_sentences.append(
+                f"{name} averaged {_fmt_num(_v(row, 'pts'))} points per game, {_top_or_rank(_rank_to_int(pts_rank))}, while shooting {fg_text} from the field."
+            )
+            if fga_rank_i is not None and fg3a_rank_i is not None:
+                summary_sentences.append(
+                    f"He did that on {_fmt_num(_v(row, 'fga'))} field-goal attempts per game (#{fga_rank}) and {_fmt_num(_v(row, 'fg3a'))} three-point attempts per game (#{fg3a_rank}), which adds context to his {fg_text} FG and {fg3_text} 3P efficiency."
+                )
+            if gp_i is not None and gp_i < 50:
+                summary_sentences.append(
+                    f"He played {gp} games, so this season line comes from a relatively small sample."
+                )
         season_summary = " ".join(summary_sentences)
 
     def _append_filtered_table(lines_out: list[str], title: str, cells: list[tuple[str, str]]) -> None:
@@ -1161,7 +1185,7 @@ def _format_single_player_stats_profile(df: pd.DataFrame, question: str, client:
         lines,
         "",
         [
-            ("PPG", _fmt_num(_v(row, "pts"))),
+            ("PTS" if use_totals_language else "PPG", _fmt_num(_v(row, "pts"))),
             ("REB", _fmt_num(_v(row, "reb"))),
             ("AST", _fmt_num(_v(row, "ast"))),
             ("Plus/Minus", _fmt_num(_v(row, "plus_minus"))),
@@ -1232,8 +1256,8 @@ def _format_single_player_stats_profile(df: pd.DataFrame, question: str, client:
         lines,
         "### Double-Double / Triple-Double",
         [
-            ("DD2", _fmt_num(_v(row, "dd2"))),
-            ("TD3", _fmt_num(_v(row, "td3"))),
+            ("Double Double", _fmt_num(_v_any(row, ["double_double", "dd2"]))),
+            ("Triple Double", _fmt_num(_v_any(row, ["triple_double", "td3"]))),
             ("DD2 Rank", _fmt_int(_v(row, "dd2_rank"))),
             ("TD3 Rank", _fmt_int(_v(row, "td3_rank"))),
         ],
@@ -1256,6 +1280,50 @@ def _is_games_played_question(question: str, df: pd.DataFrame) -> bool:
             "did he play that year",
             "did she play that year",
         ]
+    )
+
+
+def _is_total_minutes_question(question: str, df: pd.DataFrame) -> bool:
+    q = (question or "").lower()
+    if df is None or df.empty:
+        return False
+    has_minutes_intent = ("minute" in q or "minutes" in q) and any(
+        t in q for t in ["total", "totals", "how many", "across"]
+    )
+    return has_minutes_intent and ("min" in df.columns)
+
+
+def _format_total_minutes_response(df: pd.DataFrame, question: str) -> str:
+    row = df.iloc[0]
+    player = str(row.get("player_name", row.get("player", "Player")))
+    team = str(row.get("team_abbreviation", row.get("team", "N/A")))
+    season_text = None
+    if "season_label" in df.columns and not pd.isna(row.get("season_label")):
+        season_text = f"{row.get('season_label')} season"
+    elif "season_start" in df.columns and not pd.isna(row.get("season_start")):
+        try:
+            start = int(float(row.get("season_start")))
+            season_text = f"{start}-{str(start + 1)[-2:]} season"
+        except Exception:
+            season_text = None
+    if season_text is None:
+        season_text = _extract_season_reference_text(question) or "requested season"
+
+    def _fmt(v: Any, digits: int = 0) -> str:
+        if v is None or pd.isna(v):
+            return "N/A"
+        try:
+            return f"{float(v):.{digits}f}" if digits > 0 else str(int(round(float(v))))
+        except Exception:
+            return "N/A"
+
+    mins = _fmt(row.get("min"), 0)
+    gp = _fmt(row.get("gp"), 0)
+    team_text = "" if (not team or team == "N/A") else f" for {team}"
+    return (
+        f"\nIn the **{season_text}**, **{player}** played **{mins} total minutes** across **{gp} games**"
+        f"{team_text}.\n"
+        "This answer uses season totals from the totals table (not per-game calculations)."
     )
 
 
@@ -1762,21 +1830,24 @@ def analyze_dataframe() -> str:
     is_simple_top_scorers = _is_simple_top_scorers_question(user_input, domain)
     is_single_player_trend = _is_single_player_season_trend_question(user_input, df_output)
     is_single_player_stats = _is_single_player_stats_question(user_input, df_output)
-    is_clutch_profile = is_single_player_stats and _is_clutch_question_or_frame(user_input, df_output)
+    is_clutch_profile = _is_clutch_question_or_frame(user_input, df_output)
     is_games_played_q = _is_games_played_question(user_input, df_output)
+    is_total_minutes_q = _is_total_minutes_question(user_input, df_output)
     is_concise_season_lookup = _is_concise_single_player_season_lookup_question(user_input, df_output)
 
     if is_games_played_q:
         return _format_games_played_response(df_output, user_input)
+    if is_total_minutes_q:
+        return _format_total_minutes_response(df_output, user_input)
     if is_concise_season_lookup:
         return _format_concise_single_player_season_lookup_response(df_output, user_input)
 
+    if is_clutch_profile:
+        return _format_single_player_clutch_profile(df_output, user_input)
     if is_single_player_trend:
         trend_text = _format_single_player_season_trend_response(df_output, user_input, client)
         if trend_text:
             return trend_text
-    if is_clutch_profile:
-        return _format_single_player_clutch_profile(df_output, user_input)
     if is_single_player_stats:
         return _format_single_player_stats_profile(df_output, user_input, client)
     elif is_simple_top_scorers:
@@ -1925,21 +1996,24 @@ def analyze_question(question: str) -> str:
     is_simple_top_scorers = _is_simple_top_scorers_question(question, domain)
     is_single_player_trend = _is_single_player_season_trend_question(question, df)
     is_single_player_stats = _is_single_player_stats_question(question, df)
-    is_clutch_profile = is_single_player_stats and _is_clutch_question_or_frame(question, df)
+    is_clutch_profile = _is_clutch_question_or_frame(question, df)
     is_games_played_q = _is_games_played_question(question, df)
+    is_total_minutes_q = _is_total_minutes_question(question, df)
     is_concise_season_lookup = _is_concise_single_player_season_lookup_question(question, df)
 
     if is_games_played_q:
         return _format_games_played_response(df, question)
+    if is_total_minutes_q:
+        return _format_total_minutes_response(df, question)
     if is_concise_season_lookup:
         return _format_concise_single_player_season_lookup_response(df, question)
 
+    if is_clutch_profile:
+        return _format_single_player_clutch_profile(df, question)
     if is_single_player_trend:
         trend_text = _format_single_player_season_trend_response(df, question, client)
         if trend_text:
             return trend_text
-    if is_clutch_profile:
-        return _format_single_player_clutch_profile(df, question)
     if is_single_player_stats:
         return _format_single_player_stats_profile(df, question, client)
     elif is_simple_top_scorers:
@@ -2075,10 +2149,13 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
     is_single_player_stats = _is_single_player_stats_question(question, df)
     is_clutch_profile = is_single_player_stats and _is_clutch_question_or_frame(question, df)
     is_games_played_q = _is_games_played_question(question, df)
+    is_total_minutes_q = _is_total_minutes_question(question, df)
     is_concise_season_lookup = _is_concise_single_player_season_lookup_question(question, df)
 
     if is_games_played_q:
         return _format_games_played_response(df, question)
+    if is_total_minutes_q:
+        return _format_total_minutes_response(df, question)
     if is_concise_season_lookup:
         return _format_concise_single_player_season_lookup_response(df, question)
 

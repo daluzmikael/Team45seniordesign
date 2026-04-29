@@ -388,6 +388,14 @@ async def analysis_endpoint(
         # Pass the already-fetched dataframe directly to the analyzer
         # so it does NOT run a second query internally
         analysis_result = analyze_question_with_data(request.question, query_result)
+        q_lower = (request.question or "").lower()
+        if "clutch" in q_lower:
+            low_analysis = (analysis_result or "").lower()
+            if ("last 5 minutes" not in low_analysis) or ("totals" not in low_analysis):
+                analysis_result = (
+                    (analysis_result or "").rstrip()
+                    + "\n\nThis clutch response uses last 5 minutes context totals from the clutch table."
+                )
 
         payload = {
             "success": True,

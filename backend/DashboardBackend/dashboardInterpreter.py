@@ -176,13 +176,18 @@ EXAMPLES:
 
 14. **"Compare LeBron's 2012-13 skill profile to Giannis 2020-21 skill profile"** (Radar — cross-season comparison)
    - Type: "CompareCategoricalBreakdown"
-   - SQL: "SELECT player_name, '2012-13' as season, pts, ast, reb, stl, blk FROM all_players_regular_2012_2013 WHERE player_name ILIKE '%LeBron%James%' UNION ALL SELECT player_name, '2020-21' as season, pts, ast, reb, stl, blk FROM all_players_regular_2020_2021 WHERE player_name ILIKE '%Giannis%Antetokounmpo%'"
+   - SQL: "SELECT player_name, '2012-13' as season, pts, ast, reb, stl, blk FROM (SELECT DISTINCT ON (player_name) player_name, pts, ast, reb, stl, blk, gp FROM all_players_regular_2012_2013 WHERE player_name ILIKE '%LeBron%James%' ORDER BY player_name, gp DESC) sub1 UNION ALL SELECT player_name, '2020-21' as season, pts, ast, reb, stl, blk FROM (SELECT DISTINCT ON (player_name) player_name, pts, ast, reb, stl, blk, gp FROM all_players_regular_2020_2021 WHERE player_name ILIKE '%Giannis%Antetokounmpo%' ORDER BY player_name, gp DESC) sub2"
    - Config: {{ "playerNames": ["LeBron James", "Giannis Antetokounmpo"], "statDisplayName": "Cross-Season Comparison" }}
 
 15. **"Compare Curry's 2015-16 profile to his 2023-24 profile"** (Radar — same player, two seasons)
    - Type: "CompareCategoricalBreakdown"
-   - SQL: "SELECT player_name, '2015-16' as season, pts, ast, reb, stl, blk FROM all_players_regular_2015_2016 WHERE player_name ILIKE '%Stephen%Curry%' UNION ALL SELECT player_name, '2023-24' as season, pts, ast, reb, stl, blk FROM all_players_regular_2023_2024 WHERE player_name ILIKE '%Stephen%Curry%'"
+   - SQL: "SELECT player_name, '2015-16' as season, pts, ast, reb, stl, blk FROM (SELECT DISTINCT ON (player_name) player_name, pts, ast, reb, stl, blk, gp FROM all_players_regular_2015_2016 WHERE player_name ILIKE '%Stephen%Curry%' ORDER BY player_name, gp DESC) sub1 UNION ALL SELECT player_name, '2023-24' as season, pts, ast, reb, stl, blk FROM (SELECT DISTINCT ON (player_name) player_name, pts, ast, reb, stl, blk, gp FROM all_players_regular_2023_2024 WHERE player_name ILIKE '%Stephen%Curry%' ORDER BY player_name, gp DESC) sub2"
    - Config: {{ "playerNames": ["Stephen Curry"], "statDisplayName": "Season Comparison" }}
+
+15b. **"Show me Trae Young 2021 skill profile vs LeBron James 2018 skill profile vs Stephen Curry 2017 skill profile"** (Radar — 3+ players, each from a different season)
+   - Type: "CompareCategoricalBreakdown"
+   - SQL: "SELECT player_name, '2020-21' as season, pts, ast, reb, stl, blk FROM (SELECT DISTINCT ON (player_name) player_name, pts, ast, reb, stl, blk, gp FROM all_players_regular_2020_2021 WHERE player_name ILIKE '%Trae%Young%' ORDER BY player_name, gp DESC) sub1 UNION ALL SELECT player_name, '2017-18' as season, pts, ast, reb, stl, blk FROM (SELECT DISTINCT ON (player_name) player_name, pts, ast, reb, stl, blk, gp FROM all_players_regular_2017_2018 WHERE player_name ILIKE '%LeBron%James%' ORDER BY player_name, gp DESC) sub2 UNION ALL SELECT player_name, '2016-17' as season, pts, ast, reb, stl, blk FROM (SELECT DISTINCT ON (player_name) player_name, pts, ast, reb, stl, blk, gp FROM all_players_regular_2016_2017 WHERE player_name ILIKE '%Stephen%Curry%' ORDER BY player_name, gp DESC) sub3"
+   - Config: {{ "playerNames": ["Trae Young", "LeBron James", "Stephen Curry"], "statDisplayName": "Cross-Season Comparison" }}
 
 16. **"Show me a heat map of LeBron's shot selection"** (Career Shot Chart)
    - Type: "ShotChart"
@@ -229,7 +234,8 @@ CRITICAL RULES FOR RADAR CHARTS:
 - When comparing players from DIFFERENT seasons, use UNION ALL across different season tables and include a `season` string literal column.
 - When comparing the SAME player across seasons, do the same UNION ALL pattern. The season column will be used to distinguish them.
 - The playerNames array in chartConfig should list the player names as they appear in the database.
-- ALWAYS use DISTINCT ON (player_name) to avoid duplicate rows for traded players.
+- ALWAYS use DISTINCT ON (player_name) inside a subquery for EACH branch of a UNION ALL to avoid duplicate rows for traded players. Each UNION ALL branch must wrap its query like: SELECT player_name, 'YYYY-YY' as season, pts, ast, reb, stl, blk FROM (SELECT DISTINCT ON (player_name) player_name, pts, ast, reb, stl, blk, gp FROM table WHERE ... ORDER BY player_name, gp DESC) subN
+- This pattern works for any number of players (2, 3, 4, etc.) — just add more UNION ALL branches.
 
 CRITICAL RULES FOR LEADERBOARDS:
 - ALWAYS deduplicate with DISTINCT ON (player_name) ordered by gp DESC inside a subquery.
@@ -324,11 +330,8 @@ def process_categorical_data(raw_data: List[Dict], player_count: int) -> List[Di
     categories = ["PTS", "AST", "REB", "STL", "BLK"]
 
     def _build_label(row: Dict) -> str:
-        name = row.get("full_name") or row.get("player_name") or "Unknown"
-        season = row.get("season")
-        if season:
-            return f"{name} ({season})"
-        return name
+        # player_name is already formatted as "Name (season)" by interpret_question
+        return row.get("full_name") or row.get("player_name") or "Unknown"
 
     # Single player radar (only when 1 row and no cross-season)
     if player_count <= 1 and len(raw_data) == 1:
@@ -481,12 +484,17 @@ def _columns_present(raw_data: List[Dict]) -> set:
 def _looks_like_radar(raw_data: List[Dict]) -> bool:
     if not raw_data:
         return False
-    if len(raw_data) > 5:
-        return False
+    # Check column shape first — radar data has raw stat columns, not stat_value
     upper = set(_safe_upper_keys(raw_data[0]).keys())
     if "STAT_VALUE" in upper:
         return False
-    return len(RADAR_KEYS.intersection(upper)) >= 3
+    if len(RADAR_KEYS.intersection(upper)) < 3:
+        return False
+    # Allow up to ~20 rows to accommodate traded-player duplicates across
+    # multiple players/seasons (e.g. 5 players × up to 4 team stints each)
+    if len(raw_data) > 20:
+        return False
+    return True
 
 
 def _validate_and_autofix(chart_type: str, raw_data: List[Dict], chart_config: Dict[str, Any]) -> Tuple[bool, str, str]:

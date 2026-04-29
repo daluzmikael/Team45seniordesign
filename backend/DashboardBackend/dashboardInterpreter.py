@@ -93,6 +93,25 @@ OUTPUT SHAPE RULES (VERY IMPORTANT):
   * If comparing across different seasons, include a `season` column as a string literal.
   * The radar labels will automatically combine player_name + season when season is present.
 - For ShotChart, always select: `loc_x, loc_y, shot_made_flag` from `court_shots`.
+- For Scatter (scatter plot, "X vs Y", or single-axis distribution):
+  * The data must be ONE ROW PER PLAYER (deduplicate with DISTINCT ON when needed).
+  * For two-axis scatter (e.g. "TS% vs PPG", "PPG vs age"): SELECT exactly three columns aliased as
+    `player_name`, `x_value`, `y_value`. No other columns.
+  * For single-axis distribution (e.g. "scatter of TS% in 2018-19"): SELECT exactly two columns
+    aliased as `player_name` and `y_value`. No `x_value` column at all.
+  * x_value and y_value MUST be numeric. For text-storage families (nba_advanced_*, nba_clutch_*,
+    nba_hustle_*, nba_player_tracking_pt_*, nba_lineups_*, team_advanced_*, nba_standings_*),
+    cast with `CAST(NULLIF("COL", '') AS numeric)`. For the `all_players_*` and `player_game_logs`
+    tables, raw column references work directly.
+  * Apply a meaningful sample filter so noise dots do not dominate:
+      `WHERE gp >= 20` for `all_players_*`, or
+      `WHERE CAST(NULLIF("GP", '') AS numeric) >= 20` for text-storage families.
+  * Add `LIMIT 500` — scatter readability collapses past that.
+  * NEVER use GROUP BY across (player, season) for Scatter unless explicitly aggregating
+    career totals across multiple season tables (UNION ALL pattern, then SUM and GROUP BY player_name).
+  * If x and y are stored in different tables, JOIN on player_name (case-insensitive ILIKE if needed).
+  * statDisplayName, xAxisLabel, and yAxisLabel are REQUIRED in chartConfig for Scatter so the chart
+    renders human-readable axes. For single-axis, set xAxisLabel to "" (empty string).
 """
 
 
@@ -102,7 +121,7 @@ def build_system_prompt() -> str:
 
 Return JSON with this structure:
 {{
-  "chartType": "Leaderboard|CategoricalBreakdown|CompareCategoricalBreakdown|SinglePlayerStat|CompareStats|ShotChart",
+  "chartType": "Leaderboard|CategoricalBreakdown|CompareCategoricalBreakdown|SinglePlayerStat|CompareStats|ShotChart|Scatter",
   "sqlQuery": "SELECT ...",
   "chartConfig": {{
       "statKey": "stat_value",
@@ -241,6 +260,34 @@ EXAMPLES:
    - SQL: "SELECT loc_x, loc_y, shot_made_flag FROM court_shots WHERE player_name ILIKE '%Stephen%Curry%'"
    - Config: {{ "playerNames": ["Stephen Curry"], "statDisplayName": "Shot Frequency", "mode": "volume" }}
 
+24. **"Scatter plot of points per game vs age this season"** (Scatter — two numeric axes, single table)
+   - Type: "Scatter"
+   - SQL: "SELECT player_name, age AS x_value, pts AS y_value FROM all_players_regular_2024_2025 WHERE gp >= 20 LIMIT 500"
+   - Config: {{ "statDisplayName": "PPG vs Age", "xAxisLabel": "Age", "yAxisLabel": "Points Per Game" }}
+
+25. **"Scatter of true shooting percentage vs PPG for 2023-24"** (Scatter — cross-table JOIN with text-storage cast)
+   - Type: "Scatter"
+   - SQL: "SELECT a.player_name, a.pts AS x_value, CAST(NULLIF(b.\\"TS_PCT\\", '') AS numeric) AS y_value FROM all_players_regular_2023_2024 a JOIN nba_advanced_season_2023_24_season_type_regular_season_per b ON a.player_name = b.\\"PLAYER_NAME\\" WHERE a.gp >= 20 LIMIT 500"
+   - Config: {{ "statDisplayName": "TS% vs PPG", "xAxisLabel": "Points Per Game", "yAxisLabel": "True Shooting %" }}
+
+26. **"Show me a scatter of true shooting percentages in 2018-19"** (Scatter — single-axis distribution, text-storage table)
+   - Type: "Scatter"
+   - SQL: "SELECT \\"PLAYER_NAME\\" AS player_name, CAST(NULLIF(\\"TS_PCT\\", '') AS numeric) AS y_value FROM nba_advanced_season_2018_19_season_type_regular_season_per WHERE CAST(NULLIF(\\"GP\\", '') AS numeric) >= 20 LIMIT 500"
+   - Config: {{ "statDisplayName": "TS% Distribution 2018-19", "xAxisLabel": "", "yAxisLabel": "True Shooting %" }}
+   - NOTE: When the user only mentions ONE stat (no "vs"), produce single-axis scatter — SELECT only player_name and y_value, set xAxisLabel="".
+
+27. **"Plot rebounds per game vs assists per game in 2022-23 playoffs"** (Scatter — two-axis, playoffs table)
+   - Type: "Scatter"
+   - SQL: "SELECT player_name, ast AS x_value, reb AS y_value FROM all_players_playoffs_2022_2023 WHERE gp >= 5 LIMIT 500"
+   - Config: {{ "statDisplayName": "REB vs AST (2022-23 Playoffs)", "xAxisLabel": "Assists Per Game", "yAxisLabel": "Rebounds Per Game" }}
+   - NOTE: For playoff scatters, drop the gp threshold to 5 since playoff samples are small.
+
+28. **"Scatter of usage rate vs PER for 2023-24"** (Scatter — both axes from text-storage table)
+   - Type: "Scatter"
+   - SQL: "SELECT \\"PLAYER_NAME\\" AS player_name, CAST(NULLIF(\\"USG_PCT\\", '') AS numeric) AS x_value, CAST(NULLIF(\\"PIE\\", '') AS numeric) AS y_value FROM nba_advanced_season_2023_24_season_type_regular_season_per WHERE CAST(NULLIF(\\"GP\\", '') AS numeric) >= 20 LIMIT 500"
+   - Config: {{ "statDisplayName": "PIE vs Usage Rate", "xAxisLabel": "Usage Rate", "yAxisLabel": "PIE (PER equivalent)" }}
+   - NOTE: When the user asks for "PER", we substitute "PIE" (the closest equivalent in our schema). Reflect that in yAxisLabel.
+
 CRITICAL RULES FOR RADAR CHARTS:
 - ALWAYS include `player_name` in your SELECT — even for single player radars. Without it, multi-player comparisons break.
 - When comparing players from DIFFERENT seasons, use UNION ALL across different season tables and include a `season` string literal column.
@@ -253,6 +300,16 @@ CRITICAL RULES FOR LEADERBOARDS:
 - ALWAYS deduplicate with DISTINCT ON (player_name) ordered by gp DESC inside a subquery.
 - The outer query then sorts by stat_value DESC and applies the LIMIT.
 - This prevents traded players from appearing multiple times.
+
+CRITICAL RULES FOR SCATTER CHARTS:
+- The output column aliases MUST BE EXACTLY `player_name`, `x_value`, `y_value` (or `player_name` and `y_value` for single-axis). No other column names. No extras like `season`, `team_abbreviation`, or `rank`.
+- Both axes must be NUMERIC. For text-storage families, wrap with CAST(NULLIF("COL", '') AS numeric). For numeric-typed tables (all_players_*, player_game_logs), use the raw column.
+- Always include a sample-size filter: `gp >= 20` (regular) or `gp >= 5` (playoffs) for numeric tables, or the casted equivalent for text-storage tables.
+- Always include `LIMIT 500`.
+- DEDUPLICATE traded players. If a single-table query, wrap the FROM clause in `(SELECT DISTINCT ON (player_name) ... ORDER BY player_name, gp DESC)` so each player appears at most once.
+- For cross-table JOINs (e.g. all_players_regular_* JOIN nba_advanced_*), join on `a.player_name = b."PLAYER_NAME"` and dedupe BEFORE the join if either side has duplicates.
+- Do NOT use ORDER BY for scatter — order doesn't matter visually.
+- The user's question determines axis labels. "X vs Y" → x_value = X, y_value = Y. "Scatter of Y" alone → single-axis, only y_value.
 """
 
 # Max values for normalizing player stats to 0-100 scale
@@ -389,6 +446,7 @@ ALLOWED_CHART_TYPES = {
     "SinglePlayerStat",
     "CompareStats",
     "ShotChart",
+    "Scatter",
 }
 
 RADAR_KEYS = {"PTS", "AST", "REB", "STL", "BLK"}
@@ -397,16 +455,56 @@ RADAR_KEYS = {"PTS", "AST", "REB", "STL", "BLK"}
 def _extract_names_heuristic(q: str) -> List[str]:
     # Strip possessives so "LeBron's" doesn't truncate the next word.
     cleaned_q = re.sub(r"['\u2019]s\b", "", q)
+    # Strip leading verb phrases like "Compare", "Show me", "Plot", "Tell me"
+    # at the START of the question so they don't get glued to a real player name
+    # (e.g. "Compare LeBron and KD" must extract "LeBron" not "Compare LeBron").
+    # We do this only at sentence start to avoid mangling mid-sentence content.
+    cleaned_q = re.sub(
+        r"^\s*(?:please\s+)?"
+        r"(?:can\s+you\s+|could\s+you\s+|would\s+you\s+)?"
+        r"(?:please\s+)?"
+        r"(?:show\s+me|show|tell\s+me|tell|give\s+me|give|"
+        r"compare|plot|graph|chart|display|find|fetch|get|pull\s+up|pull|"
+        r"how\s+(?:has|did|does|do)|how\s+many|how\s+much|"
+        r"who(?:'s|\s+is|\s+was|\s+are|\s+were|\s+had)?|"
+        r"what(?:'s|\s+is|\s+are|\s+were|\s+was)?|"
+        r"where\s+(?:is|are|was|were|does|do|did)?|"
+        r"when\s+(?:is|are|was|were|does|do|did)?|"
+        r"which|let\s+me\s+see|i\s+want\s+to\s+see)\b",
+        "",
+        cleaned_q,
+        flags=re.IGNORECASE,
+    )
     # Allow internal capitals (LeBron, McGrady, DeRozan, O'Neal etc.).
     name_token = r"[A-Z][A-Za-z][A-Za-z\-']*"
     candidates = re.findall(rf"\b{name_token}(?:\s+{name_token}){{0,2}}\b", cleaned_q)
-    blacklist = {"Top", "Show", "Compare", "Vs", "Versus", "Skill", "Profile", "Points",
-                 "Assists", "Rebounds", "Playoffs", "Regular", "Season", "Last", "Games",
-                 "Trend", "Leaderboard", "Heat", "Shot", "Chart", "Map", "Best", "Worst",
-                 "Shooting", "Zones", "Selection",
-                 # Common verbs / question-words at sentence start.
-                 "Tell", "Give", "Make", "Create", "Build", "Find",
-                 "When", "Where", "Why", "How", "What", "Who"}
+    blacklist = {
+        "Top", "Show", "Compare", "Vs", "Versus", "Skill", "Profile", "Points",
+        "Assists", "Rebounds", "Playoffs", "Regular", "Season", "Last", "Games",
+        "Trend", "Leaderboard", "Heat", "Shot", "Chart", "Map", "Best", "Worst",
+        "Shooting", "Zones", "Selection",
+        # Common verbs / question-words at sentence start.
+        "Tell", "Give", "Make", "Create", "Build", "Find",
+        "When", "Where", "Why", "How", "What", "Who",
+        # Acronyms / stat tokens that look like names but aren't
+        "PPG", "RPG", "APG", "SPG", "BPG", "MPG",
+        "FG", "FGM", "FGA", "FT", "FTM", "FTA",
+        "TS", "EFG", "USG", "PER", "PIE", "VORP", "BPM",
+        "PTS", "REB", "AST", "STL", "BLK", "TOV",
+        "NBA", "MVP", "DPOY", "ROY",
+        # Months (so "March 2024" doesn't become a "name")
+        "January", "February", "March", "April", "May", "June",
+        "July", "August", "September", "October", "November", "December",
+        # NBA team mascots — so "vs the Celtics" doesn't extract "Celtics" as a player.
+        "Hawks", "Celtics", "Nets", "Hornets", "Bulls", "Cavaliers", "Cavs",
+        "Mavericks", "Mavs", "Nuggets", "Pistons", "Warriors", "Rockets",
+        "Pacers", "Clippers", "Lakers", "Grizzlies", "Heat", "Bucks",
+        "Timberwolves", "Wolves", "Pelicans", "Knicks", "Thunder",
+        "Magic", "Sixers", "Suns", "Blazers", "Trail", "Kings",
+        "Spurs", "Raptors", "Jazz", "Wizards",
+        # Other noise tokens
+        "Plot", "Graph", "Distribution", "Scatter",
+    }
     out = []
     seen = set()
     for c in candidates:
@@ -424,26 +522,78 @@ def _intent_hint(user_question: str) -> Dict[str, Any]:
     q = user_question.lower()
     hint: Dict[str, Any] = {}
 
-    # Check shot chart FIRST
-    is_shotchart = any(w in q for w in [
+    # ─────────────────────────────────────────────────────────────────────
+    # ShotChart detection — broadened to cover natural language users actually type.
+    # Previously missed: "hot zones", "cold zones", "shooting locations",
+    # "shooting areas", "shooting spots", "where does X shoot/score from",
+    # "where is X most accurate", "where can't X shoot", "most efficient
+    # shooting areas", "best/worst spots".
+    # ─────────────────────────────────────────────────────────────────────
+    _shotchart_phrases = [
         "heat map", "heatmap", "shot chart", "shot selection", "shot map",
-        "shooting zones", "shot locations", "shot frequency",
-        "shooting percentages", "shooting accuracy"
-    ])
+        "shooting zones", "shooting zone", "shooting locations", "shooting location",
+        "shooting areas", "shooting area", "shooting spots", "shooting spot",
+        "shot locations", "shot location", "shot frequency", "shooting percentages",
+        "shooting accuracy", "shooting %", "shooting heatmap", "shot heatmap",
+        "hot zones", "hot zone", "hotzone", "cold zones", "cold zone", "coldzone",
+        "hot spot", "hotspot", "cold spot", "coldspot",
+        "best shooting", "worst shooting",
+        "money spot", "where can he shoot", "where can she shoot",
+        "where can't", "where cant",
+    ]
+    is_shotchart = any(p in q for p in _shotchart_phrases)
+
+    # "where does X shoot/score from" / "where can X shoot" — strong shotchart signal.
+    # Also handles "where X can't shoot" with a subject between "where" and the verb.
+    if not is_shotchart and re.search(
+        r"\bwhere\s+(?:\w+\s+)?(?:does|do|is|are|can|can't|cant|cannot)\b", q
+    ):
+        if any(w in q for w in (
+            "shoot", "shooting", "score", "scoring", "best", "worst",
+            "accurate", "efficient", "most", "least"
+        )):
+            is_shotchart = True
+
+    # "most efficient shooting" / "most accurate" → shotchart accuracy mode
+    if not is_shotchart and any(w in q for w in ("efficient shooting", "most accurate", "least accurate")):
+        is_shotchart = True
+
+    # Defer to scatter if the user explicitly said scatter — so
+    # "scatter of shooting percentages" doesn't get hijacked by ShotChart.
+    if is_shotchart and any(w in q for w in ("scatter", "scatterplot", "scatter plot", "distribution")):
+        is_shotchart = False
+
+    # If the user named 2+ players, "shooting percentages" is a player-vs-player
+    # comparison, not a shot map. We require multi-word names ("LeBron James")
+    # because single-token candidates may be artifacts of split possessives like
+    # "Shaquille O'Neal" → ["Shaquille", "Neal"].
+    def _multi_word_player_count(question: str) -> int:
+        return sum(1 for n in _extract_names_heuristic(question) if " " in n.strip())
+
+    if is_shotchart and _multi_word_player_count(user_question) >= 2:
+        is_shotchart = False
+
+    # Compare/comparison of shot stats with two players → CompareStats, not ShotChart.
+    if is_shotchart and ("compare" in q or " versus " in q):
+        if _multi_word_player_count(user_question) >= 2:
+            is_shotchart = False
 
     if is_shotchart:
         hint["suspectedCompare"] = False
         hint["suspectedLeaderboard"] = False
         hint["suspectedProfile"] = False
         hint["suspectedShotChart"] = True
+        hint["suspectedScatter"] = False
         hint["suspectedGameLog"] = False
         hint["preferredChartType"] = "ShotChart"
 
-        if any(w in q for w in ["best ", "hot spot", "hotspot", "money spot", "most efficient"]):
+        # Mode detection — order matters: hot/cold spot wins over generic "best/worst",
+        # accuracy wins over volume.
+        if any(w in q for w in ["hot spot", "hotspot", "hot zone", "hotzone", "money spot", "best shooting", "best zone"]):
             hint["suggestedMode"] = "hotspots"
-        elif any(w in q for w in ["worst ", "cold spot", "coldspot", "struggle", "inefficient"]):
+        elif any(w in q for w in ["cold spot", "coldspot", "cold zone", "coldzone", "worst shooting", "worst zone", "struggle", "where can't", "where cant", "least accurate", "inefficient"]):
             hint["suggestedMode"] = "coldspots"
-        elif any(w in q for w in ["percentage", "accuracy", "efficient", "efficiency", "shooting %"]):
+        elif any(w in q for w in ["percentage", "accuracy", "accurate", "efficient", "efficiency", "shooting %"]):
             hint["suggestedMode"] = "accuracy"
         else:
             hint["suggestedMode"] = "volume"
@@ -453,15 +603,112 @@ def _intent_hint(user_question: str) -> Dict[str, Any]:
 
     # Not a shot chart
     is_profile = any(w in q for w in ["skill profile", "profile", "radar", "breakdown", "categories", "categorical"])
-    # Catch bare " v ", "vs"-at-sentence-start, year-vs-year, and "year to year"
-    # in addition to the explicit "compare", " vs ", " versus ".
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Scatter detection — runs BEFORE compare so "TS% vs PPG" doesn't get
+    # routed to CompareStats. Triggers:
+    #   1) explicit scatter/scatterplot/plot/distribution keywords
+    #   2) "X vs Y" / "X against Y" between stat words (not player names)
+    #   3) "X and Y across all players" type framing
+    # ─────────────────────────────────────────────────────────────────────
+    _SCATTER_TRIGGER_WORDS = (
+        "scatter", "scatter plot", "scatterplot",
+        "plot ", "distribution",
+    )
+    _STAT_WORDS = (
+        "ppg", "points per game", "rpg", "rebounds per game",
+        "apg", "assists per game", "spg", "steals per game", "bpg", "blocks per game",
+        "true shooting", "ts%", "ts pct", "ts_pct", "efg", "efg%",
+        "usage rate", "usg%", "usg_pct", "off rating", "def rating", "net rating",
+        "per", "pie", "win shares", "ws", "vorp", "bpm",
+        "age", "minutes", "min ", "mpg",
+        "fg%", "fg_pct", "field goal", "3pt%", "fg3_pct", "three point", "3-point",
+        "fta", "fga", "fgm", "fg3m", "fg3a",
+        "drives", "deflections", "rebounds", "assists",
+        "points", "blocks", "steals", "turnovers",
+        "salary",
+    )
+    _CROSS_LEAGUE_PHRASES = (
+        "across all players", "across players", "for all players",
+        "for every player", "across the league", "all players in",
+    )
+
+    def _has_compare_verb_with_stats(question_lower: str) -> bool:
+        """'compare X and Y' or 'compare X vs Y' where X, Y are stat words."""
+        if "compare" not in question_lower:
+            return False
+        names = _extract_names_heuristic(user_question)
+        # If we found 2+ player names, it's a player comparison, not scatter.
+        if len(names) >= 2:
+            return False
+        # No real player names + 2+ stat tokens + "across players" framing → scatter
+        stat_hits = sum(1 for s in _STAT_WORDS if s in question_lower)
+        if stat_hits >= 2 and any(p in question_lower for p in _CROSS_LEAGUE_PHRASES):
+            return True
+        return False
+
+    def _looks_like_scatter(question_lower: str) -> bool:
+        # 1) Explicit keyword
+        if any(w in question_lower for w in _SCATTER_TRIGGER_WORDS):
+            return True
+        # 2) "graph X against Y" — colloquial scatter
+        if "graph " in question_lower and (" against " in question_lower or " vs " in question_lower):
+            return True
+        # 3) "X vs/against Y" with stat words on both sides (no players)
+        names = _extract_names_heuristic(user_question)
+        has_vs = (" vs " in question_lower or " versus " in question_lower
+                  or " against " in question_lower)
+        if has_vs and len(names) <= 1:
+            stat_hits = sum(1 for s in _STAT_WORDS if s in question_lower)
+            if stat_hits >= 2:
+                return True
+        # 4) "compare X and Y across all players" — stat-comparison framing
+        if _has_compare_verb_with_stats(question_lower):
+            return True
+        return False
+
+    is_scatter = _looks_like_scatter(q)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Trend detection — must run BEFORE compare detection because "from 2010
+    # to 2023" looks like a year-vs-year compare otherwise. Also gates the
+    # year-range regex so it only fires for real comparisons.
+    # ─────────────────────────────────────────────────────────────────────
+    _TREND_KEYWORDS = (
+        "trend", "track", "over time", "over the years", "over his career",
+        "over her career", "across seasons", "by season", "per season",
+        "by year", "per year", "season-over-season", "season over season",
+        "evolved", "evolution", "progression", "changed", "changing",
+        "improved", "improvement", "history of",
+    )
+    is_trend = any(w in q for w in _TREND_KEYWORDS)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Compare detection — broadened to handle "compare X" at sentence start
+    # (previously only matched " compare " with leading space). Year-range
+    # patterns like "2015 vs 2023" only fire when they are NOT trends.
+    # ─────────────────────────────────────────────────────────────────────
     is_compare = (
-        any(w in q for w in [" compare ", " vs ", " versus ", " v "])
+        " compare " in q
+        or q.startswith("compare ")
+        or " vs " in q
+        or " versus " in q
+        or " v " in q
         or " vs." in q
         or q.startswith("vs ")
-        or bool(re.search(r"\b(19\d{2}|20\d{2})\b.*\bvs\b.*\b(19\d{2}|20\d{2})\b", q))
-        or bool(re.search(r"\b(19\d{2}|20\d{2})\b\s+to\s+\b(19\d{2}|20\d{2})\b", q))
     )
+    # Year-vs-year and year-to-year only count as "compare" when the user is
+    # NOT asking for a trend. "from 2010 to 2023" = trend; "Curry 2015 vs 2023" = compare.
+    if not is_trend:
+        if re.search(r"\b(19\d{2}|20\d{2})\b.*\bvs\b.*\b(19\d{2}|20\d{2})\b", q):
+            is_compare = True
+        if re.search(r"\b(19\d{2}|20\d{2})\b\s+to\s+\b(19\d{2}|20\d{2})\b", q):
+            is_compare = True
+
+    # Scatter takes precedence over compare when triggered.
+    if is_scatter:
+        is_compare = False
+        is_profile = False
 
     # Same-player-two-seasons radar pattern: heuristic finds only one unique
     # name when the player is repeated. Treat it as a comparison if profile-y
@@ -474,21 +721,39 @@ def _intent_hint(user_question: str) -> Dict[str, Any]:
     if repeated_name_radar:
         is_compare = True
 
-    is_leaderboard = any(w in q for w in ["top ", "leaders", "leaderboard", "most ", "rank"])
+    # ─────────────────────────────────────────────────────────────────────
+    # Leaderboard detection — broadened with natural phrasings users try.
+    # Previously missed: "who leads", "highest", "greatest", "scoring players".
+    # ─────────────────────────────────────────────────────────────────────
+    _LEADERBOARD_KEYWORDS = (
+        "top ", "top-", "leaders ", "league leaders", "leaderboard",
+        "most ", "highest", "greatest", "rank", "ranked",
+        "who leads", "who led", "who's leading", "who is leading",
+        "best ",
+        "scoring leader", "scoring leaders", "scoring players",
+    )
+    is_leaderboard = any(w in q for w in _LEADERBOARD_KEYWORDS)
+    # "show me the X scoring/rebounding/assist players" → leaderboard
+    if re.search(r"\b(highest|top|best|greatest|leading)\s+\w*\s*(scoring|rebounding|assist|defensive|shooting)\s+players?\b", q):
+        is_leaderboard = True
+    # If a profile/radar is being asked for, "best" is descriptive, not a leaderboard.
+    if is_profile:
+        is_leaderboard = False
+
     is_recent = any(w in q for w in [
         "last ", "past ", "recent", "game log", "gamelog",
         "playoffs", "march", "april", "january", "february",
         "december", "november", "october"
     ])
 
-    # Detect multi-player trend (2+ names + "trend" or year range)
+    # Detect multi-player trend (2+ names + trend marker)
+    # IMPORTANT: bare "from "/" to " no longer counts — that fires on
+    # single-player trends too. Require an actual trend keyword.
     guessed_names = _extract_names_heuristic(user_question)[:4]
-    is_multi_player_trend = len(guessed_names) >= 2 and any(w in q for w in ["trend", "from ", " to "])
-
-    if not is_profile and any(w in q for w in ["best "]):
-        is_leaderboard = True
+    is_multi_player_trend = len(guessed_names) >= 2 and is_trend
 
     if any(w in q for w in ["against ", "vs the"]):
+        # "vs the Celtics" is a matchup question, handled elsewhere as a game log.
         if is_recent or "game" in q:
             pass
         else:
@@ -498,9 +763,13 @@ def _intent_hint(user_question: str) -> Dict[str, Any]:
     hint["suspectedLeaderboard"] = is_leaderboard
     hint["suspectedProfile"] = is_profile
     hint["suspectedShotChart"] = False
+    hint["suspectedScatter"] = is_scatter
     hint["suspectedGameLog"] = is_recent
+    hint["suspectedTrend"] = is_trend
 
-    if is_profile and is_compare:
+    if is_scatter:
+        hint["preferredChartType"] = "Scatter"
+    elif is_profile and is_compare:
         hint["preferredChartType"] = "CompareCategoricalBreakdown"
     elif is_profile:
         hint["preferredChartType"] = "CategoricalBreakdown"
@@ -551,6 +820,36 @@ def _validate_and_autofix(chart_type: str, raw_data: List[Dict], chart_config: D
         if "loc_x" in cols and "loc_y" in cols and "shot_made_flag" in cols:
             return True, chart_type, "ok"
         return False, chart_type, "ShotChart requires loc_x, loc_y, shot_made_flag columns"
+
+    # Scatter validation (two-axis or single-axis)
+    if chart_type == "Scatter":
+        has_player = ("player_name" in cols) or ("full_name" in cols)
+        has_y = "y_value" in cols
+        has_x = "x_value" in cols
+        if not has_player:
+            return False, chart_type, "Scatter requires 'player_name' (or 'full_name')"
+        if not has_y:
+            return False, chart_type, "Scatter requires 'y_value' column"
+        # Numeric sanity check on a sample of rows. We accept ints, floats, numeric strings.
+        def _is_numericish(v):
+            if v is None:
+                return True  # nulls allowed; renderer drops them
+            if isinstance(v, (int, float)):
+                return True
+            try:
+                float(str(v).strip())
+                return True
+            except (ValueError, TypeError):
+                return False
+        sample = raw_data[:50]
+        if not all(_is_numericish(r.get("y_value")) for r in sample):
+            return False, chart_type, "Scatter y_value must be numeric — add CAST(NULLIF(\"COL\", '') AS numeric) for text-storage tables"
+        if has_x and not all(_is_numericish(r.get("x_value")) for r in sample):
+            return False, chart_type, "Scatter x_value must be numeric — add CAST(NULLIF(\"COL\", '') AS numeric) for text-storage tables"
+        # Hard cap to keep the chart readable
+        if len(raw_data) > 1000:
+            return False, chart_type, f"Scatter returned {len(raw_data)} rows — add a tighter sample filter (e.g. WHERE gp >= 20) and LIMIT 500"
+        return True, chart_type, "ok"
 
     # Auto-detect shot chart data
     if "loc_x" in cols and "loc_y" in cols and "shot_made_flag" in cols:
@@ -626,6 +925,7 @@ def _call_gpt_for_interpretation(user_question: str, hint: Dict[str, Any], repai
 - suspectedLeaderboard: {hint.get('suspectedLeaderboard')}
 - suspectedProfile: {hint.get('suspectedProfile')}
 - suspectedShotChart: {hint.get('suspectedShotChart')}
+- suspectedScatter: {hint.get('suspectedScatter')}
 - suggestedMode: {hint.get('suggestedMode', 'N/A')}
 - guessedNames: {hint.get('guessedNames')}
 
@@ -703,6 +1003,12 @@ def interpret_question(user_question: str) -> Dict[str, Any]:
                 "the chartType MUST be 'CompareCategoricalBreakdown' and the SQL MUST use the "
                 "UNION ALL pattern from examples 15, 15b, 15c, and 15d — one branch per (player, season) "
                 "with a string-literal `season` column and DISTINCT ON (player_name) inside each branch.\n\n"
+                "If the user asked for a 'scatter' / 'scatter plot' / 'plot X vs Y' / 'distribution', "
+                "the chartType MUST be 'Scatter'. The SQL MUST output exactly `player_name`, `x_value`, "
+                "`y_value` (or just `player_name`, `y_value` for single-axis distributions). "
+                "Both axes must be numeric — wrap text-storage columns with CAST(NULLIF(\"COL\", '') AS numeric). "
+                "Apply WHERE gp >= 20 (or the casted equivalent) and LIMIT 500. "
+                "Use examples 24, 25, 26, 27, and 28 as the templates.\n\n"
                 "Do NOT return explanations, only JSON."
             )
             interpretation = _call_gpt_for_interpretation(user_question, hint, repair_message=repair_msg)

@@ -686,6 +686,94 @@ def _player_where_clause_for_names(player_names: list[str]) -> str:
     return " OR ".join(clauses)
 
 
+def _extract_per_player_year_spans(user_input: str, named_players: list[str]) -> dict:
+    """For comparison questions where each player has a different year attached
+    ("Compare LeBron 2012 and Durant 2015"), return a dict mapping player name
+    to (start_year, end_year, is_playoffs).
+
+    Returns an empty dict when:
+      - There aren't multiple named players.
+      - The question uses a shared range (e.g. "from 2018 to 2024") rather than
+        per-player years.
+      - We can't find at least 2 distinct year mentions.
+
+    Heuristic: walk the question, find each player-name occurrence, and pair
+    it with the closest year/season-label that follows the name (within the
+    same span before the next player). The 'between' or 'shared range'
+    keyword guards prevent us from misclaiming "from 2018 to 2024" as a per-
+    player split.
+    """
+    if not named_players or len(named_players) < 2:
+        return {}
+
+    q = _extract_current_question_text(user_input)
+    if not q:
+        return {}
+    ql = q.lower()
+
+    # Bail out for shared-range phrasings — those are NOT per-player.
+    if re.search(r"\bfrom\s+(19\d{2}|20\d{2})\b.+?\bto\s+(19\d{2}|20\d{2})\b", ql):
+        return {}
+    if re.search(r"\b(19\d{2}|20\d{2})(?:\s+season)?\s*(?:to|through|thru|-)\s*(19\d{2}|20\d{2})\b", ql):
+        return {}
+
+    # Build a list of (position, kind, value) markers for player names + years.
+    markers: list[tuple[int, str, object]] = []
+
+    # Player name positions (case-insensitive). For each named player, find
+    # the FIRST occurrence in the question. We check the full name, then
+    # surname, then first name as fallbacks — users often drop one.
+    for player in named_players:
+        plower = player.lower()
+        idx = ql.find(plower)
+        if idx == -1:
+            parts = plower.split()
+            # Try surname first (more distinctive)
+            if len(parts) >= 2:
+                idx = ql.find(parts[-1])
+            # Then first name
+            if idx == -1 and parts:
+                idx = ql.find(parts[0])
+        if idx != -1:
+            markers.append((idx, "player", player))
+
+    # Year markers: 4-digit years AND season-label patterns YYYY-YY
+    for m in re.finditer(r"\b(19\d{2}|20\d{2})\s*[-/]\s*(\d{2})\b", ql):
+        markers.append((m.start(), "season_label", (int(m.group(1)),)))
+    for m in re.finditer(r"\b(19\d{2}|20\d{2})\b", ql):
+        # Skip year tokens already inside a season-label match
+        already_in_label = any(
+            kind == "season_label" and pos <= m.start() <= pos + 7
+            for pos, kind, _ in markers
+        )
+        if not already_in_label:
+            markers.append((m.start(), "year", int(m.group(1))))
+
+    if not markers:
+        return {}
+    markers.sort(key=lambda x: x[0])
+
+    # Walk markers — assign year to most recent player seen.
+    is_playoffs = ("playoff" in ql) or ("postseason" in ql)
+    spans: dict[str, tuple[int, int, bool]] = {}
+    current_player: str | None = None
+    for _, kind, value in markers:
+        if kind == "player":
+            current_player = value  # type: ignore[assignment]
+        elif kind in ("year", "season_label") and current_player is not None:
+            year = value if kind == "year" else value[0]  # type: ignore[index]
+            # Only set if this player doesn't already have a year — first
+            # year mentioned after the name wins.
+            if current_player not in spans:
+                spans[current_player] = (year, year, is_playoffs)
+
+    # Require at least 2 of the named players to have distinct years.
+    distinct_years = {s[0] for s in spans.values()}
+    if len(spans) < 2 or len(distinct_years) < 2:
+        return {}
+    return spans
+
+
 def _extract_requested_season_start_span(user_input: str):
     q = _extract_current_question_text(user_input).lower()
     is_playoffs = ("playoff" in q) or ("postseason" in q)
@@ -1080,8 +1168,23 @@ def _rewrite_career_aggregate_to_by_season(sql_query: str, user_input: str, conn
 
     named_players = _extract_named_players(user_input, q, conn=conn)
     requested_span = _extract_requested_season_start_span(user_input)
+
+    # Per-player year override: e.g. "Compare LeBron 2012 and Durant 2015"
+    # produces {"LeBron James": (2012, 2012, False), "Kevin Durant": (2015, 2015, False)}
+    # When present, each player gets their OWN year inside the loop below
+    # instead of all sharing requested_span.
+    per_player_spans = _extract_per_player_year_spans(user_input, named_players)
+    if per_player_spans:
+        logger.debug(
+            "rewriter:career_aggregate using per-player year spans: %s",
+            per_player_spans,
+        )
+
     asks_full_row_player_slice = bool(named_players) and (
-        requested_span is not None or nth_request is not None or rookie_year_request
+        requested_span is not None
+        or per_player_spans
+        or nth_request is not None
+        or rookie_year_request
     )
     if not asks_over_time and not asks_full_row_player_slice:
         logger.debug(
@@ -1134,6 +1237,12 @@ def _rewrite_career_aggregate_to_by_season(sql_query: str, user_input: str, conn
             if not player_where:
                 continue
 
+            # Resolve the year-window for THIS player. Per-player spans (from
+            # questions like "LeBron 2012 vs Durant 2015") win over the shared
+            # requested_span. This is critical so each leg queries the right
+            # season table — not collapsing both players into one year.
+            effective_span = per_player_spans.get(player_name, requested_span) if per_player_spans else requested_span
+
             season_starts: list[int] = []
             if nth_request is not None and conn is not None:
                 first_start = _first_season_start_for_where(conn, table_type, player_where, available_starts)
@@ -1144,8 +1253,8 @@ def _rewrite_career_aggregate_to_by_season(sql_query: str, user_input: str, conn
             elif rookie_year_request and conn is not None:
                 first_start = _first_season_start_for_where(conn, table_type, player_where, available_starts)
                 if first_start is not None:
-                    if requested_span is not None:
-                        _, end_year, span_playoffs = requested_span
+                    if effective_span is not None:
+                        _, end_year, span_playoffs = effective_span
                         table_type = "playoffs" if span_playoffs else table_type
                         season_starts = [
                             season_start
@@ -1154,8 +1263,8 @@ def _rewrite_career_aggregate_to_by_season(sql_query: str, user_input: str, conn
                         ]
                     else:
                         season_starts = [first_start]
-            elif requested_span is not None:
-                start_year, end_year, span_playoffs = requested_span
+            elif effective_span is not None:
+                start_year, end_year, span_playoffs = effective_span
                 table_type = "playoffs" if span_playoffs else table_type
                 season_starts = [
                     season_start

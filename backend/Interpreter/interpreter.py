@@ -52,27 +52,14 @@ def _is_single_player_profile_request(user_input: str) -> bool:
     has_exclusions = any(
         k in q
         for k in [
-            "top ",
-            "best ",
-            "highest",
-            "most ",
-            "leading ",
-            "compare",
-            "versus",
-            " vs ",
-            "between",
-            "leaderboard",
-            "by season",
-            "per season",
-            "trend",
-            "over time",
-            "over the years",
-            "through the years",
-            "decade",
-            "rookie year",
-            "from ",
-            " to ",
-            "career",
+            "top ", "best ", "highest", "most ", "leading ",
+            "compare", "versus", " vs ", "between",
+            "leaderboard", "by season", "per season",
+            "trend", "over time", "over the years", "through the years",
+            "decade", "rookie year", "from ", " to ", "career",
+            "better", "worse", "as well as", " or ",
+            "who was", "who is", "who's", "of the two",
+            "follow-up constraint",   # set by main.py when continuing a comparison
         ]
     )
     return has_profile_intent and not has_exclusions
@@ -1418,6 +1405,26 @@ def _ensure_season_columns_in_sql(sql_query: str) -> str:
     return leg_pattern.sub(_rewrite_leg, q)
 
 
+def _sql_touches_text_storage_family(sql_query: str) -> bool:
+    """True if the SQL references any of the families where columns are stored as TEXT.
+
+    Those tables need ORDER BY + NULLIF/::numeric casts to be functional, so the
+    raw-data-only enforcer must not strip ORDER BY or block casts for them.
+    """
+    if not sql_query:
+        return False
+    q = sql_query.lower()
+    return any(fam in q for fam in (
+        "nba_advanced_",
+        "nba_clutch_",
+        "nba_hustle_",
+        "nba_player_tracking_pt_",
+        "nba_lineups_",
+        "team_advanced_",
+        "nba_standings_",
+    ))
+
+
 def _enforce_raw_data_only_sql(sql_query: str) -> str:
     """
     Enforce raw-data SQL:
@@ -1433,6 +1440,12 @@ def _enforce_raw_data_only_sql(sql_query: str) -> str:
         return q.rstrip(";") + ";"
 
     q = q.rstrip(";")
+
+    # Text-storage families REQUIRE ORDER BY + casts to be functional. Skip the
+    # raw-data scrubbing entirely and let the original SQL pass through.
+    if _sql_touches_text_storage_family(q):
+        q = re.sub(r"\s+", " ", q).strip()
+        return q + ";"
 
     if not re.search(r"(?i)\w+_rank\b", q):
         q = re.sub(r"(?is)\border\s+by\b.*?(?=(\blimit\b|$))", " ", q)
@@ -1478,6 +1491,35 @@ def _enforce_raw_data_only_sql(sql_query: str) -> str:
 
 # 5.5 repair SQL error
 def repair_sql_error(original_sql, error_message, schema_description, user_input):
+    # Detect whether the failing SQL touched a TEXT-stored family. If so, the
+    # repair MUST be allowed to use casts — the columns are physically text and
+    # any numeric WHERE/ORDER BY needs an explicit cast.
+    text_storage_families = (
+        "nba_advanced_", "nba_clutch_", "nba_hustle_",
+        "nba_player_tracking_pt_", "nba_lineups_",
+        "team_advanced_", "nba_standings_",
+    )
+    touches_text_family = any(fam in (original_sql or "") for fam in text_storage_families)
+
+    if touches_text_family:
+        cast_guidance = (
+            "- The query touches a TEXT-storage family (nba_advanced_*, nba_clutch_*, "
+            "nba_hustle_*, nba_player_tracking_pt_*, nba_lineups_*, team_advanced_*, "
+            "nba_standings_*). Every column there is physically TEXT, even numeric stats.\n"
+            "- You MUST use NULLIF(col, '')::numeric for any numeric WHERE/ORDER BY on "
+            "those tables. Example: ORDER BY NULLIF(\"DRIVES\", '')::numeric DESC NULLS LAST.\n"
+            "- KEEP the double quotes around UPPERCASE column names. Lowercasing them "
+            "makes Postgres look up a different (non-existent) identifier.\n"
+            "- You MAY use CAST/NULLIF/::numeric here. They are required, not forbidden."
+        )
+    else:
+        cast_guidance = (
+            "- ONLY select direct columns from the tables\n"
+            "- DO NOT use SUM, AVG, COUNT, MIN, MAX, CAST, NULLIF, COALESCE, "
+            "window functions, or arithmetic expressions\n"
+            "- DO NOT use GROUP BY, HAVING, or ORDER BY"
+        )
+
     r_prompt = f"""
 The following SQL query failed:
 
@@ -1495,9 +1537,7 @@ Database error:
 
 Fix the SQL to match the schema exactly while keeping a RAW DATA query shape.
 STRICT RULES:
-- ONLY select direct columns from the tables
-- DO NOT use SUM, AVG, COUNT, MIN, MAX, CAST, NULLIF, COALESCE, window functions, or arithmetic expressions
-- DO NOT use GROUP BY, HAVING, or ORDER BY
+{cast_guidance}
 - Keep WHERE/JOIN only when needed to fetch correct rows and columns
 Return ONLY a valid PostgreSQL SELECT query.
 Do NOT include any additional text or markdown.
@@ -1646,6 +1686,10 @@ RULE 0 — INTENT ROUTING FOR EXTENDED TABLE FAMILIES:
   - "lineup", "5-man unit", "best lineup"               → `nba_lineups_...`
   - "standings", "seed", "conference rank"              → `nba_standings_...`
   - "advanced metrics", "true shooting", "net rating"   → `nba_advanced_...`
+  When routing to any of the families above:
+  - "this season" / no year → 2025_26 (these families are current).
+  - For all_players_regular / all_players_playoffs, "this season" still maps to 2024_2025
+    because those tables are not produced yet for 2025-26.
 
 RULE 1 — MOST RECENT PLAYOFF PERFORMANCE:
   Trigger phrases: "playoff performance", "playoffs", "analyze playoffs", "postseason"
@@ -1697,12 +1741,21 @@ RULE 9 — SHOT CHARTS, DISTANCE, AND PLAY-BY-PLAY (court_shots):
   → Filter by `game_date` or `player_name` using standard WHERE clauses.
   → Columns are lowercase: game_id, player_name, team_name, game_date, action_type, shot_type, shot_zone_basic, shot_distance, loc_x, loc_y, shot_made_flag
 
-RULE 10 — LINEUPS AND 5-MAN UNITS (STRICT 63-CHAR TABLE NAMES):
-  Trigger phrases: "best 5-man lineup", "lineup net rating"
-  → PostgreSQL forcefully truncated these table names at exactly 63 characters.
-  → You MUST use this exact suffix: `nba_lineups_group_5_season_YYYY_YY_season_type_playoffs_pe` (Ends in _pe)
+RULE 10 — LINEUPS AND 5-MAN UNITS (PLAYOFFS-ONLY DATA):
+  Trigger phrases: "best 5-man lineup", "lineup net rating", "best lineup"
+  IMPORTANT: lineup data EXISTS ONLY FOR PLAYOFFS. There are no regular-season lineup tables.
+  Available years: 2007-08, 2012-13, 2021-22, 2022-23, 2023-24, 2024-25.
+  → Use ONLY: nba_lineups_group_5_season_YYYY_YY_season_type_playoffs_pe (ends in _pe)
+  → If the user asks for regular-season lineups, answer that the data is playoff-only
+    and ask whether they want the most recent playoff lineups instead. Return no other table.
 
 RULE 11 — SPECIALTY STATS & TRACKING (STRICT 63-CHAR TABLE NAMES):
+
+    CURRENT SEASON NOTE: Unlike all_players_*, the advanced / clutch / hustle / tracking
+    families DO have 2025-26 tables. For "this season" or "current season" advanced/specialty
+    questions, use the 2025_26 suffix (e.g. nba_advanced_season_2025_26_season_type_regular_season_per).
+    Use 2024_25 only when the user explicitly asks for last season.
+
   CRITICAL: PostgreSQL forcefully truncated these table names at exactly 63 characters. 
   DO NOT write "regular_season" or "per_mode_per" for the tracking tables. You MUST copy these exact suffix patterns character-for-character:
   
@@ -1715,9 +1768,15 @@ RULE 11 — SPECIALTY STATS & TRACKING (STRICT 63-CHAR TABLE NAMES):
       Regular: `nba_clutch_season_YYYY_YY_season_type_regular_season_per_mo`
       Playoffs: `nba_clutch_season_YYYY_YY_season_type_playoffs_per_mode_per`
       
-  → Drives ("drives"):
+  → Drives ("drives", "drives per game"):
       Regular: `nba_player_tracking_pt_drives_season_YYYY_YY_season_type_re`
       Playoffs: `nba_player_tracking_pt_drives_season_YYYY_YY_season_type_pl`
+      Available columns: "DRIVES", "DRIVE_FGM", "DRIVE_FGA", "DRIVE_FG_PCT",
+                         "DRIVE_PTS", "DRIVE_PASSES", "DRIVE_AST", "DRIVE_TOV", "GP".
+      CRITICAL: The `_re` and `_pl` tables are stored in PER-GAME mode by default.
+      "DRIVES" is ALREADY the per-game value. DO NOT divide DRIVES by GP.
+      For "most drives per game" → ORDER BY NULLIF("DRIVES", '')::numeric DESC NULLS LAST.
+      Apply WHERE NULLIF("GP", '')::numeric >= 20 for leaderboards to exclude small-sample outliers.
       
   → Passing ("passing", "assists created"):
       Regular: `nba_player_tracking_pt_passing_season_YYYY_YY_season_type_r`
@@ -1771,7 +1830,26 @@ RULE 15 — SPECIFIC ADVANCED ACRONYMS (TS%, eFG%, USG%):
   → "Usage Rate" or "USG%" = `"USG_PCT"`
   → "Assist Percentage" = `"AST_PCT"`
   → "Rebound Percentage" = `"REB_PCT"`
+  → "PER" (Player Efficiency Rating, John Hollinger's metric):
+       This database does NOT store classic PER. The closest equivalent is "PIE" in nba_advanced_*.
+       Numbers in nba_advanced_* are TEXT-stored, so cast with NULLIF(col, '')::numeric.
+       Map "PER" → SELECT "PLAYER_NAME", "TEAM_ABBREVIATION", "GP", "PIE"
+                   FROM nba_advanced_season_YYYY_YY_season_type_regular_season_per
+                   WHERE NULLIF("GP", '')::numeric >= 20
+                   ORDER BY NULLIF("PIE", '')::numeric DESC NULLS LAST LIMIT 10;
+       The analyzer will rename PIE to "PIE (PER equivalent)" in the rendered output —
+       you do NOT need to alias it in the SQL.
   CRITICAL: You MUST wrap these uppercase column names in double quotes.
+
+RULE 16 — TABLES YOU MUST NOT USE:
+  These tables appear in the schema but are NOT to be queried by this system:
+  - `nba_regular_season_totals_*`  (legacy import, columns differ from all_players_regular_*)
+  - `nba_shot_locations_*`         (column names are unnamed/duplicated, unusable)
+  - `team_advanced_staging`        (staging copy, not for production)
+  ALWAYS prefer the canonical equivalent:
+  - season totals → `all_players_regular_YYYY_YYYY`
+  - shot location → `court_shots`
+  - team advanced → `team_advanced_season_YYYY_YY_regular_season_pergame`
 
 ════════════════════════════════════════════════════════════════════════
 SECTION 3: MANDATORY QUERY CONSTRUCTION RULES
@@ -1795,6 +1873,30 @@ PLAYER NAME MATCHING:
       "Dame"                     → player_name ILIKE '%Damian Lillard%'
       "Russ"                     → player_name ILIKE '%Russell Westbrook%'
       "PG" or "PG13"             → player_name ILIKE '%Paul George%'
+
+TRACKING TABLE PER-MODE RULE:
+  - All `nba_player_tracking_pt_*` tables suffixed `_re` or `_pl` are in PER-GAME mode.
+  - The numeric stat columns (DRIVES, DRIVE_PTS, POST_TOUCHES, AVG_SPEED, etc.) are
+    already per-game values. NEVER divide them by GP.
+  - The same applies to nba_hustle_*, nba_clutch_*, nba_advanced_*, nba_lineups_*,
+    team_advanced_*, and nba_standings_* tables.
+  - For "most X per game" questions on these tables, just ORDER BY the column directly
+    (with the numeric cast described next).
+
+TEXT-STORED NUMERIC COLUMNS (CRITICAL):
+  Every column in nba_advanced_*, nba_clutch_*, nba_hustle_*, nba_player_tracking_pt_*,
+  nba_lineups_*, team_advanced_*, and nba_standings_* tables is stored as TEXT in
+  PostgreSQL — even numeric stats like GP, DRIVES, PIE, TS_PCT, etc.
+  This means:
+  - Numeric comparisons ALWAYS need an explicit cast:
+      WHERE NULLIF("GP", '')::numeric >= 20
+  - Numeric ORDER BY ALWAYS needs an explicit cast:
+      ORDER BY NULLIF("DRIVES", '')::numeric DESC NULLS LAST
+  - WITHOUT the cast, "9.5" sorts ABOVE "19.2" (lexicographic) and any `>= 20`
+    comparison fails with `operator does not exist: text >= integer`.
+  - Use NULLIF(col, '') so empty strings cast cleanly to NULL instead of erroring.
+  - The all_players_regular_*, all_players_playoffs_*, player_game_logs, and
+    court_shots tables DO have proper numeric types — no casts needed there.
 
 AGGREGATION RULES for season summary tables:
   - ONLY use SUM()+GROUP BY when combining MULTIPLE rows per player
@@ -1883,6 +1985,8 @@ GENERAL:
   - NEVER add WHERE season_type = ... to season summary tables (season_type does not exist there)
   - If a question is ambiguous between recency and season summary, default to player_game_logs
     with season_id = '22025' since it is the most current data available
+  - For "last N games" / "recent games" / "last X games" prompts, omit the
+    season_id filter so cross-season tails work. Just ORDER BY game_date DESC LIMIT N.
 
 ════════════════════════════════════════════════════════════════════════
 SECTION 4: SEASON AND YEAR REFERENCE MAP
@@ -2080,6 +2184,118 @@ FROM (
   SELECT player_name, pts, reb, ast, fgm, fga FROM all_players_regular_2024_2025 WHERE player_name ILIKE '%LeBron James%'
 ) AS combined GROUP BY player_name LIMIT 50;
 
+Q: "Show me Kevin Durant's points trend from 2015 to 2023"
+→ RULE 5. By-season trend. UNION ALL across EVERY season in the inclusive range.
+   ONE ROW PER SEASON. No SUM. No GROUP BY across seasons.
+SELECT player_name, season_label, pts, gp, fg_pct, fg3_pct, ft_pct
+FROM (
+  SELECT player_name, '2015-16' AS season_label, pts, gp, fg_pct, fg3_pct, ft_pct
+    FROM all_players_regular_2015_2016 WHERE player_name ILIKE '%Kevin Durant%'
+  UNION ALL
+  SELECT player_name, '2016-17', pts, gp, fg_pct, fg3_pct, ft_pct
+    FROM all_players_regular_2016_2017 WHERE player_name ILIKE '%Kevin Durant%'
+  UNION ALL
+  SELECT player_name, '2017-18', pts, gp, fg_pct, fg3_pct, ft_pct
+    FROM all_players_regular_2017_2018 WHERE player_name ILIKE '%Kevin Durant%'
+  UNION ALL
+  SELECT player_name, '2018-19', pts, gp, fg_pct, fg3_pct, ft_pct
+    FROM all_players_regular_2018_2019 WHERE player_name ILIKE '%Kevin Durant%'
+  UNION ALL
+  SELECT player_name, '2019-20', pts, gp, fg_pct, fg3_pct, ft_pct
+    FROM all_players_regular_2019_2020 WHERE player_name ILIKE '%Kevin Durant%'
+  UNION ALL
+  SELECT player_name, '2020-21', pts, gp, fg_pct, fg3_pct, ft_pct
+    FROM all_players_regular_2020_2021 WHERE player_name ILIKE '%Kevin Durant%'
+  UNION ALL
+  SELECT player_name, '2021-22', pts, gp, fg_pct, fg3_pct, ft_pct
+    FROM all_players_regular_2021_2022 WHERE player_name ILIKE '%Kevin Durant%'
+  UNION ALL
+  SELECT player_name, '2022-23', pts, gp, fg_pct, fg3_pct, ft_pct
+    FROM all_players_regular_2022_2023 WHERE player_name ILIKE '%Kevin Durant%'
+  UNION ALL
+  SELECT player_name, '2023-24', pts, gp, fg_pct, fg3_pct, ft_pct
+    FROM all_players_regular_2023_2024 WHERE player_name ILIKE '%Kevin Durant%'
+) AS trend
+ORDER BY season_label;
+
+Q: "Compare Luka Doncic and Trae Young assists from 2020 to 2024"
+→ RULE 6 + RULE 5. Two players, multi-season range. UNION ALL each (player, season).
+   ONE ROW PER (player, season). No cross-season aggregation.
+SELECT player_name, season_label, ast, gp
+FROM (
+  SELECT player_name, '2020-21' AS season_label, ast, gp FROM all_players_regular_2020_2021
+    WHERE player_name ILIKE '%Luka Doncic%' OR player_name ILIKE '%Trae Young%'
+  UNION ALL
+  SELECT player_name, '2021-22', ast, gp FROM all_players_regular_2021_2022
+    WHERE player_name ILIKE '%Luka Doncic%' OR player_name ILIKE '%Trae Young%'
+  UNION ALL
+  SELECT player_name, '2022-23', ast, gp FROM all_players_regular_2022_2023
+    WHERE player_name ILIKE '%Luka Doncic%' OR player_name ILIKE '%Trae Young%'
+  UNION ALL
+  SELECT player_name, '2023-24', ast, gp FROM all_players_regular_2023_2024
+    WHERE player_name ILIKE '%Luka Doncic%' OR player_name ILIKE '%Trae Young%'
+  UNION ALL
+  SELECT player_name, '2024-25', ast, gp FROM all_players_regular_2024_2025
+    WHERE player_name ILIKE '%Luka Doncic%' OR player_name ILIKE '%Trae Young%'
+) AS combined
+ORDER BY season_label, player_name;
+
+Q: "Who had the most drives per game in 2023?"
+→ RULE 0 + RULE 11. "drives" → tracking_pt_drives. "in 2023" → 2023_24 season.
+   "DRIVES" is already per-game in this table — DO NOT divide by GP.
+   These tables store numbers as TEXT, so cast with NULLIF(col, '')::numeric.
+SELECT "PLAYER_NAME", "TEAM_ABBREVIATION", "GP", "DRIVES",
+       "DRIVE_PTS", "DRIVE_FG_PCT", "DRIVE_AST"
+FROM nba_player_tracking_pt_drives_season_2023_24_season_type_re
+WHERE NULLIF("GP", '')::numeric >= 20
+ORDER BY NULLIF("DRIVES", '')::numeric DESC NULLS LAST
+LIMIT 10;
+
+Q: "Who leads in deflections this season?"
+→ RULE 0 + RULE 11. "deflections" → hustle. "this season" → 2025_26.
+   These tables store numbers as TEXT, so cast with NULLIF(col, '')::numeric.
+SELECT "PLAYER_NAME", "TEAM_ABBREVIATION", "G", "DEFLECTIONS", "CONTESTED_SHOTS", "CHARGES_DRAWN"
+FROM nba_hustle_season_2025_26_season_type_regular_season_per_mo
+WHERE NULLIF("G", '')::numeric >= 20
+ORDER BY NULLIF("DEFLECTIONS", '')::numeric DESC NULLS LAST
+LIMIT 10;
+
+Q: "Who had the highest PER in 2023?"
+→ RULE 15. PER is not stored — closest equivalent is "PIE" in nba_advanced_*.
+   Numbers in advanced tables are TEXT, so cast with NULLIF(col, '')::numeric.
+SELECT "PLAYER_NAME", "TEAM_ABBREVIATION", "GP", "PIE"
+FROM nba_advanced_season_2023_24_season_type_regular_season_per
+WHERE NULLIF("GP", '')::numeric >= 20
+ORDER BY NULLIF("PIE", '')::numeric DESC NULLS LAST
+LIMIT 10;
+
+Q: "How does Giannis perform on post-ups?"
+→ RULE 0 + RULE 11. "post-ups" → tracking_pt_posttouch. No year ⇒ current ⇒ 2025_26.
+SELECT "PLAYER_NAME", "TEAM_ABBREVIATION", "GP", "POST_TOUCHES",
+       "POST_TOUCH_FG_PCT", "POINTS", "PTS_PER_TOUCH"
+FROM nba_player_tracking_pt_posttouch_season_2025_26_season_type
+WHERE "PLAYER_NAME" ILIKE '%Giannis%';
+
+Q: "What were LeBron's stats vs the Celtics in 2024?"
+→ RULE 13. Use player_game_logs. Calendar year 2024 ⇒ filter by game_date range.
+SELECT player_name, game_date, matchup, wl, pts, reb, ast, stl, blk, tov,
+  fgm, fga, fg3m, fg3a, ftm, fta, min,
+  (CAST(fgm AS DOUBLE PRECISION) / NULLIF(fga, 0)) AS fg_pct
+FROM player_game_logs
+WHERE player_name ILIKE '%LeBron James%'
+  AND matchup ILIKE '%BOS%'
+  AND game_date >= '2024-01-01' AND game_date <= '2024-12-31'
+ORDER BY game_date DESC;
+
+Q: "How many points did Wembanyama score in his last 5 games?"
+→ RULE 3. "last N games" — do NOT pin to a specific season; let game_date order across season boundary.
+SELECT player_name, game_date, matchup, wl, pts, reb, ast, fgm, fga, fg3m, fg3a, ftm, fta, min
+FROM player_game_logs
+WHERE player_name ILIKE '%Victor Wembanyama%'
+  OR player_name ILIKE '%Wembanyama%'
+ORDER BY game_date DESC
+LIMIT 5;
+
 ════════════════════════════════════════════════════════════════════════
 SECTION 6: COMMON MISTAKES — NEVER DO THESE
 ════════════════════════════════════════════════════════════════════════
@@ -2149,7 +2365,12 @@ Generate the SQL:"""
     sql_query = _expand_player_name_filters_for_encoding(sql_query)
     sql_query = _ensure_profile_columns_in_sql(sql_query, user_input_param)
     sql_query = _ensure_season_columns_in_sql(sql_query)
-    # Skip raw-data policy for advanced metrics — those tables have pre-computed stats as direct columns
+    # Skip raw-data policy for advanced metrics by user-intent keywords. The
+    # enforcer itself ALSO bypasses scrubbing when the SQL touches a text-storage
+    # family (nba_advanced_*, nba_clutch_*, nba_hustle_*, nba_player_tracking_pt_*,
+    # nba_lineups_*, team_advanced_*, nba_standings_*) — those queries need ORDER BY
+    # and NULLIF/::numeric casts to function. So this gate is just for keyword-based
+    # routing; the function is the safety net for everything else.
     if not _is_advanced_metrics_request(user_input_param):
         try:
             sql_query = _enforce_raw_data_only_sql(sql_query)

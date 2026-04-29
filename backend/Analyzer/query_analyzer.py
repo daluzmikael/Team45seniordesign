@@ -101,6 +101,36 @@ def _resolve_df_output(module: Optional[Any]) -> Optional[pd.DataFrame]:
 
 
 # -------------------------
+# Display column renames
+# -------------------------
+# Map confusing or non-existent stat columns to friendlier display names so
+# the analyzer narrative + table never confuse users. Add new mappings here.
+_DISPLAY_COLUMN_RENAMES = {
+    "PIE":  "PIE (PER equivalent)",
+    "pie":  "PIE (PER equivalent)",
+}
+
+
+def _rename_columns_for_display(df):
+    """Return a shallow-copied df with confusing column names rewritten for display."""
+    if df is None or df.empty:
+        return df
+    rename_map = {c: _DISPLAY_COLUMN_RENAMES[c] for c in df.columns if c in _DISPLAY_COLUMN_RENAMES}
+    if not rename_map:
+        return df
+    return df.rename(columns=rename_map)
+
+
+def _user_asked_for_per(question: str) -> bool:
+    """True only when the user explicitly asked for classic PER (Hollinger).
+
+    Avoids matching 'per game', 'per minute', 'per possession', 'performance'.
+    """
+    q = (question or "").lower()
+    return bool(re.search(r"\b(player efficiency rating|per)\b(?!\s*game|formance|\s*minute|\s*possession)", q))
+
+
+# -------------------------
 # Composite scoring utilities
 # -------------------------
 @dataclass
@@ -1835,13 +1865,28 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
     )
     rows_to_show = df if is_comparison else df.head(20)
 
+    # Apply user-friendly column renames before showing data to GPT or the user.
+    display_df = _rename_columns_for_display(df)
+    display_rows_to_show = display_df if is_comparison else display_df.head(20)
+
     df_summary = (
-        f"DataFrame shape: {df.shape[0]} rows, {df.shape[1]} columns\n"
-        f"Columns: {', '.join(df.columns.tolist())}\n\n"
-        f"Data:\n{rows_to_show.to_string(index=False)}\n"
+        f"DataFrame shape: {display_df.shape[0]} rows, {display_df.shape[1]} columns\n"
+        f"Columns: {', '.join(display_df.columns.tolist())}\n\n"
+        f"Data:\n{display_rows_to_show.to_string(index=False)}\n"
     )
-    if len(df) > 20 and not is_comparison:
-        df_summary += f"\nSummary statistics:\n{df.describe().to_string()}\n"
+    if len(display_df) > 20 and not is_comparison:
+        df_summary += f"\nSummary statistics:\n{display_df.describe().to_string()}\n"
+
+    # If the user asked for "PER" specifically, prepend a note for GPT so it
+    # opens with a one-line acknowledgment that classic PER isn't stored.
+    per_note = ""
+    if _user_asked_for_per(question) and any(c in df.columns for c in ("PIE", "pie")):
+        per_note = (
+            "\n\nIMPORTANT: This database does not store classic PER (Hollinger). "
+            "The 'PIE (PER equivalent)' column shown is the NBA's official equivalent. "
+            "Open your answer with one short sentence acknowledging this so the user "
+            "knows what they're seeing."
+        )
 
     rubric_by_domain = {
         "defense": "Prioritize defensive_impact; rim protection (rim_fg_pct_allowed lower is better; rim_shots_contested higher is better); on-ball impact (opp_fg_pct_as_primary_defender lower is better); versatility; disruptions (deflections, loose balls).",
@@ -1889,8 +1934,8 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
             f"Domain: {domain}\n"
             f"Guidance: {rubric_by_domain.get(domain, '')}\n\n"
             f"RANKED (DO NOT REORDER):\n{score_text}\n\n"
-            f"ORIGINAL DATA (first rows):\n{rows_to_show.to_string(index=False)}\n\n"
-            f"Analyze the top result and compare to the next strongest contenders in a natural, engaging format."
+            f"ORIGINAL DATA (first rows):\n{display_rows_to_show.to_string(index=False)}\n\n"
+            f"Analyze the top result and compare to the next strongest contenders in a natural, engaging format.{per_note}"
         )
     else:
         system_prompt = (
@@ -1908,7 +1953,7 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
 
         user_prompt = (
             f"User's question: {question}\n\n"
-            f"Data:\n{df_summary}\n"
+            f"Data:\n{df_summary}{per_note}\n"
             "Analyze the data and answer the question in a fluid, engaging sports-analyst style."
         )
 

@@ -189,6 +189,18 @@ EXAMPLES:
    - SQL: "SELECT player_name, '2020-21' as season, pts, ast, reb, stl, blk FROM (SELECT DISTINCT ON (player_name) player_name, pts, ast, reb, stl, blk, gp FROM all_players_regular_2020_2021 WHERE player_name ILIKE '%Trae%Young%' ORDER BY player_name, gp DESC) sub1 UNION ALL SELECT player_name, '2017-18' as season, pts, ast, reb, stl, blk FROM (SELECT DISTINCT ON (player_name) player_name, pts, ast, reb, stl, blk, gp FROM all_players_regular_2017_2018 WHERE player_name ILIKE '%LeBron%James%' ORDER BY player_name, gp DESC) sub2 UNION ALL SELECT player_name, '2016-17' as season, pts, ast, reb, stl, blk FROM (SELECT DISTINCT ON (player_name) player_name, pts, ast, reb, stl, blk, gp FROM all_players_regular_2016_2017 WHERE player_name ILIKE '%Stephen%Curry%' ORDER BY player_name, gp DESC) sub3"
    - Config: {{ "playerNames": ["Trae Young", "LeBron James", "Stephen Curry"], "statDisplayName": "Cross-Season Comparison" }}
 
+15c. **"LeBron James' skill profile 2003 vs LeBron James' skill profile 2012"** (Radar — bare-name shape, no leading verb)
+   - Type: "CompareCategoricalBreakdown"
+   - SQL: "SELECT player_name, '2003-04' as season, pts, ast, reb, stl, blk FROM (SELECT DISTINCT ON (player_name) player_name, pts, ast, reb, stl, blk, gp FROM all_players_regular_2003_2004 WHERE player_name ILIKE '%LeBron%James%' ORDER BY player_name, gp DESC) sub1 UNION ALL SELECT player_name, '2012-13' as season, pts, ast, reb, stl, blk FROM (SELECT DISTINCT ON (player_name) player_name, pts, ast, reb, stl, blk, gp FROM all_players_regular_2012_2013 WHERE player_name ILIKE '%LeBron%James%' ORDER BY player_name, gp DESC) sub2"
+   - Config: {{ "playerNames": ["LeBron James"], "statDisplayName": "Season Comparison" }}
+   - NOTE: The user can phrase a comparison without any leading verb. Treat "X profile [year] vs X profile [year]" the same as "Compare X profile [year] vs profile [year]" — it is a CompareCategoricalBreakdown.
+
+15d. **"Curry 2015 vs Curry 2023"** (Radar — minimal shape, no word "profile")
+   - Type: "CompareCategoricalBreakdown"
+   - SQL: "SELECT player_name, '2015-16' as season, pts, ast, reb, stl, blk FROM (SELECT DISTINCT ON (player_name) player_name, pts, ast, reb, stl, blk, gp FROM all_players_regular_2015_2016 WHERE player_name ILIKE '%Stephen%Curry%' ORDER BY player_name, gp DESC) sub1 UNION ALL SELECT player_name, '2023-24' as season, pts, ast, reb, stl, blk FROM (SELECT DISTINCT ON (player_name) player_name, pts, ast, reb, stl, blk, gp FROM all_players_regular_2023_2024 WHERE player_name ILIKE '%Stephen%Curry%' ORDER BY player_name, gp DESC) sub2"
+   - Config: {{ "playerNames": ["Stephen Curry"], "statDisplayName": "Season Comparison" }}
+   - NOTE: When the dashboard intent hint is set to a profile/radar type, treat "X year vs X year" as a season comparison radar.
+
 16. **"Show me a heat map of LeBron's shot selection"** (Career Shot Chart)
    - Type: "ShotChart"
    - SQL: "SELECT loc_x, loc_y, shot_made_flag FROM court_shots WHERE player_name ILIKE '%LeBron%James%'"
@@ -383,17 +395,28 @@ RADAR_KEYS = {"PTS", "AST", "REB", "STL", "BLK"}
 
 
 def _extract_names_heuristic(q: str) -> List[str]:
-    candidates = re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2}\b", q)
-    blacklist = {"Top", "Show", "Compare", "Vs", "Versus", "Skill", "Profile", "Points", "Assists", "Rebounds",
-                 "Playoffs", "Regular", "Season", "Last", "Games", "Trend", "Leaderboard", "Heat", "Shot", "Chart",
-                 "Map", "Best", "Worst", "Shooting", "Zones", "Selection"}
-    cleaned = [c for c in candidates if c not in blacklist]
-    seen = set()
+    # Strip possessives so "LeBron's" doesn't truncate the next word.
+    cleaned_q = re.sub(r"['\u2019]s\b", "", q)
+    # Allow internal capitals (LeBron, McGrady, DeRozan, O'Neal etc.).
+    name_token = r"[A-Z][A-Za-z][A-Za-z\-']*"
+    candidates = re.findall(rf"\b{name_token}(?:\s+{name_token}){{0,2}}\b", cleaned_q)
+    blacklist = {"Top", "Show", "Compare", "Vs", "Versus", "Skill", "Profile", "Points",
+                 "Assists", "Rebounds", "Playoffs", "Regular", "Season", "Last", "Games",
+                 "Trend", "Leaderboard", "Heat", "Shot", "Chart", "Map", "Best", "Worst",
+                 "Shooting", "Zones", "Selection",
+                 # Common verbs / question-words at sentence start.
+                 "Tell", "Give", "Make", "Create", "Build", "Find",
+                 "When", "Where", "Why", "How", "What", "Who"}
     out = []
-    for c in cleaned:
-        if c not in seen:
-            seen.add(c)
-            out.append(c)
+    seen = set()
+    for c in candidates:
+        # Single-word candidates that exactly match a blacklist word are noise.
+        if " " not in c and c in blacklist:
+            continue
+        if c in seen:
+            continue
+        seen.add(c)
+        out.append(c)
     return out
 
 
@@ -430,7 +453,27 @@ def _intent_hint(user_question: str) -> Dict[str, Any]:
 
     # Not a shot chart
     is_profile = any(w in q for w in ["skill profile", "profile", "radar", "breakdown", "categories", "categorical"])
-    is_compare = any(w in q for w in [" compare ", " vs ", " versus "]) or " vs." in q
+    # Catch bare " v ", "vs"-at-sentence-start, year-vs-year, and "year to year"
+    # in addition to the explicit "compare", " vs ", " versus ".
+    is_compare = (
+        any(w in q for w in [" compare ", " vs ", " versus ", " v "])
+        or " vs." in q
+        or q.startswith("vs ")
+        or bool(re.search(r"\b(19\d{2}|20\d{2})\b.*\bvs\b.*\b(19\d{2}|20\d{2})\b", q))
+        or bool(re.search(r"\b(19\d{2}|20\d{2})\b\s+to\s+\b(19\d{2}|20\d{2})\b", q))
+    )
+
+    # Same-player-two-seasons radar pattern: heuristic finds only one unique
+    # name when the player is repeated. Treat it as a comparison if profile-y
+    # language is present and at least two years are mentioned.
+    repeated_name_radar = (
+        is_profile
+        and len(_extract_names_heuristic(user_question)) == 1
+        and len(re.findall(r"\b(19\d{2}|20\d{2})\b", user_question)) >= 2
+    )
+    if repeated_name_radar:
+        is_compare = True
+
     is_leaderboard = any(w in q for w in ["top ", "leaders", "leaderboard", "most ", "rank"])
     is_recent = any(w in q for w in [
         "last ", "past ", "recent", "game log", "gamelog",
@@ -654,7 +697,12 @@ def interpret_question(user_question: str) -> Dict[str, Any]:
             repair_msg = (
                 "Your previous output caused a schema mismatch when executing the SQL. "
                 f"Reason: {reason}. "
-                "Return corrected JSON. You may change chartType and/or SQL so it matches the OUTPUT SHAPE RULES. "
+                "Return corrected JSON. You may change chartType and/or SQL so it matches the OUTPUT SHAPE RULES.\n\n"
+                "If the user asked for a 'skill profile' or 'radar' comparison across seasons "
+                "(including bare-name shapes like \"X profile YEAR vs X profile YEAR\" or \"X YEAR vs X YEAR\"), "
+                "the chartType MUST be 'CompareCategoricalBreakdown' and the SQL MUST use the "
+                "UNION ALL pattern from examples 15, 15b, 15c, and 15d — one branch per (player, season) "
+                "with a string-literal `season` column and DISTINCT ON (player_name) inside each branch.\n\n"
                 "Do NOT return explanations, only JSON."
             )
             interpretation = _call_gpt_for_interpretation(user_question, hint, repair_message=repair_msg)

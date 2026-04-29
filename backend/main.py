@@ -115,8 +115,58 @@ def _build_contextual_question(
 
 
 def _is_affirmative_followup(question: str) -> bool:
-    q = (question or "").strip().lower()
-    return q in {"yes", "yeah", "yep", "yup", "sure", "ok", "okay", "do it", "go ahead"}
+    q = re.sub(r"[^\w\s]", "", (question or "").strip().lower())
+    if not q:
+        return False
+    tokens = q.split()
+    if not tokens:
+        return False
+    if tokens[0] in {"yes", "yeah", "yep", "yup", "yah", "ya", "sure", "ok", "okay", "k", "kk"}:
+        return True
+    return q in {"do it", "go ahead", "go for it", "lets go", "lets do it", "please do"}
+
+
+_COMPARISON_FOLLOWUP_MARKERS = (
+    "better", "worse", "more", "less", "compare", "vs ", " vs.",
+    "between them", "of the two", "of those two",
+    "who was", "who is", "who's", " or ", "as well as",
+)
+
+def _looks_like_comparison_followup(question: str) -> bool:
+    q = " " + (question or "").strip().lower() + " "
+    return any(m in q for m in _COMPARISON_FOLLOWUP_MARKERS)
+
+
+# Stop words to filter out of name candidates pulled from prior assistant text.
+_NAME_STOPWORDS = {
+    "regular season", "per game", "playoffs", "playoff", "field goal",
+    "free throw", "double double", "triple double", "double-double",
+    "triple-double", "plus minus", "plus-minus", "western conference",
+    "eastern conference", "all star", "all-star",
+}
+
+_NAME_CANDIDATE_RE = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z\.\-']+){1,2})\b")
+
+def _extract_player_names_from_history(
+    history_messages: List[Dict[str, Any]], limit: int = 4
+) -> List[str]:
+    names: List[str] = []
+    seen = set()
+    for msg in reversed(history_messages or []):
+        content = str(msg.get("content", "")).strip()
+        if not content:
+            continue
+        for cand in _NAME_CANDIDATE_RE.findall(content):
+            key = cand.lower()
+            if any(stop in key for stop in _NAME_STOPWORDS):
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            names.append(cand)
+            if len(names) >= limit:
+                return names
+    return names
 
 
 def _extract_latest_player_and_season_from_history(
@@ -237,6 +287,7 @@ async def analysis_endpoint(
         # Prefer history passed by the frontend (works for both guest and auth chats).
         if history_messages and _should_apply_history_context(request.question):
             effective_question = _build_contextual_question(request.question, history_messages)
+
             if _is_affirmative_followup(request.question):
                 player_name, season_label = _extract_latest_player_and_season_from_history(history_messages)
                 if player_name and season_label:
@@ -245,6 +296,26 @@ async def analysis_endpoint(
                         f"Use player_name ILIKE '%{player_name}%' and season_label '{season_label}' context "
                         "(do not advance to a different season)."
                     )
+
+            # NEW: comparison continuity. If the follow-up is comparison-shaped but
+            # the user dropped one or both player names, pull them from history.
+            if _looks_like_comparison_followup(request.question):
+                prior_names = _extract_player_names_from_history(history_messages)
+                current_lower = request.question.lower()
+                missing = [n for n in prior_names if n.lower() not in current_lower]
+                if missing:
+                    names_clause = " and ".join(missing[:2])
+                    effective_question += (
+                        f"\n\nFollow-up constraint: this is a CONTINUATION of an earlier comparison. "
+                        f"Include {names_clause} alongside any players named in the current question. "
+                        f"Treat as a multi-player comparison and return one row per player."
+                    )
+                    # Also rewrite the question that the analyzer sees so the
+                    # narrative covers all parties, not just the named one.
+                    request.question = (
+                        f"{request.question} (continuing comparison with {names_clause})"
+                    )
+
             history_context_applied = True
             history_context_reason = "request_history_used"
         # Fallback for older clients: load persisted history for authenticated users.

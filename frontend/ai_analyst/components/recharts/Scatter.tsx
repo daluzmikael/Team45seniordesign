@@ -90,22 +90,31 @@ const CustomTooltip = ({
       <div className="font-semibold">{p.player_name}</div>
       {!isSingleAxis && xAxisLabel && (
         <div className="text-muted-foreground">
-          {xAxisLabel}: <span className="text-foreground font-medium">{formatValue(p.x_value)}</span>
+          {xAxisLabel}: <span className="text-foreground font-medium">{formatValue(p.x_value, xAxisLabel)}</span>
         </div>
       )}
       <div className="text-muted-foreground">
-        {yAxisLabel || "Value"}: <span className="text-foreground font-medium">{formatValue(p.y_value)}</span>
+        {yAxisLabel || "Value"}: <span className="text-foreground font-medium">{formatValue(p.y_value, yAxisLabel)}</span>
       </div>
     </div>
   )
 }
 
-function formatValue(v: number): string {
+function formatValue(v: number, label?: string): string {
   if (!Number.isFinite(v)) return "—"
-  // Percentages stored as decimals (e.g. TS_PCT = 0.611) → render as %
-  if (Math.abs(v) > 0 && Math.abs(v) < 1) {
+
+  // Check if the label implies it's a percentage stat
+  const isPercent = label && (
+    label.toLowerCase().includes("%") ||
+    label.toLowerCase().includes("pct") ||
+    label.toLowerCase().includes("rate")
+  )
+
+  // Only apply % formatting if the label suggests it AND it's a decimal <= 1
+  if (isPercent && Math.abs(v) > 0 && Math.abs(v) <= 1) {
     return (v * 100).toFixed(1) + "%"
   }
+
   // Big numbers (salary, totals) get comma-separated; small numbers get one decimal
   if (Math.abs(v) >= 1000) return Math.round(v).toLocaleString()
   if (Number.isInteger(v)) return v.toString()
@@ -233,7 +242,7 @@ export default function ScatterComponent({ data, config }: ScatterProps) {
                     ? { value: xAxisLabel, position: "insideBottom", offset: -10, style: { fontSize: 13 } }
                     : undefined
                 }
-                tickFormatter={formatValue}
+                tickFormatter={(v) => formatValue(v, xAxisLabel)}
               />
               <YAxis
                 type="number"
@@ -246,7 +255,7 @@ export default function ScatterComponent({ data, config }: ScatterProps) {
                     ? { value: yAxisLabel, angle: -90, position: "insideLeft", style: { fontSize: 13, textAnchor: "middle" } }
                     : undefined
                 }
-                tickFormatter={formatValue}
+                tickFormatter={(v) => formatValue(v, yAxisLabel)}
                 width={70}
               />
               {/* ZAxis controls dot size — keep it modest so 500 dots don't overlap */}

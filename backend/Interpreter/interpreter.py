@@ -2665,6 +2665,294 @@ def _enforce_rebounders_query(sql_query: str, user_input: str, schema_descriptio
     )
 
 
+def _enforce_pre_1996_archive_routing(sql_query: str, user_input: str) -> str:
+    start, end, is_playoffs = _extract_requested_season_window(user_input)
+    if start >= 1996:
+        return sql_query
+
+    q_text = _extract_current_question_text(user_input).lower()
+    season_start = f"{start}-07-01"
+    season_end = f"{end}-07-01"
+    game_type_clause = (
+        "LOWER(COALESCE(gametype, '')) LIKE 'playoff%'"
+        if is_playoffs
+        else "LOWER(COALESCE(gametype, '')) NOT LIKE 'playoff%'"
+    )
+
+    if any(k in q_text for k in ["schedule", "calendar", "upcoming", "next game"]):
+        return (
+            "SELECT gameid, gamedatetimeest, hometeamcity, hometeamname, awayteamcity, awayteamname, "
+            "homescore, awayscore, gametype "
+            'FROM public."games_archive" '
+            f"WHERE gamedatetimeest::timestamp >= '{season_start}'::timestamp "
+            f"AND gamedatetimeest::timestamp < '{season_end}'::timestamp "
+            f"AND {game_type_clause} "
+            "ORDER BY gamedatetimeest DESC "
+            "LIMIT 50;"
+        )
+
+    if _is_team_record_request(user_input):
+        team_filters = []
+        for key, aliases in _TEAM_ALIASES.items():
+            if key in q_text:
+                team_filters.extend(aliases)
+        team_where = ""
+        if team_filters:
+            clause = " OR ".join([f"teamname ILIKE '%{a}%'" for a in dict.fromkeys(team_filters)])
+            team_where = f" AND ({clause}) "
+        return (
+            "SELECT teamname AS team, COUNT(*) AS gp, "
+            "SUM(CASE WHEN COALESCE(win, '0') IN ('1', 'true', 't', 'yes') THEN 1 ELSE 0 END) AS w, "
+            "SUM(CASE WHEN COALESCE(win, '0') IN ('1', 'true', 't', 'yes') THEN 0 ELSE 1 END) AS l, "
+            "ROUND(100.0 * SUM(CASE WHEN COALESCE(win, '0') IN ('1', 'true', 't', 'yes') THEN 1 ELSE 0 END) "
+            "/ NULLIF(COUNT(*), 0), 1) AS win_pct "
+            'FROM public."team_statistics_archive" '
+            f"WHERE gamedatetimeest::timestamp >= '{season_start}'::timestamp "
+            f"AND gamedatetimeest::timestamp < '{season_end}'::timestamp "
+            f"AND {game_type_clause} "
+            f"{team_where}"
+            "GROUP BY teamname "
+            "ORDER BY w DESC NULLS LAST, win_pct DESC NULLS LAST "
+            "LIMIT 10;"
+        )
+
+    question_text = _extract_current_question_text(user_input)
+    extracted_names = _extract_player_names_from_question(question_text)
+    if not extracted_names:
+        extracted_names = _extract_loose_player_name_candidates(question_text)
+
+    name_filters = []
+    for name in extracted_names:
+        full = name.replace("'", "''")
+        parts = [p for p in name.split() if p]
+        if len(parts) >= 2:
+            first = parts[0].replace("'", "''")
+            last = parts[-1].replace("'", "''")
+            name_filters.append(f"(firstname ILIKE '{first}%' AND lastname ILIKE '{last}%')")
+        name_filters.append(
+            f"((firstname || ' ' || lastname) ILIKE '%{full}%' OR (lastname || ' ' || firstname) ILIKE '%{full}%')"
+        )
+    names_where = f" AND ({' OR '.join(dict.fromkeys(name_filters))}) " if name_filters else ""
+
+    minute_total_requested = (
+        "total minute" in q_text or ("minutes" in q_text and any(k in q_text for k in ["total", "how many"]))
+    )
+    if minute_total_requested:
+        return (
+            "SELECT firstname || ' ' || lastname AS player_name, MAX(playerteamname) AS team_abbreviation, "
+            "COUNT(*) AS gp, "
+            "ROUND(CAST(SUM(NULLIF(regexp_replace(numminutes::text, '[^0-9\\.-]', '', 'g'), '')::double precision) AS numeric), 0) "
+            "AS min "
+            'FROM public."player_statistics_archive" '
+            f"WHERE gamedatetimeest::timestamp >= '{season_start}'::timestamp "
+            f"AND gamedatetimeest::timestamp < '{season_end}'::timestamp "
+            f"AND {game_type_clause} "
+            f"{names_where}"
+            "GROUP BY firstname, lastname "
+            "ORDER BY min DESC NULLS LAST "
+            "LIMIT 25;"
+        )
+
+    return (
+        "SELECT firstname || ' ' || lastname AS player_name, MAX(playerteamname) AS team_abbreviation, "
+        "COUNT(*) AS gp, "
+        "ROUND(CAST(AVG(NULLIF(regexp_replace(points::text, '[^0-9\\.-]', '', 'g'), '')::double precision) AS numeric), 1) AS pts, "
+        "ROUND(CAST(AVG(NULLIF(regexp_replace(reboundstotal::text, '[^0-9\\.-]', '', 'g'), '')::double precision) AS numeric), 1) AS reb, "
+        "ROUND(CAST(AVG(NULLIF(regexp_replace(assists::text, '[^0-9\\.-]', '', 'g'), '')::double precision) AS numeric), 1) AS ast "
+        'FROM public."player_statistics_archive" '
+        f"WHERE gamedatetimeest::timestamp >= '{season_start}'::timestamp "
+        f"AND gamedatetimeest::timestamp < '{season_end}'::timestamp "
+        f"AND {game_type_clause} "
+        f"{names_where}"
+        "GROUP BY firstname, lastname "
+        "ORDER BY pts DESC NULLS LAST "
+        "LIMIT 25;"
+    )
+
+
+def _enforce_single_player_by_season_query(sql_query: str, user_input: str, conn) -> str:
+    question_text = _extract_current_question_text(user_input)
+    q = question_text.lower()
+    if not _is_over_time_request(question_text):
+        return sql_query
+    if _is_explicit_total_request(question_text):
+        return sql_query
+    names = _extract_player_names_from_question(question_text)
+    if len(names) != 1:
+        return sql_query
+    player_name = names[0]
+    player_where = _player_where_clause_for_names([player_name])
+    if not player_where:
+        return sql_query
+
+    starts = _available_season_starts(conn, "regular") if conn is not None else []
+    if not starts:
+        return sql_query
+
+    metric_expr = '"3p%"'
+    metric_alias = "fg3_pct"
+    if any(k in q for k in ["assist", "ast"]):
+        metric_expr = "ast"
+        metric_alias = "ast"
+    elif any(k in q for k in ["rebound", "reb"]):
+        metric_expr = "reb"
+        metric_alias = "reb"
+    elif any(k in q for k in ["point", "pts", "score"]):
+        metric_expr = "pts"
+        metric_alias = "pts"
+    elif any(k in q for k in ["fg%", "field goal"]):
+        metric_expr = '"fg%"'
+        metric_alias = "fg_pct"
+    elif any(k in q for k in ["ft%", "free throw"]):
+        metric_expr = '"ft%"'
+        metric_alias = "ft_pct"
+    elif any(k in q for k in ["3", "three", "3-point", "3pt", "3p"]):
+        metric_expr = '"3p%"'
+        metric_alias = "fg3_pct"
+
+    legs = []
+    for start in starts:
+        end = start + 1
+        table_name = _physical_regular_summary_table(start, end)
+        season_label = f"{start}-{str(end)[-2:]}"
+        legs.append(
+            f"SELECT {start} AS season_start, '{season_label}' AS season_label, "
+            f"player AS player_name, team AS team_abbreviation, gp, {metric_expr} AS {metric_alias} "
+            f'FROM {_qualified_public_table_ref(table_name)} WHERE {player_where}'
+        )
+
+    return (
+        "SELECT season_start, season_label, player_name, team_abbreviation, gp, "
+        f"{metric_alias} FROM ({' UNION ALL '.join(legs)}) AS by_season "
+        f"WHERE {metric_alias} IS NOT NULL "
+        "ORDER BY season_start ASC "
+        "LIMIT 200;"
+    )
+
+
+def _build_archive_supplement_fallback_sql(user_input: str) -> str | None:
+    start, end, is_playoffs = _extract_requested_season_window(user_input)
+    if start < 1996:
+        return None
+
+    q_text = _extract_current_question_text(user_input).lower()
+    season_start = f"{start}-07-01"
+    season_end = f"{end}-07-01"
+    game_type_clause = (
+        "LOWER(COALESCE(gametype, '')) LIKE 'playoff%'"
+        if is_playoffs
+        else "LOWER(COALESCE(gametype, '')) NOT LIKE 'playoff%'"
+    )
+
+    if _is_team_record_request(user_input):
+        team_filters = []
+        for key, aliases in _TEAM_ALIASES.items():
+            if key in q_text:
+                team_filters.extend(aliases)
+        team_where = ""
+        if team_filters:
+            clause = " OR ".join([f"teamname ILIKE '%{a}%'" for a in dict.fromkeys(team_filters)])
+            team_where = f" AND ({clause}) "
+        return (
+            "SELECT teamname AS team, COUNT(*) AS gp, "
+            "SUM(CASE WHEN COALESCE(win, '0') IN ('1', 'true', 't', 'yes') THEN 1 ELSE 0 END) AS w, "
+            "SUM(CASE WHEN COALESCE(win, '0') IN ('1', 'true', 't', 'yes') THEN 0 ELSE 1 END) AS l, "
+            "ROUND(CAST(100.0 * SUM(CASE WHEN COALESCE(win, '0') IN ('1', 'true', 't', 'yes') THEN 1 ELSE 0 END) "
+            "/ NULLIF(COUNT(*), 0) AS numeric), 1) AS win_pct "
+            'FROM public."team_statistics_archive" '
+            f"WHERE gamedatetimeest::timestamp >= '{season_start}'::timestamp "
+            f"AND gamedatetimeest::timestamp < '{season_end}'::timestamp "
+            f"AND {game_type_clause} "
+            f"{team_where}"
+            "GROUP BY teamname "
+            "ORDER BY w DESC NULLS LAST, win_pct DESC NULLS LAST "
+            "LIMIT 10;"
+        )
+
+    question_text = _extract_current_question_text(user_input)
+    extracted_names = _extract_player_names_from_question(question_text)
+    if not extracted_names:
+        extracted_names = _extract_loose_player_name_candidates(question_text)
+
+    name_filters = []
+    for name in extracted_names:
+        full = name.replace("'", "''")
+        parts = [p for p in name.split() if p]
+        if len(parts) >= 2:
+            first = parts[0].replace("'", "''")
+            last = parts[-1].replace("'", "''")
+            name_filters.append(f"(firstname ILIKE '{first}%' AND lastname ILIKE '{last}%')")
+        name_filters.append(
+            f"((firstname || ' ' || lastname) ILIKE '%{full}%' OR (lastname || ' ' || firstname) ILIKE '%{full}%')"
+        )
+    if not name_filters:
+        return None
+    names_where = f" AND ({' OR '.join(dict.fromkeys(name_filters))}) "
+
+    minute_total_requested = (
+        "total minute" in q_text or ("minutes" in q_text and any(k in q_text for k in ["total", "how many"]))
+    )
+    if minute_total_requested:
+        return (
+            "SELECT firstname || ' ' || lastname AS player_name, MAX(playerteamname) AS team_abbreviation, "
+            "COUNT(*) AS gp, "
+            "ROUND(CAST(SUM(NULLIF(regexp_replace(numminutes::text, '[^0-9\\.-]', '', 'g'), '')::double precision) AS numeric), 0) "
+            "AS min "
+            'FROM public."player_statistics_archive" '
+            f"WHERE gamedatetimeest::timestamp >= '{season_start}'::timestamp "
+            f"AND gamedatetimeest::timestamp < '{season_end}'::timestamp "
+            f"AND {game_type_clause} "
+            f"{names_where}"
+            "GROUP BY firstname, lastname "
+            "ORDER BY min DESC NULLS LAST "
+            "LIMIT 10;"
+        )
+
+    return (
+        "SELECT firstname || ' ' || lastname AS player_name, MAX(playerteamname) AS team_abbreviation, "
+        "COUNT(*) AS gp, "
+        "ROUND(CAST(AVG(NULLIF(regexp_replace(points::text, '[^0-9\\.-]', '', 'g'), '')::double precision) AS numeric), 1) AS pts, "
+        "ROUND(CAST(AVG(NULLIF(regexp_replace(reboundstotal::text, '[^0-9\\.-]', '', 'g'), '')::double precision) AS numeric), 1) AS reb, "
+        "ROUND(CAST(AVG(NULLIF(regexp_replace(assists::text, '[^0-9\\.-]', '', 'g'), '')::double precision) AS numeric), 1) AS ast "
+        'FROM public."player_statistics_archive" '
+        f"WHERE gamedatetimeest::timestamp >= '{season_start}'::timestamp "
+        f"AND gamedatetimeest::timestamp < '{season_end}'::timestamp "
+        f"AND {game_type_clause} "
+        f"{names_where}"
+        "GROUP BY firstname, lastname "
+        "ORDER BY pts DESC NULLS LAST "
+        "LIMIT 10;"
+    )
+
+
+def _extract_loose_player_name_candidates(question_text: str) -> list[str]:
+    q = (question_text or "").strip()
+    if not q:
+        return []
+    out: list[str] = []
+    patterns = [
+        re.compile(r"(?i)\bhow many total minutes did\s+([a-z][a-z\-\.\']+(?:\s+[a-z][a-z\-\.\']+){1,2})\s+play\b"),
+        re.compile(r"(?i)\btell me about\s+([a-z][a-z\-\.\']+(?:\s+[a-z][a-z\-\.\']+){1,2})\b"),
+        re.compile(r"(?i)\bstats for\s+([a-z][a-z\-\.\']+(?:\s+[a-z][a-z\-\.\']+){1,2})\b"),
+    ]
+    for pattern in patterns:
+        m = pattern.search(q)
+        if not m:
+            continue
+        candidate = re.sub(r"\s+", " ", m.group(1)).strip(" ,.;:!?")
+        if candidate:
+            out.append(" ".join([w.capitalize() for w in candidate.split()]))
+    dedup: list[str] = []
+    seen = set()
+    for n in out:
+        k = n.lower()
+        if k in seen:
+            continue
+        seen.add(k)
+        dedup.append(n)
+    return dedup
+
+
 def _ensure_all_players_broad_columns(sql_query: str, user_input: str) -> str:
     q = sql_query or ""
     q_lower = q.lower()
@@ -3532,6 +3820,7 @@ Generate the SQL:"""
     sql_query = _enforce_regular_totals_table_mapping(sql_query, user_input_param)
     sql_query = _enforce_no_year_playoff_player_fallback(sql_query, user_input_param, conn)
     sql_query = _enforce_nth_season_table_mapping(sql_query, user_input_param, conn)
+    sql_query = _enforce_single_player_by_season_query(sql_query, user_input_param, conn)
     sql_query = _rewrite_nth_season_comparison_sql(sql_query, user_input_param, conn)
     sql_query = _rewrite_implicit_head_to_head_to_career_sql(sql_query, user_input_param, conn)
     sql_query = _enforce_advanced_table_mapping(sql_query, user_input_param, schema_description)
@@ -3577,6 +3866,7 @@ Generate the SQL:"""
             sql_query = _enforce_regular_totals_table_mapping(sql_query, user_input_param)
             sql_query = _enforce_no_year_playoff_player_fallback(sql_query, user_input_param, conn)
             sql_query = _enforce_nth_season_table_mapping(sql_query, user_input_param, conn)
+            sql_query = _enforce_single_player_by_season_query(sql_query, user_input_param, conn)
             sql_query = _rewrite_nth_season_comparison_sql(sql_query, user_input_param, conn)
             sql_query = _rewrite_implicit_head_to_head_to_career_sql(sql_query, user_input_param, conn)
             sql_query = _enforce_advanced_table_mapping(sql_query, user_input_param, schema_description)
@@ -3601,6 +3891,7 @@ Generate the SQL:"""
             sql_query = _enforce_regular_totals_table_mapping(sql_query, user_input_param)
             if not _is_advanced_metrics_request(user_input_param):
                 sql_query = _enforce_raw_data_only_sql(sql_query)
+    sql_query = _enforce_pre_1996_archive_routing(sql_query, user_input_param)
     sql_query = _rewrite_nth_season_comparison_sql(sql_query, user_input_param, conn)
     sql_query = _rewrite_implicit_head_to_head_to_career_sql(sql_query, user_input_param, conn)
     sql_query = _enforce_best_team_record_query(sql_query, user_input_param, schema_description)
@@ -3631,6 +3922,7 @@ Generate the SQL:"""
             sql_query = _enforce_team_table_columns(sql_query, user_input_param)
             sql_query = _enforce_defense_table_columns(sql_query)
             sql_query = _enforce_violations_table_columns(sql_query)
+            sql_query = _enforce_pre_1996_archive_routing(sql_query, user_input_param)
             logger.debug("Attempt %d executing query...", attempt + 1)
             logger.info("Final SQL being executed:\n%s", sql_query)
             tables_used = _extract_tables_from_sql(sql_query)
@@ -3678,6 +3970,14 @@ Generate the SQL:"""
                     fallback_tables = _extract_tables_from_sql(fallback_sql)
                     _LAST_TABLES_USED = list(fallback_tables)
                     return execute_query(conn, fallback_sql)
+            archive_fallback_sql = _build_archive_supplement_fallback_sql(user_input_param)
+            if archive_fallback_sql:
+                logger.info("Primary query empty; trying archive supplement SQL:\n%s", archive_fallback_sql)
+                fallback_tables = _extract_tables_from_sql(archive_fallback_sql)
+                _LAST_TABLES_USED = list(fallback_tables)
+                archive_df = execute_query(conn, archive_fallback_sql)
+                if archive_df is not None and not archive_df.empty:
+                    return archive_df
             return result_df
 
         except Exception as e:
@@ -3715,6 +4015,7 @@ Generate the SQL:"""
                 sql_query = _enforce_regular_totals_table_mapping(sql_query, user_input_param)
                 sql_query = _enforce_no_year_playoff_player_fallback(sql_query, user_input_param, conn)
                 sql_query = _enforce_nth_season_table_mapping(sql_query, user_input_param, conn)
+                sql_query = _enforce_single_player_by_season_query(sql_query, user_input_param, conn)
                 sql_query = _rewrite_nth_season_comparison_sql(sql_query, user_input_param, conn)
                 sql_query = _rewrite_implicit_head_to_head_to_career_sql(sql_query, user_input_param, conn)
                 sql_query = _enforce_advanced_table_mapping(sql_query, user_input_param, schema_description)
@@ -3744,6 +4045,7 @@ Generate the SQL:"""
                 sql_query = _enforce_regular_totals_table_mapping(sql_query, user_input_param)
                 if not _is_advanced_metrics_request(user_input_param):
                     sql_query = _enforce_raw_data_only_sql(sql_query)
+                sql_query = _enforce_pre_1996_archive_routing(sql_query, user_input_param)
                 sql_query = _rewrite_nth_season_comparison_sql(sql_query, user_input_param, conn)
                 sql_query = _rewrite_implicit_head_to_head_to_career_sql(sql_query, user_input_param, conn)
                 sql_query = limit_rows(sql_query)

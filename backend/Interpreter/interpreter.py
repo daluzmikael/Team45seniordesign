@@ -792,6 +792,33 @@ def _enforce_advanced_table_mapping(sql_query: str, user_input: str, schema_desc
     if not sql_query or not _is_advanced_metrics_request(user_input):
         return sql_query
 
+    # Check whether the user's CURRENT question explicitly mentions a year.
+    # If it doesn't, but the model's emitted SQL already references a valid
+    # nba_advanced_* table, trust the model — it most likely picked up the
+    # year from prior conversation context (e.g. "Breakdown his 2018 season"
+    # → "What about his net rating" should keep 2018-19, not jump to current).
+    current_q = _extract_current_question_text(user_input).lower()
+    has_explicit_year = bool(re.search(r"\b(19\d{2}|20\d{2})\b", current_q))
+    has_explicit_season_label = bool(re.search(r"\b(19\d{2}|20\d{2})\s*[-/]\s*\d{2}\b", current_q))
+    has_explicit_phrasing = any(
+        k in current_q for k in (
+            "this season", "current season", "last season",
+            "this playoff", "current playoff", "last playoff",
+            "rookie", "first season", "second season", "third season",
+        )
+    )
+    user_specified_year = has_explicit_year or has_explicit_season_label or has_explicit_phrasing
+
+    if not user_specified_year:
+        # Check if the model's SQL already cites a real nba_advanced_* table.
+        existing_advanced = re.search(
+            r"(?i)nba_advanced_season_\d{4}_\d{2}_season_type_(?:regular_season|playoffs)_[a-z0-9_]+",
+            sql_query,
+        )
+        if existing_advanced:
+            # Trust the model — likely picked up year from context.
+            return sql_query
+
     start, end, is_playoffs = _extract_requested_season_window(user_input)
     target = _pick_available_advanced_table(schema_description, start, end, is_playoffs)
     target_ref = _qualified_public_table_ref(target)
@@ -1374,10 +1401,37 @@ def _ensure_season_columns_in_sql(sql_query: str) -> str:
     """
     Ensure season context is always present for season-summary table queries so
     the analyzer can name the exact referenced season from returned rows.
+
+    UNION-aware: when the SQL is already a multi-leg UNION ALL whose first leg
+    declares a season label/start column (or whose first leg already includes a
+    string-literal that is positionally the season label), we leave it alone.
+    Postgres inherits column names from the first leg, so injecting differently
+    into legs 2..N will create a column-count mismatch and fail.
     """
     q = sql_query or ""
     if not q:
         return q
+
+    # Detect UNION ALL queries — if any UNION ALL is present, only inject into
+    # legs that don't ALREADY have either an explicit `AS season_label` clause
+    # OR a same-position string literal (which inherits the column name from
+    # the first leg). In practice the simplest safe rule is: if the SQL
+    # contains UNION ALL and the FIRST leg already names season_start or
+    # season_label, skip injection completely — the season columns are present.
+    has_union = bool(re.search(r"(?i)\bunion\s+all\b", q))
+    if has_union:
+        first_leg_match = re.search(
+            r"(?is)\bselect\b(?P<select_part>.*?)\bfrom\b\s+all_players_(?:regular|playoffs)_\d{4}_\d{4}",
+            q,
+        )
+        if first_leg_match:
+            first_select = first_leg_match.group("select_part")
+            if (re.search(r"(?i)\bseason_start\b", first_select)
+                    or re.search(r"(?i)\bseason_label\b", first_select)):
+                # Season columns are already declared on the first leg and
+                # inherited by the rest. Do NOT inject — that would unbalance
+                # the UNION column counts.
+                return q
 
     leg_pattern = re.compile(
         r"(?is)(select\s+)(?P<select_part>.*?)(\s+from\s+)"
@@ -1555,6 +1609,22 @@ Do NOT include any additional text or markdown.
 
     fixed_sql = response.choices[0].message.content.strip()
     fixed_sql = fixed_sql.replace("```sql", "").replace("```", "").strip()
+
+    # Strip leading prose/comments. The repair model occasionally returns
+    # "Here is the corrected SQL:\nSELECT ..." or similar. Find the first
+    # WITH/SELECT and trim everything before it. (Only WITH and SELECT are
+    # allowed by the executor, and our prompt rules only ask for SELECT, but
+    # we tolerate a leading WITH CTE as well so the executor's validator can
+    # decide.)
+    select_match = re.search(r"(?i)\b(SELECT|WITH)\b", fixed_sql)
+    if select_match:
+        fixed_sql = fixed_sql[select_match.start():].strip()
+    # Strip a trailing semicolon if there's prose after it (rare).
+    semi_match = re.search(r";", fixed_sql)
+    if semi_match:
+        # Keep everything up to and including the first semicolon to avoid
+        # multi-statement issues.
+        fixed_sql = fixed_sql[: semi_match.end()].strip()
 
     return fixed_sql
 

@@ -20,7 +20,12 @@ from auth import (
     get_conversation_messages,
     list_conversations,
 )
-from Interpreter.interpreter import run_query, debug_query_routing, get_last_tables_used
+from Interpreter.interpreter import (
+    run_query,
+    debug_query_routing,
+    get_last_tables_used,
+    pronoun_stats_query_missing_player,
+)
 import numpy as np
 import pandas as pd
 import re
@@ -31,6 +36,12 @@ app = FastAPI()
 
 _RESPONSE_CACHE_LOCK = Lock()
 _RESPONSE_CACHE: dict[str, tuple[float, Dict[str, Any]]] = {}
+
+# When the client omits `history`, remember the last user question per conversation/session
+# so follow-ups ("his stats", "same for playoffs") still resolve player/season context.
+_LAST_QUESTION_LOCK = Lock()
+_LAST_QUESTION_BY_KEY: dict[str, tuple[str, float]] = {}
+_LAST_QUESTION_TTL_SECONDS = int(os.getenv("LAST_QUESTION_TTL_SECONDS", str(45 * 60)))
 
 
 def _cache_ttl_seconds() -> int:
@@ -83,6 +94,8 @@ app.add_middleware(
 class QueryRequest(BaseModel):
     question: str
     conversationId: Optional[str] = None
+    # Optional guest/anonymous thread key when conversationId is not used; enables server-side last-question memory.
+    sessionId: Optional[str] = None
     history: Optional[List[Dict[str, Any]]] = None
 
 class AuthRequest(BaseModel):
@@ -246,7 +259,11 @@ def _should_apply_history_context(question: str) -> bool:
     followup_markers = [
         "what about",
         "how about",
-        "and ",
+        # Do not use bare "and " — it matches "Compare X and Y" player pairs and wrongly
+        # injects unrelated chat history into standalone compare questions.
+        "and also",
+        "and what about",
+        "and how about",
         "also",
         "same ",
         "that ",
@@ -257,6 +274,15 @@ def _should_apply_history_context(question: str) -> bool:
         "her ",
         "their ",
         "break that down",
+        "breakdown",
+        "elaborate",
+        "more detail",
+        "go deeper",
+        "same player",
+        "same season",
+        "previous",
+        "last answer",
+        "last response",
         "which one",
         "who is better",
         "who's better",
@@ -271,9 +297,13 @@ def _should_apply_history_context(question: str) -> bool:
     if any(marker in q for marker in followup_markers):
         return True
 
+    # Pronouns / deictic references (word-boundary; avoids matching substrings like "history").
+    if re.search(r"\b(his|her|their|him|them|they|he|she)\b", q):
+        return True
+
     # Very short prompts are often dependent on prior context.
     token_count = len(re.findall(r"\w+", q))
-    return token_count <= 4
+    return token_count <= 6
 
 
 def _analysis_debug_enabled() -> bool:
@@ -296,6 +326,38 @@ def _sanitize_history_messages(history: Optional[List[Dict[str, Any]]]) -> List[
         sanitized.append({"role": role, "content": content})
     return sanitized
 
+
+def _last_question_context_key(request: QueryRequest) -> Optional[str]:
+    cid = (request.conversationId or "").strip()
+    if cid:
+        return f"cid:{cid}"
+    sid = (request.sessionId or "").strip()
+    if sid:
+        return f"sid:{sid}"
+    return None
+
+
+def _recall_last_user_question(key: str) -> Optional[str]:
+    now = time.time()
+    with _LAST_QUESTION_LOCK:
+        row = _LAST_QUESTION_BY_KEY.get(key)
+        if not row:
+            return None
+        text, ts = row
+        if (now - ts) > _LAST_QUESTION_TTL_SECONDS:
+            _LAST_QUESTION_BY_KEY.pop(key, None)
+            return None
+        t = (text or "").strip()
+        return t or None
+
+
+def _remember_user_question(key: str, question: str) -> None:
+    qt = (question or "").strip()
+    if not qt or not key:
+        return
+    with _LAST_QUESTION_LOCK:
+        _LAST_QUESTION_BY_KEY[key] = (qt, time.time())
+
 @app.post("/api/dashboards")
 async def dashboard_endpoint(request: QueryRequest):
     result = interpret_question(request.question)
@@ -317,10 +379,23 @@ async def analysis_endpoint(
         history_context_applied = False
         history_context_reason = "no_history_available"
         history_messages: List[Dict[str, Any]] = _sanitize_history_messages(request.history)
+        context_key = _last_question_context_key(request)
+        history_from_server_memory = False
+        if not history_messages and context_key:
+            prev_q = _recall_last_user_question(context_key)
+            cur_q = (request.question or "").strip()
+            if (
+                prev_q
+                and prev_q.strip().lower() != cur_q.lower()
+                and _should_apply_history_context(request.question)
+            ):
+                history_messages = [{"role": "user", "content": prev_q}]
+                history_from_server_memory = True
 
-        # Prefer history passed by the frontend (works for both guest and auth chats).
-        # Always apply available history so sequential questions consistently keep context.
-        if history_messages:
+        # Prefer history passed by the frontend (works for both guest and auth chats),
+        # but only inject it for likely follow-up prompts to avoid contaminating
+        # standalone questions with stale player/season context.
+        if history_messages and _should_apply_history_context(request.question):
             effective_question = _build_contextual_question(request.question, history_messages)
             player_name, season_label = _extract_latest_player_and_season_from_history(history_messages)
             if season_label and (_is_affirmative_followup(request.question) or _should_force_previous_context(request.question)):
@@ -334,7 +409,11 @@ async def analysis_endpoint(
                         f" Keep player context anchored to {player_name} when resolving pronouns/references."
                     )
             history_context_applied = True
-            history_context_reason = "request_history_used"
+            history_context_reason = (
+                "server_last_question_recalled"
+                if history_from_server_memory
+                else "request_history_used"
+            )
         # Fallback for older clients: load persisted history for authenticated users.
         elif request.conversationId and authorization:
             try:
@@ -342,7 +421,7 @@ async def analysis_endpoint(
                 history_result = get_conversation_messages(uid, request.conversationId.strip())
                 if history_result.get("success"):
                     fetched_history = history_result.get("messages", [])
-                    if isinstance(fetched_history, list) and fetched_history:
+                    if isinstance(fetched_history, list) and fetched_history and _should_apply_history_context(request.question):
                         effective_question = _build_contextual_question(
                             request.question, fetched_history
                         )
@@ -359,6 +438,8 @@ async def analysis_endpoint(
                                 )
                         history_context_applied = True
                         history_context_reason = "stored_history_used"
+                    elif isinstance(fetched_history, list) and fetched_history:
+                        history_context_reason = "stored_history_present_not_applied"
                     else:
                         history_context_reason = "stored_history_empty"
                 else:
@@ -369,6 +450,8 @@ async def analysis_endpoint(
                 history_context_reason = "history_lookup_exception"
         elif history_messages:
             history_context_reason = "request_history_present_but_unused"
+        elif context_key and _recall_last_user_question(context_key):
+            history_context_reason = "server_last_question_available_not_applied"
         elif request.conversationId and authorization:
             history_context_reason = "stored_history_unavailable"
         elif request.conversationId and not authorization:
@@ -389,6 +472,8 @@ async def analysis_endpoint(
             if _analysis_debug_enabled():
                 cached_payload.setdefault("debug", {})
                 cached_payload["debug"]["cacheHit"] = True
+            if context_key:
+                _remember_user_question(context_key, request.question)
             return cached_payload
 
         # Run the query ONCE here — do not let query_analyzer run it again
@@ -410,6 +495,14 @@ async def analysis_endpoint(
                     "- Try a specific playoff year (example: 'Giannis 2021 playoff performance').\n"
                     "- If you want, ask for regular-season stats instead."
                 )
+            elif pronoun_stats_query_missing_player(effective_question):
+                empty_message = (
+                    "This question uses **his / her / their** but no player was resolved from your message or "
+                    "recent chat context.\n"
+                    "- Name the player explicitly, e.g. **LeBron James defensive stats from 2004-2016**.\n"
+                    "- Or send the same **conversationId** / **sessionId** as your previous question and include "
+                    "**history** (or ask right after a message that names the player)."
+                )
             else:
                 empty_message = (
                     "I don't currently have enough data in the database to answer this question confidently.\n"
@@ -430,7 +523,11 @@ async def analysis_endpoint(
                     "historyContextApplied": history_context_applied,
                     "historyContextReason": history_context_reason,
                     "conversationId": request.conversationId,
+                    "sessionId": request.sessionId,
+                    "historyFromServerMemory": history_from_server_memory,
                 }
+            if context_key:
+                _remember_user_question(context_key, request.question)
             _set_cached_response(cache_key, payload)
             return payload
 
@@ -439,7 +536,8 @@ async def analysis_endpoint(
 
         # Pass the already-fetched dataframe directly to the analyzer
         # so it does NOT run a second query internally
-        analysis_result = analyze_question_with_data(request.question, query_result)
+        analysis_question = effective_question if history_context_applied else request.question
+        analysis_result = analyze_question_with_data(analysis_question, query_result)
         q_lower = (request.question or "").lower()
         if "clutch" in q_lower:
             low_analysis = (analysis_result or "").lower()
@@ -461,7 +559,11 @@ async def analysis_endpoint(
                 "historyContextApplied": history_context_applied,
                 "historyContextReason": history_context_reason,
                 "conversationId": request.conversationId,
+                "sessionId": request.sessionId,
+                "historyFromServerMemory": history_from_server_memory,
             }
+        if context_key:
+            _remember_user_question(context_key, request.question)
         _set_cached_response(cache_key, payload)
         return payload
 

@@ -253,9 +253,10 @@ def validate_and_normalize_sql(sql_query: str) -> str:
     except ParseError as e:
         raise ValueError(f"SQL Syntax Error: {e}")
 
-    #  only SELECT statement
-    if parsed.key.upper() != "SELECT":
-        raise ValueError("Only SELECT statements are allowed.")
+    # Only read queries: a single SELECT, or UNION / UNION ALL of SELECTs (e.g. cross-season compare).
+    root = parsed.key.upper()
+    if root not in ("SELECT", "UNION"):
+        raise ValueError("Only SELECT statements (including UNION ALL of SELECTs) are allowed.")
 
     # no multiple statements
     if ";" in sql_query.strip().rstrip(";"):

@@ -529,7 +529,7 @@ def _extract_season_reference_text(question: str) -> Optional[str]:
         return f"{start}-{str(end)[-2:]} season"
 
     if "this season" in q or "current season" in q:
-        return "2024-25 season"
+        return "2025-26 season"
     if "this playoff" in q or "current playoff" in q:
         return "2024-25 playoffs"
     if "last season" in q:
@@ -538,6 +538,54 @@ def _extract_season_reference_text(question: str) -> Optional[str]:
         return "2024-25 playoffs"
 
     return None
+
+
+def _question_has_explicit_season_phrase(question: str) -> bool:
+    """True if the user named a season window; mirrors backend interpreter season cues."""
+    ql = (question or "").lower()
+    if re.search(r"\b(19\d{2}|20\d{2})\s*[-/_]\s*(\d{2}|19\d{2}|20\d{2})\b", ql):
+        return True
+    if re.search(r"\b(19\d{2}|20\d{2})\b", ql):
+        return True
+    seasonal = (
+        "this season",
+        "current season",
+        "last season",
+        "this playoff",
+        "current playoff",
+        "last playoff",
+        "postseason",
+        "playoffs",
+        "regular season",
+    )
+    return any(k in ql for k in seasonal)
+
+
+def _implicit_default_season_llm_note(question: str) -> str:
+    """When no season is named, remind the model the backend defaults to the current NBA season."""
+    if _question_has_explicit_season_phrase(question):
+        return ""
+    ql = (question or "").lower()
+    if any(
+        h in ql
+        for h in (
+            "what year",
+            "which year",
+            "when did",
+            "draft",
+            "debut",
+            "retire",
+            "career high",
+            "career total",
+            "mvp race",
+        )
+    ):
+        return ""
+    return (
+        "\n\nSeason context: The query used the current default NBA season because the question "
+        "did not specify a year or range (2025-26 regular season). Say explicitly that these numbers "
+        "are for **this season (2025-26)** (or equivalent wording) in the opening or first paragraph."
+    )
 
 
 def _is_single_player_stats_question(question: str, df: pd.DataFrame) -> bool:
@@ -733,6 +781,55 @@ def _is_single_player_season_trend_question(question: str, df: pd.DataFrame) -> 
     return unique_players <= 2
 
 
+def _fallback_trend_stat_columns(
+    working: pd.DataFrame, is_defense: bool, is_shooting: bool, is_rebounding: bool
+) -> list[tuple[str, str]]:
+    """When preset column lists miss the dataframe, infer numeric stat columns to still render a table."""
+    skip = {
+        "season_start",
+        "season_label",
+        "season",
+        "season_year",
+        "season_id",
+        "player_name",
+        "team",
+        "team_abbreviation",
+        "player_id",
+    }
+    extras: list[str] = []
+    for c in working.columns:
+        if c in skip:
+            continue
+        try:
+            if pd.api.types.is_numeric_dtype(working[c]):
+                extras.append(str(c))
+        except Exception:
+            continue
+    if is_defense:
+        pref = ["stl", "blk", "dreb", "oreb", "reb", "pf", "gp"]
+        ordered = [c for c in pref if c in extras]
+        if not ordered:
+            ordered = extras[:10]
+        return [(c.upper().replace("_", " "), c) for c in ordered]
+    if is_shooting:
+        pref = ["fg_pct", "fg3_pct", "ft_pct", "fgm", "fga", "fg3m", "fg3a", "gp"]
+        ordered = [c for c in pref if c in extras]
+        if not ordered:
+            ordered = extras[:10]
+        return [(c.upper().replace("_", " "), c) for c in ordered]
+    if is_rebounding:
+        pref = ["reb", "oreb", "dreb", "gp"]
+        ordered = [c for c in pref if c in extras]
+        if not ordered:
+            ordered = extras[:10]
+        return [(c.upper().replace("_", " "), c) for c in ordered]
+    pref = ["pts", "reb", "ast", "fg_pct", "fg3_pct", "gp"]
+    ordered = [c for c in pref if c in extras]
+    if not ordered:
+        ordered = extras[:10]
+    return [(c.upper().replace("_", " "), c) for c in ordered]
+
+
 def _format_single_player_season_trend_response(df: pd.DataFrame, question: str, client: Optional[Any]) -> str:
     q = (question or "").lower()
     working = df.copy()
@@ -789,18 +886,56 @@ def _format_single_player_season_trend_response(df: pd.DataFrame, question: str,
 
     is_shooting = any(k in q for k in ["shoot", "fg%", "3 point", "3p", "percentage"])
     is_rebounding = any(k in q for k in ["rebound", "boards", "glass"])
-    is_defense = any(k in q for k in ["block", "blk", "steal", "stl", "defense"])
+    is_defense = any(
+        k in q
+        for k in [
+            "defensive stat",
+            "defensive stats",
+            "defensive numbers",
+            "defensive profile",
+            "defensively",
+            "defensive",
+            "defense stat",
+            "defense stats",
+            "defense",
+            "defender",
+            "block",
+            "blk",
+            "steal",
+            "stl",
+            "rim protection",
+            "stopper",
+        ]
+    )
+    # Query may already be defensive-only (no per-game points column); honor that even if phrasing is vague.
+    if not is_defense and "stl" in working.columns and "pts" not in working.columns:
+        is_defense = True
+    # Full row per-game data: still show defensive columns when the question is clearly defensive.
+    if not is_defense and re.search(r"\b(defensive|defense stats)\b", q) and "stl" in working.columns:
+        is_defense = True
 
     if is_shooting:
         columns = [("FG%", "fg_pct"), ("3P%", "fg3_pct"), ("FT%", "ft_pct"), ("FGM", "fgm"), ("FGA", "fga"), ("3PM", "fg3m"), ("3PA", "fg3a")]
     elif is_rebounding:
         columns = [("REB", "reb"), ("OREB", "oreb"), ("DREB", "dreb"), ("REB Rank", "reb_rank"), ("OREB Rank", "oreb_rank"), ("DREB Rank", "dreb_rank")]
     elif is_defense:
-        columns = [("BLK", "blk"), ("STL", "stl"), ("BLK Rank", "blk_rank"), ("STL Rank", "stl_rank"), ("Games", "gp")]
+        columns = [
+            ("STL", "stl"),
+            ("BLK", "blk"),
+            ("DREB", "dreb"),
+            ("OREB", "oreb"),
+            ("REB", "reb"),
+            ("PF", "pf"),
+            ("STL Rank", "stl_rank"),
+            ("BLK Rank", "blk_rank"),
+            ("Games", "gp"),
+        ]
     else:
         columns = [("PTS", "pts"), ("REB", "reb"), ("AST", "ast"), ("FG%", "fg_pct"), ("3P%", "fg3_pct")]
 
     available = [(label, col) for label, col in columns if col in working.columns]
+    if not available:
+        available = _fallback_trend_stat_columns(working, is_defense, is_shooting, is_rebounding)
     if not available:
         return ""
 
@@ -830,10 +965,17 @@ def _format_single_player_season_trend_response(df: pd.DataFrame, question: str,
     if client is not None:
         try:
             sample = working[[season_col] + [c for _, c in available]].head(8).to_dict(orient="records")
+            trend_system = (
+                "Write 2 concise sentences summarizing the trend in these season-by-season defensive stats "
+                "(steals, blocks, rebound splits, fouls as shown). Focus on defensive impact, not scoring; "
+                "cite at least one concrete number from the sample."
+                if is_defense
+                else "Write 2 concise sentences summarizing the trend in these season-by-season stats. Use plain language and include at least one concrete stat reference."
+            )
             resp = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
-                    {"role": "system", "content": "Write 2 concise sentences summarizing the trend in these season-by-season stats. Use plain language and include at least one concrete stat reference."},
+                    {"role": "system", "content": trend_system},
                     {"role": "user", "content": f"Question: {question}\nPlayers: {unique_players or [player_name]}\nSeason rows: {sample}"},
                 ],
                 temperature=0.2,
@@ -871,7 +1013,11 @@ def _format_single_player_season_trend_response(df: pd.DataFrame, question: str,
 
     asks_peak = any(k in q for k in ["highest", "best", "most", "peak"])
     if asks_peak and not working.empty:
-        metric_candidates = ["pts", "ast", "reb", "blk", "stl", "fg3m", "fg_pct", "fg3_pct", "ft_pct"]
+        metric_candidates = (
+            ["stl", "blk", "dreb", "reb", "oreb", "pf"]
+            if is_defense
+            else ["pts", "ast", "reb", "blk", "stl", "fg3m", "fg_pct", "fg3_pct", "ft_pct"]
+        )
         chosen = next((c for c in metric_candidates if c in working.columns), None)
         if chosen is not None:
             numeric = pd.to_numeric(working[chosen], errors="coerce")
@@ -886,6 +1032,11 @@ def _format_single_player_season_trend_response(df: pd.DataFrame, question: str,
     if not summary:
         if is_multi_player:
             summary = "This table shows the season-by-season rows for each player in the requested span so you can compare their production over time."
+        elif is_defense:
+            summary = (
+                "This table shows season-by-season defensive counting stats for the requested span "
+                "(steals, blocks, rebounding splits, fouls)."
+            )
         else:
             summary = "This table shows the season-by-season trend so you can see how his production and efficiency changed over time."
 
@@ -1846,7 +1997,7 @@ def analyze_dataframe() -> str:
         return _format_single_player_clutch_profile(df_output, user_input)
     if is_single_player_trend:
         trend_text = _format_single_player_season_trend_response(df_output, user_input, client)
-        if trend_text:
+        if trend_text and trend_text.strip():
             return trend_text
     if is_single_player_stats:
         return _format_single_player_stats_profile(df_output, user_input, client)
@@ -1893,6 +2044,7 @@ def analyze_dataframe() -> str:
             f"User's question: {user_input}\n\n"
             f"Data:\n{df_summary}\n"
             "Analyze the data and answer the question in a fluid, engaging sports-analyst style."
+            f"{_implicit_default_season_llm_note(user_input)}"
         )
 
     try:
@@ -2012,7 +2164,7 @@ def analyze_question(question: str) -> str:
         return _format_single_player_clutch_profile(df, question)
     if is_single_player_trend:
         trend_text = _format_single_player_season_trend_response(df, question, client)
-        if trend_text:
+        if trend_text and trend_text.strip():
             return trend_text
     if is_single_player_stats:
         return _format_single_player_stats_profile(df, question, client)
@@ -2059,6 +2211,7 @@ def analyze_question(question: str) -> str:
             f"User's question: {question}\n\n"
             f"Data:\n{df_summary}\n"
             "Analyze the data and answer the question in a fluid, engaging sports-analyst style."
+            f"{_implicit_default_season_llm_note(question)}"
         )
 
     try:
@@ -2161,7 +2314,7 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
 
     if is_single_player_trend:
         trend_text = _format_single_player_season_trend_response(df, question, client)
-        if trend_text:
+        if trend_text and trend_text.strip():
             return trend_text
     if is_clutch_profile:
         return _format_single_player_clutch_profile(df, question)
@@ -2209,6 +2362,7 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
             f"User's question: {question}\n\n"
             f"Data:\n{df_summary}\n"
             "Analyze the data and answer the question in a fluid, engaging sports-analyst style."
+            f"{_implicit_default_season_llm_note(question)}"
         )
 
     try:

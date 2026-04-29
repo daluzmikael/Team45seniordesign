@@ -8,6 +8,11 @@ import json
 import logging
 import os
 from typing import Optional
+import time
+
+
+_schema_cache: dict = {"value": None, "fetched_at": 0.0}
+_SCHEMA_TTL_SECONDS = 600
 
 # Root logging is configured by the app entrypoint (e.g. Interpreter.interpreter before
 # this import, or uvicorn). Avoid basicConfig here so we do not steal first configuration
@@ -30,8 +35,10 @@ def get_connection():
 # Only includes tables the app actually queries. Groups repeated season tables
 # by type and lists columns once. Cuts token usage by ~95% vs the original.
 
-# Table patterns the app actually uses — everything else is excluded
-_RELEVANT_TABLE_PATTERNS = [
+
+
+# Heavy-use families: show columns once (these are 95% of queries)
+_HEAVY_USE_PATTERNS = [
     r"all_players_regular_\d{4}_\d{4}$",
     r"all_players_playoffs_\d{4}_\d{4}$",
     r"nba_advanced_season_\d{4}_\d{2}_season_type_(regular_season|playoffs)_per_mode_p",
@@ -39,111 +46,121 @@ _RELEVANT_TABLE_PATTERNS = [
     r"court_shots$",
 ]
 
-def _is_relevant_table(table_name: str) -> bool:
-    return any(re.match(p, table_name) for p in _RELEVANT_TABLE_PATTERNS)
+# Other families: list patterns + counts only (cheap awareness)
+_OTHER_FAMILY_PREFIXES = [
+    "nba_hustle_season_",
+    "nba_clutch_season_",
+    "nba_lineups_group_",       # nba_lineups_group_5_season_*
+    "nba_schedule_",
+    "nba_standings_",
+    "nba_player_tracking_pt_",  # catchshoot, drives, passing, defense, etc.
+    "team_advanced_season_",     # team-level advanced stats
+]
+
+def _summarize_sql(sql: str, max_chars: int = 600) -> str:
+    one_line = re.sub(r"\s+", " ", sql or "").strip()
+    if len(one_line) <= max_chars:
+        return one_line
+    return one_line[:max_chars] + f"... [+{len(one_line) - max_chars} chars]"
+
+
+def _is_heavy_use_table(table_name: str) -> bool:
+    return any(re.match(p, table_name) for p in _HEAVY_USE_PATTERNS)
 
 
 def get_db_schema(conn):
-    logger.debug("Fetching database schema (compact + whitelisted)...")
+
+    now = time.time()
+    if _schema_cache["value"] and (now - _schema_cache["fetched_at"]) < _SCHEMA_TTL_SECONDS:
+        return _schema_cache["value"]
+    
+    logger.debug("Fetching database schema (tiered)...")
     cursor = conn.cursor()
-
     cursor.execute("""
-        SELECT table_name
-        FROM information_schema.tables
-        WHERE table_schema = 'public'
-        ORDER BY table_name;
+        SELECT table_name FROM information_schema.tables
+        WHERE table_schema = 'public' ORDER BY table_name;
     """)
-
     all_tables = [row[0] for row in cursor.fetchall()]
 
-    # Filter to only relevant tables
-    tables = [t for t in all_tables if _is_relevant_table(t)]
-    logger.debug("Schema: %d relevant tables out of %d total", len(tables), len(all_tables))
+    heavy = [t for t in all_tables if _is_heavy_use_table(t)]
 
-    # Categorize by type
-    regular_tables = sorted([t for t in tables if re.match(r"all_players_regular_\d{4}_\d{4}$", t)])
-    playoffs_tables = sorted([t for t in tables if re.match(r"all_players_playoffs_\d{4}_\d{4}$", t)])
-    advanced_tables = sorted([t for t in tables if t.startswith("nba_advanced_season_")])
-    other_tables = [t for t in tables if t not in regular_tables and t not in playoffs_tables and t not in advanced_tables]
+    regular_tables  = sorted(t for t in heavy if re.match(r"all_players_regular_\d{4}_\d{4}$", t))
+    playoffs_tables = sorted(t for t in heavy if re.match(r"all_players_playoffs_\d{4}_\d{4}$", t))
+    advanced_tables = sorted(t for t in heavy if t.startswith("nba_advanced_season_"))
+    other_heavy     = [t for t in heavy if t not in regular_tables and t not in playoffs_tables and t not in advanced_tables]
 
     schema_parts = []
 
-    # Regular season tables — columns once, enumerate years
-    if regular_tables:
-        cursor.execute(f"""
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name = '{regular_tables[-1]}'
-            ORDER BY ordinal_position;
-        """)
-        columns = ", ".join([col[0] for col in cursor.fetchall()])
+    def _columns_for(table):
+        cursor.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = %s ORDER BY ordinal_position;",
+            (table,),
+        )
+        return ", ".join(c[0] for c in cursor.fetchall())
 
+    # ---- Heavy-use families: full column lists (single sample) ----
+    if regular_tables:
         years = []
         for t in regular_tables:
             m = re.match(r"all_players_regular_(\d{4})_(\d{4})$", t)
-            if m:
-                years.append(f"{m.group(1)}-{m.group(2)}")
-
+            if m: years.append(f"{m.group(1)}-{m.group(2)}")
         schema_parts.append(
-            f"=== Regular Season Tables ===\n"
-            f"Table pattern: all_players_regular_YYYY_YYYY\n"
-            f"Columns (same for all): {columns}\n"
-            f"Available tables ({len(regular_tables)}): {', '.join(years)}\n"
+            "=== Regular Season Tables ===\n"
+            "Pattern: all_players_regular_YYYY_YYYY\n"
+            f"Columns: {_columns_for(regular_tables[-1])}\n"
+            f"Available ({len(regular_tables)}): {', '.join(years)}\n"
         )
 
-    # Playoffs tables
     if playoffs_tables:
-        cursor.execute(f"""
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name = '{playoffs_tables[-1]}'
-            ORDER BY ordinal_position;
-        """)
-        columns = ", ".join([col[0] for col in cursor.fetchall()])
-
         years = []
         for t in playoffs_tables:
             m = re.match(r"all_players_playoffs_(\d{4})_(\d{4})$", t)
-            if m:
-                years.append(f"{m.group(1)}-{m.group(2)}")
-
+            if m: years.append(f"{m.group(1)}-{m.group(2)}")
         schema_parts.append(
-            f"=== Playoffs Tables ===\n"
-            f"Table pattern: all_players_playoffs_YYYY_YYYY\n"
-            f"Columns (same for all): {columns}\n"
-            f"Available tables ({len(playoffs_tables)}): {', '.join(years)}\n"
+            "=== Playoffs Tables ===\n"
+            "Pattern: all_players_playoffs_YYYY_YYYY\n"
+            f"Columns: {_columns_for(playoffs_tables[-1])}\n"
+            f"Available ({len(playoffs_tables)}): {', '.join(years)}\n"
         )
 
-    # Advanced season tables — columns once, list available
     if advanced_tables:
-        cursor.execute(f"""
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name = '{advanced_tables[-1]}'
-            ORDER BY ordinal_position;
-        """)
-        columns = ", ".join([col[0] for col in cursor.fetchall()])
-
         schema_parts.append(
-            f"=== Advanced Season Tables ===\n"
-            f"Table pattern: nba_advanced_season_YYYY_YY_season_type_TYPE_per_mode_p\n"
-            f"Columns (same for all): {columns}\n"
-            f"Available tables ({len(advanced_tables)}): {', '.join(advanced_tables[:5])}... and {len(advanced_tables) - 5} more\n"
+            "=== Advanced Season Tables ===\n"
+            "Pattern: nba_advanced_season_YYYY_YY_season_type_TYPE_per_mode_p\n"
+            f"Columns: {_columns_for(advanced_tables[-1])}\n"
+            f"Available ({len(advanced_tables)}): {', '.join(advanced_tables)}\n"
         )
 
-    # Other unique tables — list columns individually
-    for table_name in other_tables:
-        cursor.execute(f"""
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name = '{table_name}'
-            ORDER BY ordinal_position;
-        """)
-        columns = ", ".join([col[0] for col in cursor.fetchall()])
-        schema_parts.append(f"{table_name}({columns})")
+    for t in other_heavy:
+        schema_parts.append(f"{t}({_columns_for(t)})")
+
+    # ---- Other families: directory only (no columns) ----
+    directory_lines = []
+    for prefix in _OTHER_FAMILY_PREFIXES:
+        family = sorted(t for t in all_tables if t.startswith(prefix))
+        if not family:
+            continue
+        sample = family[0]
+        directory_lines.append(f"  {prefix}* ({len(family)} tables, e.g. {sample})")
+
+    if directory_lines:
+        schema_parts.append(
+            "=== Other Available Table Families (use intent routing in RULE 0) ===\n"
+            "These exist but columns are not pre-loaded to save tokens.\n"
+            "If you route here, use exact table names from this list and pick columns "
+            "by name convention (player_name, team_abbreviation, season-style stats).\n"
+            "If a column doesn't exist, the repair pass will surface a clear error.\n"
+            + "\n".join(directory_lines) + "\n"
+        )
 
     schema_description = "\n".join(schema_parts)
-    logger.debug("Compact schema size: %d chars (%d tables included)", len(schema_description), len(tables))
+    logger.debug(
+        "Schema: %d chars | %d heavy-use, %d other-family tables enumerated",
+        len(schema_description), len(heavy), sum(1 for t in all_tables if any(t.startswith(p) for p in _OTHER_FAMILY_PREFIXES))
+    )
+    _schema_cache["value"] = schema_description
+    _schema_cache["fetched_at"] = now
     return schema_description
 
 
@@ -223,7 +240,8 @@ def check_query_cost(conn, sql_query, max_cost: Optional[float] = None):
 
 # Query execution function
 def execute_query(conn, sql_query, max_cost: Optional[float] = None, timeout_ms=60000):
-    logger.info("Executing SQL Query:\n%s", sql_query)
+    logger.info("Executing SQL: %s", _summarize_sql(sql_query))
+    logger.debug("Full SQL:\n%s", sql_query)
     table_refs = sorted(
         set(
             re.findall(
@@ -258,9 +276,14 @@ def execute_query(conn, sql_query, max_cost: Optional[float] = None, timeout_ms=
             total_cost
         )
         if df_result.empty:
-            logger.info("Query result table: [empty]")
+            logger.info("Query result: [empty]")
         else:
-            logger.info("Query result table:\n%s", df_result.to_string(index=False))
+            logger.info(
+                "Query result: %d rows × %d cols | columns: %s",
+                len(df_result), len(df_result.columns),
+                ", ".join(df_result.columns[:10]) + ("..." if len(df_result.columns) > 10 else ""),
+            )
+            logger.debug("Full result table:\n%s", df_result.to_string(index=False))
         return df_result
 
     except Exception as e:

@@ -1,6 +1,7 @@
 "use client"
 
-import { useMemo } from "react"
+import { useMemo, useState, useEffect } from "react"
+import { useTheme } from "next-themes"
 import {
   Card,
   CardContent,
@@ -179,7 +180,11 @@ function pointsOnArc(
   return points.join(" ")
 }
 
-function CourtLines() {
+function CourtLines({ isDark }: { isDark: boolean }) {
+  const lineColor = isDark ? "rgba(255,255,255,0.6)" : "rgba(0,0,0,0.65)"
+  const softLineColor = isDark ? "rgba(255,255,255,0.45)" : "rgba(0,0,0,0.5)"
+  const rimColor = isDark ? "rgba(255,140,0,0.7)" : "rgba(220,90,0,0.85)"
+
   const [bx, by] = toSvg(0, 0)
   const [courtL, courtBot] = toSvg(-250, -47)
   const [courtR] = toSvg(250, -47)
@@ -206,13 +211,13 @@ function CourtLines() {
   const ccPoints = pointsOnArc(0, 422, 60, 180, 360, 30)
 
   return (
-    <g stroke="rgba(255,255,255,0.6)" strokeWidth={2.5} fill="none">
+    <g stroke={lineColor} strokeWidth={2.5} fill="none">
       <rect x={courtL} y={courtTop} width={courtR - courtL} height={courtBot - courtTop} />
       <rect x={paintL} y={paintTop} width={paintR - paintL} height={courtBot - paintTop} />
       <polyline points={ftTopPoints} />
       <polyline points={ftBotPoints} strokeDasharray="8 6" />
-      <line x1={bx - 30} y1={by + 15} x2={bx + 30} y2={by + 15} strokeWidth={2} stroke="rgba(255,255,255,0.45)" />
-      <circle cx={bx} cy={by} r={7.5} strokeWidth={1.8} stroke="rgba(255,140,0,0.7)" />
+      <line x1={bx - 30} y1={by + 15} x2={bx + 30} y2={by + 15} strokeWidth={2} stroke={softLineColor} />
+      <circle cx={bx} cy={by} r={7.5} strokeWidth={1.8} stroke={rimColor} />
       <polyline points={raArcPoints} />
       <line x1={raLX} y1={raLY} x2={raLX} y2={courtBot} />
       <line x1={raRX} y1={raRY} x2={raRX} y2={courtBot} />
@@ -226,15 +231,22 @@ function CourtLines() {
 
 // ─── Main Component ───
 export default function ShotChart({ data, config }: ShotChartProps) {
-  if (!data || data.length === 0) return <div>No shot data found</div>
+  const { resolvedTheme } = useTheme()
+  const [mounted, setMounted] = useState(false)
+  useEffect(() => { setMounted(true) }, [])
+
+  // Default to dark on first paint to match the previous look and avoid flicker
+  const isDark = mounted ? resolvedTheme === "dark" : true
 
   const mode = config.mode || "volume"
-  const bins = useMemo(() => buildHexBins(data, HEX_RADIUS, mode), [data, mode])
+  const bins = useMemo(() => buildHexBins(data || [], HEX_RADIUS, mode), [data, mode])
 
   const maxVal = useMemo(() => {
     if (mode === "volume") return Math.max(...bins.map(b => b.total), 1)
     return 1
   }, [bins, mode])
+
+  if (!data || data.length === 0) return <div>No shot data found</div>
 
   const modeLabel = mode === "hotspots" ? "Best Shooting Zones"
     : mode === "coldspots" ? "Worst Shooting Zones"
@@ -251,6 +263,9 @@ export default function ShotChart({ data, config }: ShotChartProps) {
     : mode === "coldspots" ? "Worse"
     : "High"
 
+  const courtBg = isDark ? "#000000" : "#f5f5f0"
+  const legendTextColor = isDark ? "rgba(255,255,255,0.45)" : "rgba(0,0,0,0.55)"
+
   return (
     <Card>
       <CardHeader className="items-center pb-4">
@@ -264,7 +279,7 @@ export default function ShotChart({ data, config }: ShotChartProps) {
         <svg
           viewBox={`0 0 ${SVG_W} ${SVG_H}`}
           className="w-full max-w-[550px]"
-          style={{ background: "#000000", borderRadius: "12px" }}
+          style={{ background: courtBg, borderRadius: "12px" }}
         >
           {(() => {
             const [lx] = toSvg(-250, 0)
@@ -274,7 +289,7 @@ export default function ShotChart({ data, config }: ShotChartProps) {
             return <rect x={lx} y={ty} width={rx - lx} height={bly - ty} fill="rgba(255,255,255,0.0)" />
           })()}
 
-          <CourtLines />
+          <CourtLines isDark={isDark} />
 
           {bins.map((bin, i) => {
             let colorVal: number
@@ -312,7 +327,7 @@ export default function ShotChart({ data, config }: ShotChartProps) {
           })}
 
           <g transform={`translate(${SVG_W - 170}, ${SVG_H - 28})`}>
-            <text fill="rgba(255,255,255,0.45)" fontSize={9} fontFamily="sans-serif" y={-2}>
+            <text fill={legendTextColor} fontSize={9} fontFamily="sans-serif" y={-2}>
               {legendLabelLeft}
             </text>
             <defs>
@@ -323,7 +338,7 @@ export default function ShotChart({ data, config }: ShotChartProps) {
               </linearGradient>
             </defs>
             <rect x={28} y={-10} width={90} height={8} rx={2} fill="url(#shotLegendGrad)" />
-            <text fill="rgba(255,255,255,0.45)" fontSize={9} fontFamily="sans-serif" x={123} y={-2}>
+            <text fill={legendTextColor} fontSize={9} fontFamily="sans-serif" x={123} y={-2}>
               {legendLabelRight}
             </text>
           </g>

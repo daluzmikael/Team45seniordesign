@@ -101,6 +101,36 @@ def _resolve_df_output(module: Optional[Any]) -> Optional[pd.DataFrame]:
 
 
 # -------------------------
+# Display column renames
+# -------------------------
+# Map confusing or non-existent stat columns to friendlier display names so
+# the analyzer narrative + table never confuse users. Add new mappings here.
+_DISPLAY_COLUMN_RENAMES = {
+    "PIE":  "PIE (PER equivalent)",
+    "pie":  "PIE (PER equivalent)",
+}
+
+
+def _rename_columns_for_display(df):
+    """Return a shallow-copied df with confusing column names rewritten for display."""
+    if df is None or df.empty:
+        return df
+    rename_map = {c: _DISPLAY_COLUMN_RENAMES[c] for c in df.columns if c in _DISPLAY_COLUMN_RENAMES}
+    if not rename_map:
+        return df
+    return df.rename(columns=rename_map)
+
+
+def _user_asked_for_per(question: str) -> bool:
+    """True only when the user explicitly asked for classic PER (Hollinger).
+
+    Avoids matching 'per game', 'per minute', 'per possession', 'performance'.
+    """
+    q = (question or "").lower()
+    return bool(re.search(r"\b(player efficiency rating|per)\b(?!\s*game|formance|\s*minute|\s*possession)", q))
+
+
+# -------------------------
 # Composite scoring utilities
 # -------------------------
 @dataclass
@@ -289,8 +319,17 @@ def _minmax(series: pd.Series) -> np.ndarray:
 
 
 def compute_scores(df: pd.DataFrame, cfg: ScoreConfig) -> pd.DataFrame:
+    entity_col = "player_name"
     if "player_name" not in df.columns:
-        raise ValueError("DataFrame must include 'player_name'.")
+        if "TEAM_NAME" in df.columns:
+            entity_col = "TEAM_NAME"
+        elif "TeamName" in df.columns:
+            entity_col = "TeamName"
+        elif "team_abbreviation" in df.columns:
+            entity_col = "team_abbreviation"
+        else:
+            raise ValueError("DataFrame must include 'player_name' or a valid team column.")
+
     present = [c for c in cfg.weights if c in df.columns]
     if not present:
         raise ValueError("No required metric columns found for this domain.")
@@ -322,7 +361,7 @@ def compute_scores(df: pd.DataFrame, cfg: ScoreConfig) -> pd.DataFrame:
         contribs.sort(key=lambda x: x[1], reverse=True)
         rows.append(
             {
-                "player_name": df.iloc[i]["player_name"],
+                entity_col: df.iloc[i][entity_col],
                 "composite_score": float(score[i]),
                 "top_contributors": contribs[:3],
             }
@@ -333,6 +372,11 @@ def compute_scores(df: pd.DataFrame, cfg: ScoreConfig) -> pd.DataFrame:
 def infer_domain(user_q: str, cols: List[str]) -> str:
     uq = (user_q or "").lower()
     txt = " ".join(cols).lower()
+
+    if any(k in uq for k in ["team", "franchise", "standings", "winrate"]) or any(
+        k in txt for k in ["teamname", "team_name", "w_pct", "wins", "net_rating"]
+    ):
+        return "team_performance"
 
     if any(k in uq for k in ["rebound", "boards", "glass", "oreb", "dreb"]) or any(
         k in txt for k in ["trb_per_game", "trb_pct", "oreb_pct", "dreb_pct", "contested_reb"]
@@ -685,7 +729,7 @@ def _format_single_player_season_trend_response(df: pd.DataFrame, question: str,
         try:
             sample = working[[season_col] + [c for _, c in available]].head(8).to_dict(orient="records")
             resp = client.chat.completions.create(
-                model="gpt-4o-mini",
+                model="gpt-4.1-mini",
                 messages=[
                     {"role": "system", "content": "Write 2 concise sentences summarizing the trend in these season-by-season stats. Use plain language and include at least one concrete stat reference."},
                     {"role": "user", "content": f"Question: {question}\nPlayers: {unique_players or [player_name]}\nSeason rows: {sample}"},
@@ -802,7 +846,7 @@ def _generate_natural_player_season_summary(
 
     try:
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4.1-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -1326,7 +1370,16 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
         return "\nNo leaderboard data was available for this question."
 
     lead_row = top.iloc[0]
-    lead_name = str(lead_row.get("player_name", "N/A")) if not _is_missing(lead_row.get("player_name")) else "N/A"
+
+    def get_entity_name(row):
+        for col in ["player_name", "TEAM_NAME", "TeamName", "team_abbreviation"]:
+            if col in row and not pd.isna(row[col]):
+                return str(row[col])
+        return "N/A"
+
+    lead_row = top.iloc[0]
+    lead_name = get_entity_name(lead_row) # This now works perfectly
+    
     lead_metric = _fmt_num(lead_row.get(metric_col))
     season_text = _extract_season_reference_text(question)
     if season_text:
@@ -1339,8 +1392,14 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
     lines = [lead_line, "", selected["table_header"], selected["table_divider"]]
 
     for idx, (_, row) in enumerate(top.iterrows(), start=1):
-        name = str(row.get("player_name", "N/A")) if not _is_missing(row.get("player_name")) else "N/A"
+        # FIXED: Call your function here for every row
+        name = get_entity_name(row) 
         team = str(row.get("team_abbreviation", "N/A")) if not _is_missing(row.get("team_abbreviation")) else "N/A"
+        
+        # Optional safeguard: prevents printing "GSW (GSW)" if the name is already the team abbreviation
+        if name == team:
+            team = "Team"
+            
         lines.append(selected["row_builder"](idx, row, name, team))
 
     lines.append("")
@@ -1447,7 +1506,7 @@ def _format_spatial_shots_narrative(df: pd.DataFrame, question: str, client: Any
     user_prompt = f"Question:\n{question}\n\n{summary}\n\nAnswer in a relaxed, broadcast tone."
     try:
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4.1-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -1585,7 +1644,7 @@ def analyze_dataframe() -> str:
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4.1-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -1743,7 +1802,7 @@ def analyze_question(question: str) -> str:
 
     try:
         response = _resolve_client(query_bot_module).chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -1806,13 +1865,28 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
     )
     rows_to_show = df if is_comparison else df.head(20)
 
+    # Apply user-friendly column renames before showing data to GPT or the user.
+    display_df = _rename_columns_for_display(df)
+    display_rows_to_show = display_df if is_comparison else display_df.head(20)
+
     df_summary = (
-        f"DataFrame shape: {df.shape[0]} rows, {df.shape[1]} columns\n"
-        f"Columns: {', '.join(df.columns.tolist())}\n\n"
-        f"Data:\n{rows_to_show.to_string(index=False)}\n"
+        f"DataFrame shape: {display_df.shape[0]} rows, {display_df.shape[1]} columns\n"
+        f"Columns: {', '.join(display_df.columns.tolist())}\n\n"
+        f"Data:\n{display_rows_to_show.to_string(index=False)}\n"
     )
-    if len(df) > 20 and not is_comparison:
-        df_summary += f"\nSummary statistics:\n{df.describe().to_string()}\n"
+    if len(display_df) > 20 and not is_comparison:
+        df_summary += f"\nSummary statistics:\n{display_df.describe().to_string()}\n"
+
+    # If the user asked for "PER" specifically, prepend a note for GPT so it
+    # opens with a one-line acknowledgment that classic PER isn't stored.
+    per_note = ""
+    if _user_asked_for_per(question) and any(c in df.columns for c in ("PIE", "pie")):
+        per_note = (
+            "\n\nIMPORTANT: This database does not store classic PER (Hollinger). "
+            "The 'PIE (PER equivalent)' column shown is the NBA's official equivalent. "
+            "Open your answer with one short sentence acknowledging this so the user "
+            "knows what they're seeing."
+        )
 
     rubric_by_domain = {
         "defense": "Prioritize defensive_impact; rim protection (rim_fg_pct_allowed lower is better; rim_shots_contested higher is better); on-ball impact (opp_fg_pct_as_primary_defender lower is better); versatility; disruptions (deflections, loose balls).",
@@ -1860,8 +1934,8 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
             f"Domain: {domain}\n"
             f"Guidance: {rubric_by_domain.get(domain, '')}\n\n"
             f"RANKED (DO NOT REORDER):\n{score_text}\n\n"
-            f"ORIGINAL DATA (first rows):\n{rows_to_show.to_string(index=False)}\n\n"
-            f"Analyze the top result and compare to the next strongest contenders in a natural, engaging format."
+            f"ORIGINAL DATA (first rows):\n{display_rows_to_show.to_string(index=False)}\n\n"
+            f"Analyze the top result and compare to the next strongest contenders in a natural, engaging format.{per_note}"
         )
     else:
         system_prompt = (
@@ -1879,13 +1953,13 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
 
         user_prompt = (
             f"User's question: {question}\n\n"
-            f"Data:\n{df_summary}\n"
+            f"Data:\n{df_summary}{per_note}\n"
             "Analyze the data and answer the question in a fluid, engaging sports-analyst style."
         )
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4.1-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},

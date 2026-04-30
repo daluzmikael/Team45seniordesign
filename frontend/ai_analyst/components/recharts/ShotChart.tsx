@@ -267,7 +267,7 @@ export default function ShotChart({ data, config }: ShotChartProps) {
   const legendTextColor = isDark ? "rgba(255,255,255,0.45)" : "rgba(0,0,0,0.55)"
 
   return (
-    <Card>
+    <Card className="w-full min-w-0">
       <CardHeader className="items-center pb-4">
         <CardTitle>{config.playerName || "Player"}: Shot Chart</CardTitle>
         <CardDescription>
@@ -275,10 +275,10 @@ export default function ShotChart({ data, config }: ShotChartProps) {
           {` • ${data.length.toLocaleString()} shots`}
         </CardDescription>
       </CardHeader>
-      <CardContent className="pb-6 px-2">
+      <CardContent className="px-3 pb-6 sm:px-6">
         <svg
           viewBox={`0 0 ${SVG_W} ${SVG_H}`}
-          className="w-full"
+          className="mx-auto h-auto w-full max-w-[520px]"
           style={{ background: courtBg, borderRadius: "12px" }}
         >
           {(() => {

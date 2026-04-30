@@ -143,6 +143,18 @@ _NAME_STOPWORDS = {
     "free throw", "double double", "triple double", "double-double",
     "triple-double", "plus minus", "plus-minus", "western conference",
     "eastern conference", "all star", "all-star",
+    # Section headers from the analyzer's profile/trend formatters.
+    # These look like Capitalized Two-Word names but aren't players.
+    "games played", "ball security", "season stats", "career stats",
+    "shooting efficiency", "scoring efficiency", "shot chart", "shot selection",
+    "skill profile", "season review", "trend analysis", "stat value",
+    "points per", "assists per", "rebounds per", "steals per", "blocks per",
+    "field goals", "three point", "free throws", "true shooting",
+    "overall impact", "net rating", "offensive rating", "defensive rating",
+    "win shares", "usage rate",
+    # Common NBA terms that regex captures as names
+    "most valuable", "season high", "career high",
+    "total points", "total rebounds", "total assists",
 }
 
 _NAME_CANDIDATE_RE = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z\.\-']+){1,2})\b")
@@ -278,6 +290,7 @@ async def analysis_endpoint(
 ):
     try:
         print("----HIT----- /api/analysis")
+        print(f"Question: {request.question}")
 
         effective_question = request.question
         history_context_applied = False

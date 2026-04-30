@@ -11,7 +11,6 @@ import {
   XAxis,
   YAxis,
   ZAxis,
-  ResponsiveContainer,
 } from "recharts"
 import {
   Card,
@@ -215,7 +214,7 @@ export default function ScatterComponent({ data, config }: ScatterProps) {
   }
 
   return (
-    <Card>
+    <Card className="w-full min-w-0">
       <CardHeader>
         <CardTitle>{statDisplayName}</CardTitle>
         <CardDescription>
@@ -227,8 +226,7 @@ export default function ScatterComponent({ data, config }: ScatterProps) {
       </CardHeader>
       <CardContent>
         <ChartContainer config={chartConfig} className="min-h-[450px] w-full">
-          <ResponsiveContainer width="100%" height={450}>
-            <ScatterChart margin={{ top: 20, right: 30, bottom: 40, left: 20 }}>
+          <ScatterChart margin={{ top: 20, right: 30, bottom: 40, left: 20 }}>
               <CartesianGrid strokeDasharray="3 3" />
               <XAxis
                 type="number"
@@ -280,7 +278,6 @@ export default function ScatterComponent({ data, config }: ScatterProps) {
                 strokeWidth={0.1}
             />
             </ScatterChart>
-          </ResponsiveContainer>
         </ChartContainer>
       </CardContent>
       <CardFooter className="flex-col items-start gap-1 text-xs text-muted-foreground">

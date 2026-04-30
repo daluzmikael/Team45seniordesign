@@ -1061,6 +1061,48 @@ def _parse_compare_side_for_name_and_year(side: str) -> tuple[str, int | None]:
     return name, year
 
 
+def _match_compare_two_player_fragments(qtext: str) -> tuple[str | None, str | None]:
+    """
+    Extract the two player / season fragments from a dual-player question.
+    Supports 'Compare A … and|vs|versus B …', 'Between A … and B …', and
+    'Who (was|is) better A or B …'.
+    """
+    s = (qtext or "").strip()
+    if not s:
+        return None, None
+    m = re.search(
+        r"(?i)\bcompare\s+(.+?)\s+(?:and|vs|versus)\s+(.+?)(?:\bfrom\b|\bin\b|\bduring\b|$)",
+        s,
+    )
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    m = re.search(
+        r"(?i)\bbetween\s+(.+?)\s+and\s+(.+?)(?:\bfrom\b|\bin\b|\bduring\b|$)",
+        s,
+    )
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    m = re.search(
+        r"(?i)\bwho\s+(?:was|is)\s+better\b\s*[,:—–]?\s*(.+?)\s+\bor\b\s+(.+?)(?:\s*[.?!]*)$",
+        s,
+    )
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    m = re.search(
+        r"(?i)\bwhich\s+(?:one|player)\s+(?:was|is)\s+better\b\s*[,:—–]?\s*(.+?)\s+\bor\b\s+(.+?)(?:\s*[.?!]*)$",
+        s,
+    )
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    m = re.search(
+        r"(?i)\bwhich\s+had\s+(?:the\s+)?better\s+season\b\s*[,:—–]?\s*(.+?)\s+\bor\b\s+(.+?)(?:\s*[.?!]*)$",
+        s,
+    )
+    if m:
+        return m.group(1).strip(), m.group(2).strip()
+    return None, None
+
+
 def _dedupe_prune_player_names(names: list[str]) -> list[str]:
     deduped: list[str] = []
     seen = set()
@@ -1087,6 +1129,15 @@ def _extract_player_names_from_question(question_text: str) -> list[str]:
     pair_patterns = [
         re.compile(r"(?i)\bcompare\s+(.+?)\s+(?:and|vs|versus)\s+(.+?)(?:\bfrom\b|\bin\b|\bduring\b|$)"),
         re.compile(r"(?i)\bbetween\s+(.+?)\s+and\s+(.+?)(?:\bfrom\b|\bin\b|\bduring\b|$)"),
+        re.compile(
+            r"(?i)\bwho\s+(?:was|is)\s+better\b\s*[,:—–]?\s*(.+?)\s+\bor\b\s+(.+?)(?:\s*[.?!]*)$"
+        ),
+        re.compile(
+            r"(?i)\bwhich\s+(?:one|player)\s+(?:was|is)\s+better\b\s*[,:—–]?\s*(.+?)\s+\bor\b\s+(.+?)(?:\s*[.?!]*)$"
+        ),
+        re.compile(
+            r"(?i)\bwhich\s+had\s+(?:the\s+)?better\s+season\b\s*[,:—–]?\s*(.+?)\s+\bor\b\s+(.+?)(?:\s*[.?!]*)$"
+        ),
         re.compile(r"(?i)\b(.+?)\s+\bthan\b\s+(.+?)(?:\bfrom\b|\bin\b|\bduring\b|$)"),
     ]
     pair_names: list[str] = []
@@ -1592,7 +1643,12 @@ def _build_dynamic_multitable_sql(sql_query: str, user_input: str, schema_descri
     if is_playoffs:
         return sql_query
 
-    is_compare_prompt = any(k in q for k in ["compare", " vs ", "versus", "between"])
+    is_compare_prompt = any(k in q for k in ["compare", " vs ", "versus", "between"]) or bool(
+        re.search(
+            r"(?i)\b(?:who|which\s+(?:one|player))\s+(?:was|is)\s+better\b|\bwhich\s+had\s+(?:the\s+)?better\s+season\b",
+            q,
+        )
+    )
     wants_advanced = any(
         k in q
         for k in [
@@ -1610,6 +1666,26 @@ def _build_dynamic_multitable_sql(sql_query: str, user_input: str, schema_descri
     )
     wants_defense = any(k in q for k in ["defense", "defensive", "blocks", "steals", "def rating", "def_rtg", "opp_pts"])
     wants_offense = any(k in q for k in ["offense", "offensive", "points", "scoring", "assists", "rebounds", "fg%", "3p%", "ft%"])
+    # "Breakdown" / depth asks should pull defense_totals_* (rim activity, opp scoring context, etc.),
+    # not only per-game box rows side-by-side.
+    wants_deep_compare = any(
+        k in q
+        for k in [
+            "breakdown",
+            "break down",
+            "deep dive",
+            "in depth",
+            "in-depth",
+            "full picture",
+            "comprehensive",
+            "granular",
+            "film room",
+        ]
+    )
+    if wants_deep_compare and is_compare_prompt:
+        wants_defense = True
+        wants_advanced = True
+        wants_offense = True
     # For plain compare prompts, automatically include commonly useful families.
     if is_compare_prompt and not (wants_offense or wants_advanced or wants_defense):
         wants_offense = True
@@ -1625,15 +1701,12 @@ def _build_dynamic_multitable_sql(sql_query: str, user_input: str, schema_descri
         return sql_query
 
     qtext = _extract_current_question_text(user_input)
-    compare_match = re.search(
-        r"(?i)\bcompare\s+(.+?)\s+(?:and|vs|versus)\s+(.+?)(?:\bfrom\b|\bin\b|\bduring\b|$)",
-        qtext,
-    )
+    left_frag, right_frag = _match_compare_two_player_fragments(qtext)
     season_pairs: list[tuple[str, int]] | None = None
     explicit_names_compare: list[str] = []
-    if compare_match:
-        n1, y1 = _parse_compare_side_for_name_and_year(compare_match.group(1))
-        n2, y2 = _parse_compare_side_for_name_and_year(compare_match.group(2))
+    if left_frag and right_frag:
+        n1, y1 = _parse_compare_side_for_name_and_year(left_frag)
+        n2, y2 = _parse_compare_side_for_name_and_year(right_frag)
         if n1 and n2:
             explicit_names_compare = [n1, n2]
             if y1 is not None and y2 is not None:
@@ -2550,13 +2623,10 @@ def _rewrite_career_aggregate_to_by_season(sql_query: str, user_input: str, conn
     # Cross-season head-to-head (e.g. LeBron 2012 vs Durant 2015) is already rewritten to
     # UNION ALL by _build_dynamic_multitable_sql; do not replace it with a bare-year span
     # (first year only) from this career/trend helper.
-    cm = re.search(
-        r"(?i)\bcompare\s+(.+?)\s+(?:and|vs|versus)\s+(.+?)(?:\bfrom\b|\bin\b|\bduring\b|$)",
-        question_text,
-    )
-    if cm and "union all" in (sql_query or "").lower():
-        n1, y1 = _parse_compare_side_for_name_and_year(cm.group(1))
-        n2, y2 = _parse_compare_side_for_name_and_year(cm.group(2))
+    lf, rf = _match_compare_two_player_fragments(question_text)
+    if lf and rf and "union all" in (sql_query or "").lower():
+        n1, y1 = _parse_compare_side_for_name_and_year(lf)
+        n2, y2 = _parse_compare_side_for_name_and_year(rf)
         if n1 and n2 and y1 is not None and y2 is not None and y1 != y2:
             return sql_query
     nth_request = _extract_requested_nth_season(question_text)

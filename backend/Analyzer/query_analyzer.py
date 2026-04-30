@@ -372,6 +372,28 @@ def infer_domain(user_q: str, cols: List[str]) -> str:
     uq = (user_q or "").lower()
     txt = " ".join(cols).lower()
 
+    # Season-summary joins that include defense_totals_regularseason_* (opp_pts is the tell).
+    if "opp_pts" in txt and (
+        re.search(r"(?i)\b(compare|between)\b", uq)
+        or " versus " in uq
+        or re.search(r"(?i)\bvs\b", uq)
+        or "who was better" in uq
+        or "who is better" in uq
+        or re.search(r"(?i)\bwhich\s+(?:one|player)\s+(?:was|is)\s+better\b", uq)
+        or re.search(r"(?i)\bwhich\s+had\s+(?:the\s+)?better\s+season\b", uq)
+        or any(
+            k in uq
+            for k in [
+                "breakdown",
+                "break down",
+                "deep dive",
+                "in depth",
+                "in-depth",
+            ]
+        )
+    ):
+        return "defense"
+
     if any(k in uq for k in ["rebound", "boards", "glass", "oreb", "dreb"]) or any(
         k in txt for k in ["trb_per_game", "trb_pct", "oreb_pct", "dreb_pct", "contested_reb"]
     ):
@@ -1917,6 +1939,196 @@ def _format_spatial_shots_narrative(df: pd.DataFrame, question: str, client: Any
         return f"\nError generating shot-location narrative: {e}"
 
 
+def _should_format_compare_season_breakdown(question: str, df: pd.DataFrame) -> bool:
+    """Use structured offense/defense sections instead of raw side-by-side tables."""
+    if df is None or getattr(df, "empty", True):
+        return False
+    q = (question or "").lower()
+    if not (
+        re.search(r"(?i)\b(compare|between)\b", q)
+        or " versus " in q
+        or re.search(r"(?i)\bvs\b", q)
+        or "who was better" in q
+        or "who is better" in q
+        or re.search(r"(?i)\bwhich\s+(?:one|player)\s+(?:was|is)\s+better\b", q)
+        or re.search(r"(?i)\bwhich\s+had\s+(?:the\s+)?better\s+season\b", q)
+    ):
+        return False
+    n = len(df)
+    # Structured narrative is built for a head-to-head pair; 3+ rows should use generic tables.
+    if n != 2:
+        return False
+    cols = {c.lower() for c in df.columns}
+    if "player_name" not in cols and "player" not in cols:
+        return False
+    deep = any(
+        ph in q
+        for ph in (
+            "breakdown",
+            "break down",
+            "deep dive",
+            "in depth",
+            "in-depth",
+            "full picture",
+            "comprehensive",
+            "granular",
+        )
+    )
+    has_season = "season_start" in cols or "season_label" in cols
+    has_def_totals = "opp_pts" in cols
+    return deep or (has_def_totals and has_season)
+
+
+def _format_compare_season_breakdown(df: pd.DataFrame, question: str) -> str:
+    """Narrative + grouped tables for 2-player (or few-row) season-compare frames with defense_totals."""
+    work = df.copy()
+
+    def _missing(v: Any) -> bool:
+        try:
+            return v is None or pd.isna(v)
+        except Exception:
+            return v is None
+
+    def _fmt_num(v: Any, digits: int = 1) -> str:
+        if _missing(v):
+            return "N/A"
+        try:
+            return f"{float(v):.{digits}f}"
+        except Exception:
+            return "N/A"
+
+    def _fmt_int(v: Any) -> str:
+        if _missing(v):
+            return "N/A"
+        try:
+            return str(int(float(v)))
+        except Exception:
+            return "N/A"
+
+    def _fmt_pct(v: Any, digits: int = 1) -> str:
+        if _missing(v):
+            return "N/A"
+        try:
+            num = float(v)
+            if 0 <= num <= 1:
+                num *= 100.0
+            return f"{num:.{digits}f}%"
+        except Exception:
+            return "N/A"
+
+    def _append_table(lines_out: List[str], title: str, cells: List[tuple[str, str]]) -> None:
+        filtered = [(a, b) for a, b in cells if b != "N/A"]
+        if not filtered:
+            return
+        if title:
+            lines_out.append(title)
+        lines_out.append("| " + " | ".join(a for a, _ in filtered) + " |")
+        lines_out.append("|" + "|".join(["---:" for _ in filtered]) + "|")
+        lines_out.append("| " + " | ".join(b for _, b in filtered) + " |")
+        lines_out.append("")
+
+    name_col = "player_name" if "player_name" in work.columns else "player"
+    if "season_start" in work.columns:
+        try:
+            work["_ss"] = pd.to_numeric(work["season_start"], errors="coerce")
+            work = work.sort_values("_ss", na_position="last")
+        except Exception:
+            pass
+
+    lines: List[str] = [
+        "## Season comparison",
+        "",
+        "Below is a **structured breakdown** (per-game offense + advanced efficiency where available, "
+        "plus **defensive impact totals** from the defense summary table — steals/blocks/defensive rating "
+        "and opponent scoring context).",
+        "",
+    ]
+
+    for _, row in work.iterrows():
+        name = str(row.get(name_col, "Player"))
+        team = str(row.get("team", "")) if not _missing(row.get("team")) else ""
+        season_lbl = None
+        if "season_label" in work.columns and not _missing(row.get("season_label")):
+            season_lbl = str(row.get("season_label"))
+        elif "season_start" in work.columns and not _missing(row.get("season_start")):
+            try:
+                sy = int(float(row.get("season_start")))
+                season_lbl = f"{sy}-{str(sy + 1)[-2:]}"
+            except Exception:
+                season_lbl = None
+        head = f"### {name}"
+        if team:
+            head += f" ({team})"
+        if season_lbl:
+            head += f" — **{season_lbl}**"
+        lines.append(head)
+        lines.append("")
+
+        _append_table(
+            lines,
+            "**Per-game offense**",
+            [
+                ("GP", _fmt_int(row.get("gp"))),
+                ("PTS", _fmt_num(row.get("pts"))),
+                ("REB", _fmt_num(row.get("reb"))),
+                ("AST", _fmt_num(row.get("ast"))),
+                ("FG%", _fmt_pct(row.get("fg_pct"))),
+                ("3P%", _fmt_pct(row.get("fg3_pct"))),
+                ("FT%", _fmt_pct(row.get("ft_pct"))),
+            ],
+        )
+
+        adv_cells = [
+            ("TS%", _fmt_pct(row.get("ts"))),
+            ("USG%", _fmt_num(row.get("usg"))),
+            ("ORtg", _fmt_num(row.get("offrtg"))),
+            ("DRtg (adv)", _fmt_num(row.get("defrtg"))),
+            ("NetRtg", _fmt_num(row.get("netrtg"))),
+        ]
+        if any(b != "N/A" for _, b in adv_cells):
+            _append_table(lines, "**Advanced (season totals)**", adv_cells)
+
+        def_cells = [
+            ("DREB", _fmt_num(row.get("dreb"))),
+            ("STL", _fmt_num(row.get("stl"))),
+            ("BLK", _fmt_num(row.get("blk"))),
+            ("Def RTG", _fmt_num(row.get("def_rtg"))),
+            ("Opp PTS", _fmt_num(row.get("opp_pts"))),
+        ]
+        if any(b != "N/A" for _, b in def_cells):
+            _append_table(
+                lines,
+                "**Defense totals profile** (`defense_totals_regularseason_*`)",
+                def_cells,
+            )
+        lines.append("")
+
+    if len(work) == 2:
+        a, b = work.iloc[0], work.iloc[-1]
+        na = str(a.get(name_col, "Player A"))
+        nb = str(b.get(name_col, "Player B"))
+        pa, pb = _fmt_num(a.get("pts")), _fmt_num(b.get("pts"))
+        ta, tb = _fmt_pct(a.get("ts")), _fmt_pct(b.get("ts"))
+        da, db = _fmt_num(a.get("def_rtg")), _fmt_num(b.get("def_rtg"))
+        oa, ob = _fmt_num(a.get("opp_pts")), _fmt_num(b.get("opp_pts"))
+        hook = (
+            f"At a glance: **{na}** scored **{pa}** PPG with **{ta}** true shooting, while **{nb}** put up **{pb}** on **{tb}** TS. "
+        )
+        if da != "N/A" and db != "N/A":
+            hook += (
+                f"On the defensive totals sheet, **{na}** carried a **{da}** defensive rating vs opponent scoring (**{oa}** opp PTS context) "
+                f"compared with **{db}** / **{ob}** for **{nb}** — lower defensive rating and opponent points allowed generally signal stronger team defense "
+                f"while that player was on the floor in this table's definition."
+            )
+        lines.insert(2, hook)
+        lines.insert(3, "")
+
+    lines.append(
+        "Want a **single-season** compare (same year for both players) or a **playoff** split next?"
+    )
+    return "\n" + "\n".join(lines).strip()
+
+
 def analyze_dataframe() -> str:
     if query_bot_module is None:
         return (
@@ -1940,6 +2152,9 @@ def analyze_dataframe() -> str:
 
     if _is_spatial_shot_dataframe(df_output):
         return _format_spatial_shots_narrative(df_output, user_input, client)
+
+    if _should_format_compare_season_breakdown(user_input, df_output):
+        return _format_compare_season_breakdown(df_output, user_input)
 
     domain = infer_domain(user_input, df_output.columns.tolist())
 

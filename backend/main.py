@@ -25,6 +25,8 @@ from Interpreter.interpreter import (
     debug_query_routing,
     get_last_tables_used,
     pronoun_stats_query_missing_player,
+    _extract_current_question_text,
+    _match_compare_two_player_fragments,
 )
 import numpy as np
 import pandas as pd
@@ -255,6 +257,17 @@ def _should_apply_history_context(question: str) -> bool:
     if not q:
         return False
 
+    cur = _extract_current_question_text(question).strip()
+    cur_lower = cur.lower()
+    has_pronoun = bool(re.search(r"\b(his|her|their|him|them|they|he|she)\b", cur_lower))
+    lf, rf = _match_compare_two_player_fragments(cur)
+    if lf and rf and not has_pronoun:
+        return False
+    if re.match(r"(?i)^compare\s+", cur) and not has_pronoun:
+        return False
+    if re.match(r"(?i)^between\s+", cur) and not has_pronoun:
+        return False
+
     # Only inject history for likely follow-up/ellipsis prompts.
     followup_markers = [
         "what about",
@@ -294,6 +307,16 @@ def _should_apply_history_context(question: str) -> bool:
         "okay",
         "sure",
     ]
+    if re.search(
+        r"(?i)\bwhich\s+(?:one|player)\s+(?:was|is)\s+better\b.*\bor\b",
+        cur,
+    ) and not has_pronoun:
+        return False
+    if re.search(
+        r"(?i)\bwhich\s+had\s+(?:the\s+)?better\s+season\b.*\bor\b",
+        cur,
+    ) and not has_pronoun:
+        return False
     if any(marker in q for marker in followup_markers):
         return True
 
@@ -303,7 +326,9 @@ def _should_apply_history_context(question: str) -> bool:
 
     # Very short prompts are often dependent on prior context.
     token_count = len(re.findall(r"\w+", q))
-    return token_count <= 6
+    if token_count > 6:
+        return False
+    return True
 
 
 def _analysis_debug_enabled() -> bool:

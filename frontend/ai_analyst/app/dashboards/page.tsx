@@ -140,7 +140,7 @@ export default function DashboardsPage() {
   }
 
   return (
-    <div className="flex flex-col gap-6 max-w-6xl mx-auto p-6">
+    <div className="mx-auto flex w-full min-w-0 max-w-6xl flex-col gap-6 px-3 py-4 sm:p-6">
       <div className="space-y-2">
         <h1 className="text-4xl font-bold">Basketball Analyst</h1>
         <p className="text-muted-foreground text-lg">
@@ -148,7 +148,7 @@ export default function DashboardsPage() {
         </p>
       </div>
 
-      <div className="flex gap-2">
+      <div className="flex flex-col gap-2 sm:flex-row">
         <div className="relative flex-1">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
           <Input
@@ -174,7 +174,7 @@ export default function DashboardsPage() {
             Not sure what to ask? Pick a category to see examples.
           </p>
 
-          <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 w-full max-w-3xl">
+          <div className="grid w-full max-w-3xl grid-cols-1 gap-3 sm:grid-cols-2 md:grid-cols-3 xl:grid-cols-6">
             {EXAMPLE_CATEGORIES.map((category) => (
               <div
                 key={category.label}
@@ -229,9 +229,9 @@ export default function DashboardsPage() {
       )}
 
       {result && (
-        <div className="space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500">
+        <div className="w-full min-w-0 space-y-4 animate-in fade-in slide-in-from-bottom-4 duration-500">
           {result.chartType === "SinglePlayerStat" && (
-            <div className="border rounded-xl p-6 bg-card shadow-sm">
+            <div className="w-full min-w-0">
               <SinglePlayerStat
                 data={result.data}
                 statKey={result.config.statKey!}
@@ -244,7 +244,7 @@ export default function DashboardsPage() {
           )}
 
           {result.chartType === "CompareStats" && (
-            <div className="border rounded-xl p-6 bg-card shadow-sm">
+            <div className="w-full min-w-0">
               <CompareStats
                 data={result.data}
                 config={{
@@ -256,7 +256,7 @@ export default function DashboardsPage() {
           )}
 
           {(result.chartType === "CategoricalBreakdown" || result.chartType === "CompareCategoricalBreakdown") && (
-            <div className="border rounded-xl p-6 bg-card shadow-sm w-full max-w-lg mx-auto">
+            <div className="mx-auto w-full min-w-0 max-w-lg">
               {result.config.playerNames && result.config.playerNames.length > 1 ? (
                 <CompareCategoricalBreakdown
                   data={result.data}
@@ -275,7 +275,7 @@ export default function DashboardsPage() {
           )}
 
           {result.chartType === "Leaderboard" && (
-            <div className="border rounded-xl p-6 bg-card shadow-sm">
+            <div className="w-full min-w-0">
               <Leaderboard
                 data={result.data}
                 config={{
@@ -287,7 +287,7 @@ export default function DashboardsPage() {
           )}
 
           {result.chartType === "ShotChart" && (
-            <div className="-mx-6 border rounded-none sm:rounded-xl p-0 bg-card shadow-sm overflow-hidden">
+            <div className="w-full min-w-0">
               <ShotChart
                 data={result.data}
                 config={{
@@ -301,7 +301,7 @@ export default function DashboardsPage() {
           )}
 
           {result.chartType === "Scatter" && (
-            <div className="border rounded-xl p-6 bg-card shadow-sm">
+            <div className="w-full min-w-0">
               <Scatter
                 data={result.data}
                 config={{

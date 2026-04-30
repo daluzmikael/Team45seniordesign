@@ -29,7 +29,9 @@ logger = logging.getLogger(__name__)
 api_key = os.getenv("OPENAI_API_KEY")
 if not api_key:
     logger.warning("OpenAI API key missing from environment")
-client = OpenAI(api_key=api_key)
+client = OpenAI(api_key=api_key,
+                base_url="https://us.api.openai.com/v1"
+                )
 
 
 def _extract_current_question_text(user_input: str) -> str:
@@ -1195,8 +1197,30 @@ def _rewrite_career_aggregate_to_by_season(sql_query: str, user_input: str, conn
         return sql_query
 
     if "all_players_regular_" not in q_lower and "all_players_playoffs_" not in q_lower:
-        logger.debug("rewriter:career_aggregate skipped (no season-summary table in SQL)")
-        return q
+        # The model picked a non-season table (usually player_game_logs).
+        # If we have named players AND a year range or career signal, the user
+        # almost certainly wants a season-by-season breakdown — not 1000+ game
+        # log rows. Override the model's table choice and build the UNION ALL
+        # from scratch using the season tables.
+        has_season_signal = (
+            requested_span is not None
+            or per_player_spans
+            or mentions_career
+            or nth_request is not None
+            or rookie_year_request
+        )
+        if named_players and has_season_signal:
+            logger.info(
+                "rewriter:career_aggregate overriding model's table choice "
+                "(player_game_logs → season tables) for named_players=%s span=%s",
+                named_players, requested_span,
+            )
+            # Fall through to the UNION ALL builder below — unique_tables will
+            # be empty, and the requested_span / career branches will generate
+            # the correct legs from available_starts.
+        else:
+            logger.debug("rewriter:career_aggregate skipped (no season-summary table in SQL)")
+            return q
 
     logger.debug(
         "rewriter:career_aggregate applying — named_players=%s "
@@ -1707,13 +1731,13 @@ Do NOT include any additional text or markdown.
 """
 
     response = client.chat.completions.create(
-        model="gpt-4.1-mini",
+        model="gpt-5.4-mini",
         messages=[
             {"role": "system", "content": "Return ONLY valid SQL."},
             {"role": "user", "content": r_prompt}
         ],
         temperature=0,
-        max_tokens=1500
+        max_completion_tokens=1500
     )
 
     fixed_sql = response.choices[0].message.content.strip()
@@ -2515,13 +2539,13 @@ Generate the SQL:"""
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4.1-mini",
+            model="gpt-5.4-mini",
             messages=[
                 {"role": "system", "content": "You are a SQL query generator. Return ONLY valid SQL queries."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0,
-            max_tokens=1500
+            max_completion_tokens=1500
         )
 
         sql_query = response.choices[0].message.content.strip()

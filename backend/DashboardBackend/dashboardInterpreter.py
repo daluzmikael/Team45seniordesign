@@ -16,7 +16,8 @@ if api_key_env:
     logger.debug("OpenAI API key loaded from environment")
 else:
     logger.warning("OPENAI_API_KEY is not set")
-client = OpenAI(api_key=api_key_env)
+client = OpenAI(api_key=api_key_env,
+                base_url="https://us.api.openai.com/v1")
 
 # AWS postgres database info
 DB_CONFIG = {
@@ -978,7 +979,7 @@ Still follow the main schema exactly, and only output valid JSON."""
     messages.append({"role": "user", "content": user_question})
 
     response = client.chat.completions.create(
-        model="gpt-4.1-mini",
+        model="gpt-5.4-mini",
         messages=messages,
         temperature=0.1,
         response_format={"type": "json_object"}

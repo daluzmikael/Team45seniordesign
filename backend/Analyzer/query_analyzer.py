@@ -419,7 +419,7 @@ def _build_simple_top_scorers_prompts(question: str, rows_to_show: pd.DataFrame)
 
 def _extract_requested_top_n(question: str, default_n: int = 5, max_n: int = 50) -> int:
     q = (question or "").lower()
-    match = re.search(r"\b(top|best|leading)\s+(\d{1,3})\b", q)
+    match = re.search(r"\b(top|best|leading|worst|bottom|lowest)\s+(\d{1,3})\b", q)
     if not match:
         return default_n
     try:
@@ -1368,6 +1368,19 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
     else:
         working = working.drop_duplicates(keep="first")
 
+    # Re-sort AFTER dedup to make sure the order is clean.
+    if rank_col in cols and metric_col in cols:
+        working = working.sort_values(by=[rank_col, metric_col], ascending=[True, False], na_position="last")
+    elif rank_col in cols:
+        working = working.sort_values(by=[rank_col], ascending=[True], na_position="last")
+    elif metric_col in cols:
+        working = working.sort_values(by=[metric_col], ascending=[False], na_position="last")
+
+    # For "worst" questions, flip the sort so the worst performers come first.
+    is_worst = any(k in q for k in ["worst", "bottom", "lowest"])
+    if is_worst and metric_col in cols:
+        working = working.sort_values(by=[metric_col], ascending=[True], na_position="last")
+
     requested_n = _extract_requested_top_n(question, default_n=5, max_n=50)
     top = working.head(requested_n)
     if top.empty:
@@ -1570,6 +1583,20 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
         except Exception:
             score_table = None
 
+    # Detect single-player drill-down tag set by main.py. When present, scope
+    # the dataframe to ONLY that player and treat as a profile, not a comparison.
+    drilldown_match = re.search(r"\(single-player drill-down:\s*([^)]+)\)", question or "")
+    if drilldown_match and "player_name" in df.columns:
+        target_player = drilldown_match.group(1).strip()
+        target_lower = target_player.lower()
+        # Match by substring (handles 'LeBron' matching 'LeBron James').
+        mask = df["player_name"].dropna().astype(str).str.lower().str.contains(target_lower, regex=False)
+        filtered = df[mask.reindex(df.index, fill_value=False)]
+        if not filtered.empty:
+            df = filtered
+            print(f"[Analyzer] Drill-down tag found: scoped df to '{target_player}' "
+                  f"({len(df)} rows from original {unique_player_count if 'unique_player_count' in dir() else '?'} players)")
+
     # Detect comparisons: explicit keywords OR multiple unique players in a small result set.
     comparison_keywords = any(
         k in question.lower() for k in ["compare", "better", "versus", "vs", "between", "who"]
@@ -1578,8 +1605,11 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
         unique_player_count = df["player_name"].dropna().astype(str).str.strip().nunique() if "player_name" in df.columns else 0
     except Exception:
         unique_player_count = 0
+    # Drill-down explicitly disables comparison mode regardless of df shape.
+    is_drilldown = drilldown_match is not None
     is_comparison = (
-        len(df) <= 10
+        not is_drilldown
+        and len(df) <= 10
         and (comparison_keywords or unique_player_count >= 2)
         and unique_player_count >= 2
     )

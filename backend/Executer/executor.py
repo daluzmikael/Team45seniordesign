@@ -3,6 +3,7 @@ import pandas as pd
 import re
 import sqlglot
 from sqlglot import parse_one
+from sqlglot import expressions as exp
 from sqlglot.errors import ParseError
 import json
 import logging
@@ -166,6 +167,19 @@ def get_db_schema(conn):
 
 # 4. SQL safety checker
 # replaced the function is_sql_safe()
+def _is_read_only_select_expression(expression) -> bool:
+    """Allow SELECT queries and SELECT-only set operations such as UNION ALL."""
+    if isinstance(expression, exp.Select):
+        return True
+
+    if isinstance(expression, exp.Union):
+        return _is_read_only_select_expression(
+            expression.this
+        ) and _is_read_only_select_expression(expression.expression)
+
+    return False
+
+
 def validate_and_normalize_sql(sql_query: str) -> str:
     logger.debug("Validating SQL:\n%s", sql_query)
     try:
@@ -175,8 +189,8 @@ def validate_and_normalize_sql(sql_query: str) -> str:
     except ParseError as e:
         raise ValueError(f"SQL Syntax Error: {e}")
 
-    #  only SELECT statement
-    if parsed.key.upper() != "SELECT":
+    # Only read-only SELECT statements, including SELECT-only UNION/UNION ALL.
+    if not _is_read_only_select_expression(parsed):
         raise ValueError("Only SELECT statements are allowed.")
 
     # no multiple statements

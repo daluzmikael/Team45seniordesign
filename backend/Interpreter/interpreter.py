@@ -1444,7 +1444,10 @@ def _ensure_all_players_broad_columns(sql_query: str, user_input: str) -> str:
     # Never inject base-table columns into derived/subquery shapes like by_season.
     if " as by_season" in q_lower or re.search(r"(?is)\bfrom\s*\(", q):
         return q
-    if any(k in q_lower for k in [" sum(", " avg(", " count(", " group by ", " union all ", " order by ", " limit "]):
+    if (
+        any(k in q_lower for k in [" sum(", " avg(", " count(", " group by ", " order by ", " limit "])
+        or re.search(r"(?i)\bunion(?:\s+all)?\b", q)
+    ):
         return q
 
     select_match = re.search(r"(?is)\bselect\b(?P<select_part>.*?)\bfrom\b", q)
@@ -1497,7 +1500,10 @@ def _ensure_profile_columns_in_sql(sql_query: str, user_input: str) -> str:
         return q
     if "player_name ilike" not in q_lower:
         return q
-    if any(k in q_lower for k in [" group by ", " union ", "sum(", " order by ", " limit "]):
+    if (
+        any(k in q_lower for k in [" group by ", "sum(", " order by ", " limit "])
+        or re.search(r"(?i)\bunion(?:\s+all)?\b", q)
+    ):
         return q
 
     select_match = re.search(r"(?is)\bselect\b(?P<select_part>.*?)\bfrom\b", q)
@@ -1866,6 +1872,7 @@ TYPE C — EXTENDED NBA DATA FAMILIES (from current_working_data schema):
   - `nba_advanced_...`  (advanced metrics / impact context)
   - `nba_clutch_...`    (late-game / clutch situations)
   - `nba_hustle_...`    (hustle events: deflections, contested stats, etc.)
+  - `nba_player_tracking_...` (tracking endpoints, including defense/rim protection)
   - `nba_lineups_...`   (lineup combinations and lineup performance)
   - `nba_schedule_...`  (game schedules)
   - `nba_standings_...` (team standings / rank / records)
@@ -1885,6 +1892,10 @@ RULE 0 — INTENT ROUTING FOR EXTENDED TABLE FAMILIES:
   - "clutch", "in close games", "last 5 minutes"        → `nba_clutch_...`
   - "hustle", "deflections", "box outs", "charges"      → `nba_hustle_...`
   - "tracking", "drives", "touches", "distance", "speed"→ `nba_player_tracking_...`
+  - "defense", "defensive", "defensively", "better defender",
+    "defensive end", "rim protection", "defensive rating" → use BOTH a schema-matched
+    defensive/player-tracking table AND the matching `nba_advanced_...` table for the requested year(s)
+    Advanced-only SQL is NOT acceptable for defensive-quality questions.
   - "shot chart", "shot distance", "step back", "dunks" → `court_shots`
   - "lineup", "5-man unit", "best lineup"               → `nba_lineups_...`
   - "standings", "seed", "conference rank"              → `nba_standings_...`
@@ -1985,9 +1996,35 @@ RULE 11 — SPECIALTY STATS & TRACKING (STRICT 63-CHAR TABLE NAMES):
       Regular: `nba_player_tracking_pt_passing_season_YYYY_YY_season_type_r`
       Playoffs: `nba_player_tracking_pt_passing_season_YYYY_YY_season_type_p`
 
-  → Defense ("defense", "opponent points at rim", "rim protection", "give up"):
-      Regular: `nba_player_tracking_pt_defense_season_YYYY_YY_season_type_r`
-      Columns to use: "DEF_RIM_FGM", "DEF_RIM_FGA", "DEF_RIM_FG_PCT", "STL", "BLK" (Do not use OPP_PTS, it does not exist).
+  → Defense ("defense", "defensive", "defensively", "better defender",
+     "defensive end", "opponent points at rim", "rim protection", "give up"):
+      Do NOT default to `all_players_regular_*` by itself for defensive-quality questions.
+      Do NOT use only `nba_advanced_...` for defensive-quality questions.
+      Look in the DATABASE SCHEMA for the requested season's defensive/player-tracking table
+      (currently names contain player_tracking + defense) and pair it with the matching
+      `nba_advanced_...` table for that same season and season type.
+      Use exact table names from the schema; do not invent or lock onto one naming style.
+      Prefer defensive/rim columns such as "DEF_RIM_FGM", "DEF_RIM_FGA", "DEF_RIM_FG_PCT",
+      "STL", "BLK", and "DREB" from the defensive tracking table when present.
+      Also include advanced defensive/context columns such as "DEF_RATING", "E_DEF_RATING",
+      "DREB_PCT", "REB_PCT", "NET_RATING", and "PIE" from the advanced table when present.
+      Join tables on shared player/team keys when both tables are needed (usually
+      "PLAYER_ID" and "TEAM_ID"), and always select "PLAYER_NAME", "TEAM_ABBREVIATION",
+      "GP", and "MIN" so the analyzer can compare rows correctly and avoid low-minute outliers.
+      For "best defender" / defensive leaderboards, apply BOTH sample filters when columns exist:
+      `NULLIF("GP", '')::numeric >= 20` and `NULLIF("MIN", '')::numeric >= 15`.
+      Do not decide "best defender" from lowest "DEF_RATING" alone; return enough raw context
+      from both defensive tracking and advanced tables for the analyzer to compare rim defense,
+      stocks, defensive rebounding, team defensive rating, net impact, and minutes.
+      Unless the user explicitly asks for top 5/top 10, return a broad candidate set
+      (for example LIMIT 50 or LIMIT 100) instead of LIMIT 10.
+      For "who is better defensively, X or Y" questions, filter to those named players,
+      include both table families, and do not use a leaderboard LIMIT.
+      Use SELECT DISTINCT for defensive joins because some source tables can contain duplicate
+      player/team rows.
+      PostgreSQL rule: if a defensive query uses SELECT DISTINCT and also needs ORDER BY
+      with a numeric cast, put the DISTINCT join in a subquery, then ORDER BY in the
+      outer query. Do NOT write SELECT DISTINCT ... ORDER BY NULLIF(... )::numeric directly.
       IMPORTANT: DO NOT use the `SUM(pts)` aggregation block for defense tables. Use RAW columns.
       
   → Tracking endpoints that DO NOT split by regular/playoffs (append this EXACT suffix to the season year):
@@ -2463,6 +2500,25 @@ WHERE NULLIF("G", '')::numeric >= 20
 ORDER BY NULLIF("DEFLECTIONS", '')::numeric DESC NULLS LAST
 LIMIT 10;
 
+Q: "Who was the best defender in 2013?"
+→ RULE 0 + RULE 11. Defensive-quality question: use BOTH the schema-matched
+   defensive/player-tracking table and the matching advanced table. Do not use
+   advanced-only SQL. Pull a broad candidate set with GP and MIN filters so the
+   analyzer can avoid low-minute outliers.
+SELECT *
+FROM (
+  SELECT DISTINCT d."PLAYER_NAME", d."TEAM_ABBREVIATION", d."GP", d."MIN",
+         d."STL", d."BLK", d."DREB", d."DEF_RIM_FGM", d."DEF_RIM_FGA", d."DEF_RIM_FG_PCT",
+         a."DEF_RATING", a."E_DEF_RATING", a."DREB_PCT", a."REB_PCT", a."NET_RATING", a."PIE"
+  FROM nba_player_tracking_pt_defense_season_2013_14_season_type_r d
+  JOIN nba_advanced_season_2013_14_season_type_regular_season_per a
+    ON d."PLAYER_ID" = a."PLAYER_ID" AND d."TEAM_ID" = a."TEAM_ID"
+  WHERE NULLIF(d."GP", '')::numeric >= 20
+    AND NULLIF(d."MIN", '')::numeric >= 15
+) AS defensive_candidates
+ORDER BY NULLIF("DEF_RATING", '')::numeric ASC NULLS LAST
+LIMIT 50;
+
 Q: "Who had the highest PER in 2023?"
 → RULE 15. PER is not stored — closest equivalent is "PIE" in nba_advanced_*.
    Numbers in advanced tables are TEXT, so cast with NULLIF(col, '')::numeric.
@@ -2617,7 +2673,12 @@ Generate the SQL:"""
             logger.error("SQL execution error: %s", error_message)
 
             if any(keyword in error_message.lower()
-                   for keyword in ["does not exist", "column", "relation"]):
+                   for keyword in [
+                       "does not exist",
+                       "column",
+                       "relation",
+                       "order by expressions must appear in select list",
+                   ]):
 
                 logger.debug("Attempting schema self-repair...")
 

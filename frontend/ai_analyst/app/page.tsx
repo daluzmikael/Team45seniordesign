@@ -31,7 +31,7 @@ export default function Home() {
           {[
             "Compare LeBron James and Stephen Curry's career stats",
             "Show me Steph Curry's 3-point percentage by season",
-            "What are the Lakers' win-loss records in 2022?",
+            "Compare LebronJames 2012 and Kevin Durant 2015",
             "Analyze Giannis Antetokounmpo's playoff performance in 2023",
           ].map((example) => (
             <div

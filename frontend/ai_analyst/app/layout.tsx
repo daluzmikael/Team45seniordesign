@@ -31,7 +31,7 @@ export default function RootLayout({
                 <header className="sticky top-0 z-30 flex h-16 min-w-0 shrink-0 items-center gap-2 border-b border-[var(--surface-matte-border)] bg-[var(--surface-matte-raised)] px-4 dark:border-[var(--surface-matte-border)] dark:bg-[var(--surface-matte-raised)]">
                   <SidebarTrigger />
                   <div className="flex items-center gap-2">
-                    <h1 className="text-xl font-medium tracking-wide text-red-500">HoopQuery</h1>
+                    <h1 className="text-xl font-medium tracking-wide text-red-800">HoopQuery</h1>
                   </div>
                   <div className="ml-auto">
                     <ThemeToggle />

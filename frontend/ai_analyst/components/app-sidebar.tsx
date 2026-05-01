@@ -165,12 +165,12 @@ export function AppSidebar() {
 
   const grouped = groupByDate(conversations)
   const tabClass =
-    "border-0 bg-red-500 text-zinc-100 hover:bg-red-400 font-medium data-[active=true]:bg-red-500 data-[active=true]:text-zinc-100 data-[active=true]:hover:bg-red-400"
-  const activeTabClass = "bg-red-500 text-zinc-100"
+    "border-0 bg-red-800 text-zinc-100 hover:bg-red-700 font-medium data-[active=true]:bg-red-800 data-[active=true]:text-zinc-100 data-[active=true]:hover:bg-red-700"
+  const activeTabClass = "bg-red-800 text-zinc-100"
   const searchClass =
     "border-0 bg-[var(--surface-matte-raised)] text-zinc-900 hover:bg-[var(--surface-matte-hover)] dark:bg-[var(--surface-matte-raised)] dark:text-zinc-100 dark:hover:bg-[var(--surface-matte-hover)]"
   const savedChatClass =
-    "border-0 bg-[var(--surface-matte-raised)] text-zinc-900 hover:bg-[var(--surface-matte-hover)] dark:bg-[var(--surface-matte-raised)] dark:text-zinc-100 dark:hover:bg-[var(--surface-matte-hover)] data-[active=true]:bg-[var(--surface-matte-raised)] data-[active=true]:text-zinc-900 data-[active=true]:hover:bg-[var(--surface-matte-hover)] dark:data-[active=true]:bg-[var(--surface-matte-raised)] dark:data-[active=true]:text-zinc-100 dark:data-[active=true]:hover:bg-[var(--surface-matte-hover)]"
+    "border-0 bg-[oklch(0.82_0_0)] text-zinc-900 hover:bg-[oklch(0.79_0_0)] dark:bg-[var(--surface-matte-raised)] dark:text-zinc-100 dark:hover:bg-[var(--surface-matte-hover)] data-[active=true]:bg-[oklch(0.82_0_0)] data-[active=true]:text-zinc-900 data-[active=true]:hover:bg-[oklch(0.79_0_0)] dark:data-[active=true]:bg-[var(--surface-matte-raised)] dark:data-[active=true]:text-zinc-100 dark:data-[active=true]:hover:bg-[var(--surface-matte-hover)]"
 
   return (
     <Sidebar className="[&_[data-sidebar=sidebar]]:bg-[var(--surface-matte-sidebar)] [&_[data-sidebar=sidebar]]:text-zinc-900 [&_[data-sidebar=sidebar]]:shadow-none dark:[&_[data-sidebar=sidebar]]:bg-[var(--surface-matte-sidebar)] dark:[&_[data-sidebar=sidebar]]:text-zinc-100">

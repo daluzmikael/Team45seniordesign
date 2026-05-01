@@ -62,7 +62,7 @@ export default function Home() {
           <Button
             onClick={() => startChat()}
             size="icon"
-            className="h-[60px] w-[60px] border border-red-400 bg-red-500 text-zinc-100 hover:bg-red-400"
+            className="h-[60px] w-[60px] border border-red-700 bg-red-800 text-zinc-100 hover:bg-red-700"
             disabled={!message.trim()}
           >
             <Send className="h-5 w-5 text-zinc-600" />

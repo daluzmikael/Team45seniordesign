@@ -71,7 +71,12 @@ IMPORTANT SQL RULES:
    - **ALWAYS use DISTINCT ON (player_name) or GROUP BY to avoid duplicate rows for traded players.**
 
 4. **Name Matching**:
-   - Always use `ILIKE '%First%Last%'` to be safe.
+   - Always use `ILIKE '%Full Name%'` plus an accent-safe fallback:
+     `(player_name ILIKE '%First%' AND player_name ILIKE '%Las%')`
+     where `Las` is the first 3 letters of the last name.
+   - This is required for names with accents in the database, e.g. `Luka Dončić`
+     may not match `ILIKE '%Luka%Doncic%'`, but it will match
+     `player_name ILIKE '%Luka%' AND player_name ILIKE '%Don%'`.
 
 5. **Retired / Historical Players**:
    - If the user asks about a player with NO specific season and the player may be retired (e.g., Kobe Bryant, Tim Duncan, Kevin Garnett, Manu Ginobili), do NOT just query the latest season table.
@@ -1033,6 +1038,38 @@ _TEXT_STORAGE_TABLE_PREFIXES = (
 )
 
 
+def _expand_player_name_filters_for_encoding(sql: str) -> str:
+    """Make generated player_name ILIKE filters robust to accents.
+
+    Example: player_name ILIKE '%Luka%Doncic%' will not match `Luka Dončić`.
+    Add a fallback requiring first name + first 3 letters of the last name.
+    """
+    if not sql:
+        return sql
+
+    pattern = re.compile(r"(?i)(\"?player_name\"?)\s+ILIKE\s+'%([^%']+)%'")
+
+    def repl(match: re.Match) -> str:
+        col_name = match.group(1)
+        raw_name = match.group(2).replace("%", " ").strip()
+        parts = [p for p in raw_name.split() if p]
+        if len(parts) < 2:
+            return match.group(0)
+
+        first = parts[0].replace("'", "''")
+        last_prefix = parts[-1][:3].replace("'", "''")
+        full_name = " ".join(parts).replace("'", "''")
+        original_clause = match.group(0)
+        fallback_clause = f"({col_name} ILIKE '%{first}%' AND {col_name} ILIKE '%{last_prefix}%')"
+        full_clause = f"{col_name} ILIKE '%{full_name}%'"
+
+        if fallback_clause.lower() in sql.lower():
+            return original_clause
+        return f"({original_clause} OR {full_clause} OR {fallback_clause})"
+
+    return pattern.sub(repl, sql)
+
+
 def _sql_targets_text_storage_family(sql: str) -> bool:
     if not sql:
         return False
@@ -1169,6 +1206,21 @@ def _post_process_scatter_sql(sql: str, chart_type: str) -> str:
     return sql
 
 
+def _dedupe_single_player_trend_sql(sql: str, chart_type: str) -> str:
+    if chart_type != "SinglePlayerStat" or not sql:
+        return sql
+    if "stat_value" not in sql.lower() or " as season" not in sql.lower():
+        return sql
+    return re.sub(r"(?is)^\s*SELECT\s+\*\s+FROM\s+\(", "SELECT DISTINCT * FROM (", sql, count=1)
+
+
+def _post_process_sql(sql: str, chart_type: str) -> str:
+    sql = _post_process_scatter_sql(sql, chart_type)
+    sql = _expand_player_name_filters_for_encoding(sql)
+    sql = _dedupe_single_player_trend_sql(sql, chart_type)
+    return sql
+
+
 def interpret_question(user_question: str) -> Dict[str, Any]:
     conn = None
     try:
@@ -1182,8 +1234,7 @@ def interpret_question(user_question: str) -> Dict[str, Any]:
         sql_query = interpretation.get("sqlQuery", "")
         chart_config = interpretation.get("chartConfig", {})
 
-        # Apply scatter SQL safety-net rewrites (no-op for non-scatter chartTypes).
-        sql_query = _post_process_scatter_sql(sql_query, chart_type)
+        sql_query = _post_process_sql(sql_query, chart_type)
 
         print(f"Chart Type: {chart_type}")
         print(f"Generated SQL: {sql_query}")
@@ -1228,8 +1279,7 @@ def interpret_question(user_question: str) -> Dict[str, Any]:
             sql_query = interpretation.get("sqlQuery", "")
             chart_config = interpretation.get("chartConfig", {})
 
-            # Apply scatter SQL safety-net rewrites on the retry too.
-            sql_query = _post_process_scatter_sql(sql_query, chart_type)
+            sql_query = _post_process_sql(sql_query, chart_type)
 
             print(f"[Retry] Chart Type: {chart_type}")
             print(f"[Retry] Generated SQL: {sql_query}")

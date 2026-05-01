@@ -55,7 +55,7 @@ const EXAMPLE_CATEGORIES = [
   {
     label: "Comparisons",
     examples: [
-      "Show me Karl-Anthony Towns rebounds per game in 2021 vs Bol Bol",
+      "Show me Karl-Anthony Towns rebounds per game in 2021 vs Rudy Gobert vs Bam Adebayo",
       "Show me Kyle Kuzma and Kevin Durant points from 2019 to 2024",
       "Compare Stephen Curry and Damian Lillard 3 point shooting percentages in 2023",
       "Compare LeBron James and Trae Young assists in the 2023 season"
@@ -67,7 +67,7 @@ const EXAMPLE_CATEGORIES = [
       "Show me Dirk Nowitzki's skill profile in 2005",
       "Show me Manu Ginobili 2013 skill profile vs Trae Young's 2018 skill profile",
       "Show me Stephen Curry's skill profile",
-      "Show me James Harden's skill profile in the 2018 season"
+      "Show me James Harden's skill profile in the 2018 season vs Gobert"
     ],
   },
   {
@@ -76,6 +76,7 @@ const EXAMPLE_CATEGORIES = [
       "Show me a heat map of Stephen Curry's 3 point shot selection",
       "Show me LeBron's best shooting zones against the Celtics",
       "Show me Steph Curry's shooting percentages heat map",
+      "Jayson Tatum heatmap against spurs in april 2021",
       "Show me Shaquille O'Neal's worst shooting zone within 15 feet",
     ],
   },

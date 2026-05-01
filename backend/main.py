@@ -1,5 +1,6 @@
 import logging
 import os
+import json
 
 # Align root log level with env before importing Interpreter/Executor (uvicorn may configure logging first).
 logging.getLogger().setLevel(
@@ -9,7 +10,7 @@ logging.getLogger().setLevel(
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Set
 from DashboardBackend.dashboardInterpreter import interpret_question
 from Analyzer.query_analyzer import analyze_question_with_data
 from auth import (
@@ -20,66 +21,19 @@ from auth import (
     get_conversation_messages,
     list_conversations,
 )
-from Interpreter.interpreter import (
-    run_query,
-    debug_query_routing,
-    get_last_tables_used,
-    pronoun_stats_query_missing_player,
-    _extract_current_question_text,
-    _match_compare_two_player_fragments,
-)
+from Interpreter.interpreter import run_query, debug_query_routing
+from openai import OpenAI
 import numpy as np
 import pandas as pd
 import re
-import time
-from threading import Lock
 
 app = FastAPI()
 
-_RESPONSE_CACHE_LOCK = Lock()
-_RESPONSE_CACHE: dict[str, tuple[float, Dict[str, Any]]] = {}
-
-# When the client omits `history`, remember the last user question per conversation/session
-# so follow-ups ("his stats", "same for playoffs") still resolve player/season context.
-_LAST_QUESTION_LOCK = Lock()
-_LAST_QUESTION_BY_KEY: dict[str, tuple[str, float]] = {}
-_LAST_QUESTION_TTL_SECONDS = int(os.getenv("LAST_QUESTION_TTL_SECONDS", str(45 * 60)))
-
-
-def _cache_ttl_seconds() -> int:
-    return int(os.getenv("RESPONSE_CACHE_TTL_SECONDS", "45"))
-
-
-def _cache_max_items() -> int:
-    return int(os.getenv("RESPONSE_CACHE_MAX_ITEMS", "128"))
-
-
-def _make_cache_key(question: str, effective_question: str, history: List[Dict[str, Any]]) -> str:
-    # Include effective question and compact history footprint so follow-ups stay correct.
-    return f"{question.strip()}||{effective_question.strip()}||{repr(history[-4:])}"
-
-
-def _get_cached_response(cache_key: str) -> Optional[Dict[str, Any]]:
-    ttl = _cache_ttl_seconds()
-    now = time.time()
-    with _RESPONSE_CACHE_LOCK:
-        row = _RESPONSE_CACHE.get(cache_key)
-        if not row:
-            return None
-        ts, payload = row
-        if (now - ts) > ttl:
-            _RESPONSE_CACHE.pop(cache_key, None)
-            return None
-        return dict(payload)
-
-
-def _set_cached_response(cache_key: str, payload: Dict[str, Any]) -> None:
-    with _RESPONSE_CACHE_LOCK:
-        if len(_RESPONSE_CACHE) >= _cache_max_items():
-            # Remove oldest item (insertion-order dict in modern Python).
-            oldest_key = next(iter(_RESPONSE_CACHE))
-            _RESPONSE_CACHE.pop(oldest_key, None)
-        _RESPONSE_CACHE[cache_key] = (time.time(), dict(payload))
+context_client = (
+    OpenAI(api_key=os.getenv("OPENAI_API_KEY"), base_url="https://us.api.openai.com/v1")
+    if os.getenv("OPENAI_API_KEY")
+    else None
+)
 
 @app.get("/")
 async def root():
@@ -96,8 +50,6 @@ app.add_middleware(
 class QueryRequest(BaseModel):
     question: str
     conversationId: Optional[str] = None
-    # Optional guest/anonymous thread key when conversationId is not used; enables server-side last-question memory.
-    sessionId: Optional[str] = None
     history: Optional[List[Dict[str, Any]]] = None
 
 class AuthRequest(BaseModel):
@@ -134,7 +86,7 @@ def get_uid_from_authorization(authorization: Optional[str]) -> str:
 
 
 def _build_contextual_question(
-    current_question: str, history_messages: List[Dict[str, Any]], max_messages: int = 4
+    current_question: str, history_messages: List[Dict[str, Any]], max_messages: int = 8
 ) -> str:
     """
     Build a compact context wrapper so follow-up questions can resolve references
@@ -153,8 +105,8 @@ def _build_contextual_question(
         if not content:
             continue
         content = content.replace("\n", " ").strip()
-        if len(content) > 150:
-            content = content[:150] + "..."
+        if len(content) > 300:
+            content = content[:300] + "..."
         speaker = "User" if role == "user" else "Assistant"
         context_lines.append(f"{speaker}: {content}")
 
@@ -170,52 +122,249 @@ def _build_contextual_question(
     )
 
 
-def _is_affirmative_followup(question: str) -> bool:
-    q = (question or "").strip().lower()
-    return q in {"yes", "yeah", "yep", "yup", "sure", "ok", "okay", "do it", "go ahead"}
+def _compact_history_for_context_ai(
+    history_messages: List[Dict[str, Any]], max_messages: int = 8, max_chars: int = 450
+) -> str:
+    recent = history_messages[-max_messages:]
+    context_lines: List[str] = []
+    for msg in recent:
+        role = str(msg.get("role", "")).strip().lower()
+        if role not in {"user", "assistant"}:
+            continue
+        content = str(msg.get("content", "")).strip()
+        if not content:
+            continue
+        content = re.sub(r"\s+", " ", content)
+        if len(content) > max_chars:
+            content = content[:max_chars] + "..."
+        speaker = "User" if role == "user" else "Assistant"
+        context_lines.append(f"{speaker}: {content}")
+    return "\n".join(context_lines)
 
 
-def _has_explicit_season_reference(question: str) -> bool:
-    q = (question or "").lower()
-    return (
-        re.search(r"\b(19\d{2}|20\d{2})\b", q) is not None
-        or re.search(r"\b(19\d{2}|20\d{2})\s*[-/_]\s*(\d{2}|19\d{2}|20\d{2})\b", q) is not None
-        or "this season" in q
-        or "current season" in q
-        or "last season" in q
-        or "this playoff" in q
-        or "current playoff" in q
-        or "last playoff" in q
-        or "this postseason" in q
-        or "current postseason" in q
-        or "last postseason" in q
+def _json_object_from_text(raw: str) -> Optional[Dict[str, Any]]:
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        pass
+
+    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+    if not match:
+        return None
+    try:
+        parsed = json.loads(match.group(0))
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
+def _resolve_followup_with_ai(
+    current_question: str, history_messages: List[Dict[str, Any]]
+) -> Optional[Dict[str, str]]:
+    """
+    Ask a small model to convert a sequential chat turn into a standalone NBA
+    analytics question before SQL generation. This keeps pronoun/entity/time
+    resolution flexible without putting raw assistant prose into the SQL prompt.
+    """
+    if context_client is None or not history_messages:
+        return None
+
+    history_block = _compact_history_for_context_ai(history_messages)
+    if not history_block:
+        return None
+
+    system_prompt = (
+        "You rewrite NBA analytics chat follow-ups into standalone database questions.\n"
+        "Return ONLY a JSON object with these string/boolean fields:\n"
+        "standalone_question, analysis_question, needs_history, reason.\n\n"
+        "Rules:\n"
+        "- Use history only to resolve references like he, him, they, them, that season, those teams, or same stat.\n"
+        "- Do not answer the question and do not write SQL.\n"
+        "- Preserve the user's latest requested metric, season, season type, opponent, and entity type.\n"
+        "- If the latest user asks 'what about X' or 'how about X', carry the relevant prior metric/timeframe and replace the subject with X.\n"
+        "- If pronouns refer to teams/franchises, write team names as teams, not players.\n"
+        "- If pronouns refer to players, write player names as players.\n"
+        "- If the user says yes/sure/ok/do it, infer the specific follow-up from the last assistant offer and prior user question.\n"
+        "- If the current question is already standalone, set needs_history to false and repeat it exactly.\n"
+        "- analysis_question should be the same as standalone_question unless a shorter natural wording is clearer for the final explanation.\n"
+        "- Never invent a player, team, or season that is not present in the current question or recent history.\n"
+    )
+    user_prompt = (
+        f"Recent conversation:\n{history_block}\n\n"
+        f"Current user question:\n{current_question}\n\n"
+        "JSON only:"
     )
 
+    try:
+        response = context_client.chat.completions.create(
+            model=os.getenv("CONTEXT_RESOLVER_MODEL", "gpt-5.4-mini"),
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            temperature=0,
+            max_completion_tokens=500,
+        )
+        parsed = _json_object_from_text(response.choices[0].message.content or "")
+        if not parsed:
+            return None
 
-def _should_force_previous_context(question: str) -> bool:
-    q = (question or "").strip().lower()
-    if not q or _has_explicit_season_reference(q):
+        standalone = str(parsed.get("standalone_question", "")).strip()
+        analysis_question = str(parsed.get("analysis_question", "")).strip() or standalone
+        if not standalone:
+            return None
+
+        needs_raw = parsed.get("needs_history", True)
+        if isinstance(needs_raw, bool):
+            needs_history = needs_raw
+        else:
+            needs_history = str(needs_raw).strip().lower() not in {"false", "0", "no"}
+        if not needs_history and standalone.lower() == (current_question or "").strip().lower():
+            return {
+                "effective_question": current_question,
+                "analysis_question": current_question,
+                "reason": "already_standalone",
+            }
+
+        return {
+            "effective_question": standalone,
+            "analysis_question": analysis_question,
+            "reason": str(parsed.get("reason", "ai_context_rewrite")).strip() or "ai_context_rewrite",
+        }
+    except Exception as context_error:
+        print(f"AI context rewrite skipped: {context_error}")
+        return None
+
+
+def _is_affirmative_followup(question: str) -> bool:
+    q = re.sub(r"[^\w\s]", "", (question or "").strip().lower())
+    if not q:
         return False
-
-    vague_markers = [
-        "compare",
-        "vs",
-        "versus",
-        "between",
-        "them",
-        "those two",
-        "both",
-        "who is better",
-        "which one",
-        "what about",
-        "how about",
-        "and ",
-    ]
-    if any(marker in q for marker in vague_markers):
+    tokens = q.split()
+    if not tokens:
+        return False
+    if tokens[0] in {"yes", "yeah", "yep", "yup", "yah", "ya", "sure", "ok", "okay", "k", "kk"}:
         return True
+    return q in {"do it", "go ahead", "go for it", "lets go", "lets do it", "please do"}
 
-    token_count = len(re.findall(r"\w+", q))
-    return token_count <= 6
+
+_COMPARISON_FOLLOWUP_MARKERS = (
+    "better", "worse", "compare", "vs ", " vs.",
+    "between them", "of the two", "of those two",
+    "who was better", "who is better", "who's better",
+    " or ", "as well as",
+    # Comparative phrasing requires "than" — bare "more" / "less" matches
+    # too aggressively (e.g. "tell me more about X" is a drill-down, not
+    # a comparison).
+    "more than", "less than", "greater than",
+)
+
+def _looks_like_comparison_followup(question: str) -> bool:
+    raw = (question or "").strip().lower()
+    # Strip a leading discourse "or " — when "Or what about KD?" comes after a
+    # prior turn, that's a drill-down on KD, not a comparison.
+    if raw.startswith("or "):
+        raw = raw[3:].strip()
+    q = " " + raw + " "
+    return any(m in q for m in _COMPARISON_FOLLOWUP_MARKERS)
+
+
+# Phrases that signal the user wants a deeper look at a SPECIFIC entity from
+# the prior turn. When combined with a named player in the question, this lets
+# us scope the response to that one player.
+_DRILLDOWN_MARKERS = (
+    "more in-depth", "more in depth", "more detail", "more details",
+    "deeper", "deep dive", "deep-dive", "drill down", "drill-down",
+    "tell me more", "tell me about",
+    "breakdown of", "break down",
+    "more on", "more about", "expand on", "elaborate on",
+    "what about", "how about",
+    "focus on", "just ",
+)
+
+def _looks_like_single_player_drilldown(question: str) -> bool:
+    """True when the question has a 'tell me more / drill down' shape.
+    Used to scope a follow-up to one named player (not a comparison)."""
+    raw = (question or "").strip().lower()
+    if raw.startswith("or "):
+        raw = raw[3:].strip()
+    q = " " + raw + " "
+    if any(m in q for m in _COMPARISON_FOLLOWUP_MARKERS):
+        return False
+    return any(m in q for m in _DRILLDOWN_MARKERS)
+
+
+# Match 1-3 word capitalized names. Allows internal uppercase (LeBron, McGee).
+# Trailing 's (possessive) is stripped before matching. Sentence-start filter
+# keeps common question words from leaking through.
+_QUESTION_NAME_RE = re.compile(r"\b([A-Z][a-zA-Z]{2,}(?:\s+[A-Z][a-zA-Z\.\-']*){0,2})\b")
+
+def _extract_named_players_from_question(question: str) -> List[str]:
+    """Pull capitalized 1-3 word names from the user's question.
+    Conservative — drops obvious section-header / stat-phrase / common-word
+    false positives via _NAME_STOPWORDS and a sentence-start filter."""
+    if not question:
+        return []
+    found: List[str] = []
+    seen: Set[str] = set()
+    # Strip possessive 's so "Curry's" → "Curry"
+    cleaned = re.sub(r"['\u2019]s\b", "", question)
+    # Skip common sentence-start capitalized words that look like names
+    sentence_start_blocklist = {
+        "what", "who", "where", "when", "why", "how", "show", "give",
+        "tell", "compare", "find", "list", "rank", "between", "statistically",
+        "analyze", "break", "more", "yes", "yeah", "ok", "sure",
+        "deeper", "deep", "expand", "elaborate", "focus", "just",
+        "describe", "explain", "summarize", "look", "looking",
+    }
+    for cand in _QUESTION_NAME_RE.findall(cleaned):
+        key = cand.lower()
+        first_word = key.split()[0] if key else ""
+        if first_word in sentence_start_blocklist:
+            continue
+        if any(stop in key for stop in _NAME_STOPWORDS):
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(cand)
+    return found
+
+
+# Stop words to filter out of name candidates pulled from prior assistant text.
+_NAME_STOPWORDS = {
+    "regular season", "per game", "playoffs", "playoff", "field goal",
+    "free throw", "double double", "triple double", "double-double",
+    "triple-double", "plus minus", "plus-minus", "western conference",
+    "eastern conference", "all star", "all-star",
+}
+
+_NAME_CANDIDATE_RE = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z\.\-']+){1,2})\b")
+
+def _extract_player_names_from_history(
+    history_messages: List[Dict[str, Any]], limit: int = 4
+) -> List[str]:
+    names: List[str] = []
+    seen = set()
+    for msg in reversed(history_messages or []):
+        content = str(msg.get("content", "")).strip()
+        if not content:
+            continue
+        for cand in _NAME_CANDIDATE_RE.findall(content):
+            key = cand.lower()
+            if any(stop in key for stop in _NAME_STOPWORDS):
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            names.append(cand)
+            if len(names) >= limit:
+                return names
+    return names
 
 
 def _extract_latest_player_and_season_from_history(
@@ -257,48 +406,43 @@ def _should_apply_history_context(question: str) -> bool:
     if not q:
         return False
 
-    cur = _extract_current_question_text(question).strip()
-    cur_lower = cur.lower()
-    has_pronoun = bool(re.search(r"\b(his|her|their|him|them|they|he|she)\b", cur_lower))
-    lf, rf = _match_compare_two_player_fragments(cur)
-    if lf and rf and not has_pronoun:
-        return False
-    if re.match(r"(?i)^compare\s+", cur) and not has_pronoun:
-        return False
-    if re.match(r"(?i)^between\s+", cur) and not has_pronoun:
-        return False
-
     # Only inject history for likely follow-up/ellipsis prompts.
     followup_markers = [
         "what about",
         "how about",
-        # Do not use bare "and " — it matches "Compare X and Y" player pairs and wrongly
-        # injects unrelated chat history into standalone compare questions.
-        "and also",
-        "and what about",
-        "and how about",
+        "and what",
+        "and how",
+        "and him",
+        "and her",
+        "and them",
+        "and those",
+        "and that",
+        "and defensively",
+        "and offensively",
         "also",
         "same ",
         "that ",
         "those ",
         "them",
+        "they",
         "him",
         "his ",
         "her ",
         "their ",
+        " it ",
+        "its ",
+        "that team",
+        "those teams",
+        "same team",
+        "same stat",
+        "same question",
+        "offensively",
+        "defensively",
         "break that down",
-        "breakdown",
-        "elaborate",
-        "more detail",
-        "go deeper",
-        "same player",
-        "same season",
-        "previous",
-        "last answer",
-        "last response",
         "which one",
         "who is better",
         "who's better",
+        "who was better",
         "yes",
         "yeah",
         "yep",
@@ -306,29 +450,45 @@ def _should_apply_history_context(question: str) -> bool:
         "ok",
         "okay",
         "sure",
+        # Drill-down phrasings — user is asking for more detail on something
+        # established earlier in the conversation.
+        "more in-depth",
+        "more in depth",
+        "more detail",
+        "tell me more",
+        "tell me about",
+        "breakdown of",
+        "break down",
+        "more on",
+        "more about",
+        "expand on",
+        "elaborate",
+        "deeper",
+        "deep dive",
+        "drill down",
+        "focus on",
+        # Single-pronoun follow-ups — implicitly reference the prior subject.
+        "how was he",
+        "how is he",
+        "how was she",
+        "how is she",
+        "was he",
+        "was she",
+        "is he",
+        "is she",
+        "did he",
+        "did she",
+        "does he",
+        "does she",
+        " he ",
+        " she ",
     ]
-    if re.search(
-        r"(?i)\bwhich\s+(?:one|player)\s+(?:was|is)\s+better\b.*\bor\b",
-        cur,
-    ) and not has_pronoun:
-        return False
-    if re.search(
-        r"(?i)\bwhich\s+had\s+(?:the\s+)?better\s+season\b.*\bor\b",
-        cur,
-    ) and not has_pronoun:
-        return False
     if any(marker in q for marker in followup_markers):
-        return True
-
-    # Pronouns / deictic references (word-boundary; avoids matching substrings like "history").
-    if re.search(r"\b(his|her|their|him|them|they|he|she)\b", q):
         return True
 
     # Very short prompts are often dependent on prior context.
     token_count = len(re.findall(r"\w+", q))
-    if token_count > 6:
-        return False
-    return True
+    return token_count <= 4
 
 
 def _analysis_debug_enabled() -> bool:
@@ -352,36 +512,129 @@ def _sanitize_history_messages(history: Optional[List[Dict[str, Any]]]) -> List[
     return sanitized
 
 
-def _last_question_context_key(request: QueryRequest) -> Optional[str]:
-    cid = (request.conversationId or "").strip()
-    if cid:
-        return f"cid:{cid}"
-    sid = (request.sessionId or "").strip()
-    if sid:
-        return f"sid:{sid}"
+def _extract_explicit_season_start(question: str) -> tuple[Optional[int], bool]:
+    q = (question or "").lower()
+    is_playoffs = "playoff" in q or "postseason" in q
+
+    season_match = re.search(r"\b(19\d{2}|20\d{2})\s*[-/]\s*(\d{2}|19\d{2}|20\d{2})\b", q)
+    if season_match:
+        return int(season_match.group(1)), is_playoffs
+
+    year_match = re.search(r"\b(19\d{2}|20\d{2})\b", q)
+    if not year_match:
+        return None, is_playoffs
+
+    year = int(year_match.group(1))
+    if is_playoffs:
+        return year - 1, True
+    return year, False
+
+
+def _unsupported_specialty_message(question: str) -> Optional[str]:
+    q = (question or "").lower()
+    hustle_terms = [
+        "hustle",
+        "deflection",
+        "deflections",
+        "contested shot",
+        "contested shots",
+        "charge",
+        "charges",
+        "screen assist",
+        "screen assists",
+        "box out",
+        "box outs",
+        "loose ball",
+        "loose balls",
+    ]
+    if not any(term in q for term in hustle_terms):
+        return None
+
+    season_start, is_playoffs = _extract_explicit_season_start(question)
+    if season_start is None:
+        return None
+
+    if is_playoffs:
+        available_playoff_starts = {1998, 2004, *range(2015, 2025)}
+        if season_start not in available_playoff_starts:
+            season_label = f"{season_start}-{str(season_start + 1)[-2:]}"
+            return (
+                f"Hustle/deflections playoff data is not available for {season_label} in this database. "
+                "Available playoff hustle seasons are 1998-99, 2004-05, and 2015-16 through 2024-25."
+            )
+        return None
+
+    if season_start < 2015:
+        season_label = f"{season_start}-{str(season_start + 1)[-2:]}"
+        return (
+            f"Hustle/deflections regular-season data is not available for {season_label} in this database. "
+            "Regular-season hustle data starts at 2015-16 and runs through 2025-26."
+        )
     return None
 
 
-def _recall_last_user_question(key: str) -> Optional[str]:
-    now = time.time()
-    with _LAST_QUESTION_LOCK:
-        row = _LAST_QUESTION_BY_KEY.get(key)
-        if not row:
-            return None
-        text, ts = row
-        if (now - ts) > _LAST_QUESTION_TTL_SECONDS:
-            _LAST_QUESTION_BY_KEY.pop(key, None)
-            return None
-        t = (text or "").strip()
-        return t or None
+def _build_effective_question_from_history(
+    current_question: str, history_messages: List[Dict[str, Any]]
+) -> tuple[str, str, str]:
+    """
+    Return (sql_question, analyzer_question, strategy). Prefer an AI rewrite
+    into a standalone question; fall back to the old context wrapper plus
+    targeted deterministic constraints when the rewrite is unavailable.
+    """
+    ai_resolution = _resolve_followup_with_ai(current_question, history_messages)
+    if ai_resolution:
+        return (
+            ai_resolution["effective_question"],
+            ai_resolution["analysis_question"],
+            f"ai_standalone_rewrite: {ai_resolution['reason']}",
+        )
 
+    effective_question = _build_contextual_question(current_question, history_messages)
+    analysis_question = current_question
 
-def _remember_user_question(key: str, question: str) -> None:
-    qt = (question or "").strip()
-    if not qt or not key:
-        return
-    with _LAST_QUESTION_LOCK:
-        _LAST_QUESTION_BY_KEY[key] = (qt, time.time())
+    if _is_affirmative_followup(current_question):
+        player_name, season_label = _extract_latest_player_and_season_from_history(history_messages)
+        if player_name and season_label:
+            effective_question += (
+                "\n\nFollow-up constraint: keep the SAME player and SAME season as the last answer. "
+                f"Use player_name ILIKE '%{player_name}%' and season_label '{season_label}' context "
+                "(do not advance to a different season)."
+            )
+
+    # Comparison continuity. If the follow-up is comparison-shaped but the user
+    # dropped one or both names, pull the missing entities from history.
+    if _looks_like_comparison_followup(current_question):
+        prior_names = _extract_player_names_from_history(history_messages)
+        current_lower = current_question.lower()
+        missing = [n for n in prior_names if n.lower() not in current_lower]
+        if missing:
+            names_clause = " and ".join(missing[:2])
+            effective_question += (
+                f"\n\nFollow-up constraint: this is a CONTINUATION of an earlier comparison. "
+                f"Include {names_clause} alongside any players named in the current question. "
+                f"Treat as a multi-player comparison and return one row per player."
+            )
+            analysis_question = (
+                f"{analysis_question} (continuing comparison with {names_clause})"
+            )
+
+    # Single-player drill-down. If the follow-up explicitly names one player and
+    # is not comparison-shaped, scope the SQL and narrative to that one player.
+    elif _looks_like_single_player_drilldown(current_question):
+        named = _extract_named_players_from_question(current_question)
+        if len(named) == 1:
+            only_player = named[0]
+            effective_question += (
+                f"\n\nFollow-up constraint: this drill-down is about {only_player} ONLY. "
+                f"Filter SQL to player_name ILIKE '%{only_player}%' and do NOT include "
+                f"any other players from the prior conversation. The narrative must focus "
+                f"exclusively on {only_player}."
+            )
+            analysis_question = (
+                f"{analysis_question} (single-player drill-down: {only_player})"
+            )
+
+    return effective_question, analysis_question, "deterministic_context_wrapper"
 
 @app.post("/api/dashboards")
 async def dashboard_endpoint(request: QueryRequest):
@@ -399,72 +652,34 @@ async def analysis_endpoint(
 ):
     try:
         print("----HIT----- /api/analysis")
+        print(f"Question: {request.question}")
 
         effective_question = request.question
+        analysis_question = request.question
         history_context_applied = False
         history_context_reason = "no_history_available"
         history_messages: List[Dict[str, Any]] = _sanitize_history_messages(request.history)
-        context_key = _last_question_context_key(request)
-        history_from_server_memory = False
-        if not history_messages and context_key:
-            prev_q = _recall_last_user_question(context_key)
-            cur_q = (request.question or "").strip()
-            if (
-                prev_q
-                and prev_q.strip().lower() != cur_q.lower()
-                and _should_apply_history_context(request.question)
-            ):
-                history_messages = [{"role": "user", "content": prev_q}]
-                history_from_server_memory = True
 
-        # Prefer history passed by the frontend (works for both guest and auth chats),
-        # but only inject it for likely follow-up prompts to avoid contaminating
-        # standalone questions with stale player/season context.
+        # Prefer history passed by the frontend (works for both guest and auth chats).
         if history_messages and _should_apply_history_context(request.question):
-            effective_question = _build_contextual_question(request.question, history_messages)
-            player_name, season_label = _extract_latest_player_and_season_from_history(history_messages)
-            if season_label and (_is_affirmative_followup(request.question) or _should_force_previous_context(request.question)):
-                effective_question += (
-                    "\n\nFollow-up constraint: preserve previously established context unless user explicitly changes it. "
-                    f"Use the same season context: {season_label}. "
-                    "(Do not change to a different season unless the user asks for one.)"
-                )
-                if player_name:
-                    effective_question += (
-                        f" Keep player context anchored to {player_name} when resolving pronouns/references."
-                    )
-            history_context_applied = True
-            history_context_reason = (
-                "server_last_question_recalled"
-                if history_from_server_memory
-                else "request_history_used"
+            effective_question, analysis_question, context_strategy = _build_effective_question_from_history(
+                request.question, history_messages
             )
+            history_context_applied = True
+            history_context_reason = f"request_history_used/{context_strategy}"
         # Fallback for older clients: load persisted history for authenticated users.
-        elif request.conversationId and authorization:
+        elif request.conversationId and authorization and _should_apply_history_context(request.question):
             try:
                 uid = get_uid_from_authorization(authorization)
                 history_result = get_conversation_messages(uid, request.conversationId.strip())
                 if history_result.get("success"):
                     fetched_history = history_result.get("messages", [])
-                    if isinstance(fetched_history, list) and fetched_history and _should_apply_history_context(request.question):
-                        effective_question = _build_contextual_question(
-                            request.question, fetched_history
+                    if isinstance(fetched_history, list) and fetched_history:
+                        effective_question, analysis_question, context_strategy = _build_effective_question_from_history(
+                            request.question, _sanitize_history_messages(fetched_history)
                         )
-                        player_name, season_label = _extract_latest_player_and_season_from_history(fetched_history)
-                        if season_label and (_is_affirmative_followup(request.question) or _should_force_previous_context(request.question)):
-                            effective_question += (
-                                "\n\nFollow-up constraint: preserve previously established context unless user explicitly changes it. "
-                                f"Use the same season context: {season_label}. "
-                                "(Do not change to a different season unless the user asks for one.)"
-                            )
-                            if player_name:
-                                effective_question += (
-                                    f" Keep player context anchored to {player_name} when resolving pronouns/references."
-                                )
                         history_context_applied = True
-                        history_context_reason = "stored_history_used"
-                    elif isinstance(fetched_history, list) and fetched_history:
-                        history_context_reason = "stored_history_present_not_applied"
+                        history_context_reason = f"stored_history_used/{context_strategy}"
                     else:
                         history_context_reason = "stored_history_empty"
                 else:
@@ -474,86 +689,57 @@ async def analysis_endpoint(
                 print(f"History context skipped: {history_error}")
                 history_context_reason = "history_lookup_exception"
         elif history_messages:
-            history_context_reason = "request_history_present_but_unused"
-        elif context_key and _recall_last_user_question(context_key):
-            history_context_reason = "server_last_question_available_not_applied"
+            history_context_reason = "history_not_needed_for_standalone_question"
         elif request.conversationId and authorization:
-            history_context_reason = "stored_history_unavailable"
+            history_context_reason = "stored_history_not_needed_for_standalone_question"
         elif request.conversationId and not authorization:
             history_context_reason = "guest_without_request_history"
 
-        # Force current-season interpretation for undated regular-season performance asks.
-        q_lower = (effective_question or "").lower()
-        has_explicit_year = re.search(r"\b(19\d{2}|20\d{2})\b", q_lower) is not None
-        has_regular_perf_intent = ("regular season" in q_lower) and any(
-            k in q_lower for k in ["performance", "season stats", "season stat", "season averages", "stats"]
-        )
-        if has_regular_perf_intent and not has_explicit_year:
-            effective_question = f"{effective_question.strip()} in 2025-26 season"
-
-        cache_key = _make_cache_key(request.question, effective_question, history_messages)
-        cached_payload = _get_cached_response(cache_key)
-        if cached_payload is not None:
-            if _analysis_debug_enabled():
-                cached_payload.setdefault("debug", {})
-                cached_payload["debug"]["cacheHit"] = True
-            if context_key:
-                _remember_user_question(context_key, request.question)
-            return cached_payload
-
-        # Run the query ONCE here — do not let query_analyzer run it again
-        query_result = run_query(effective_question)
-
-        tables_used = get_last_tables_used()
-        if tables_used:
-            print("---- TABLES USED ----")
-            print(", ".join(tables_used))
-
-        # Handle empty or failed queries with a helpful message instead of crashing
-        if query_result is None or query_result.empty:
-            q_lower = (request.question or "").lower()
-            if "playoff" in q_lower or "postseason" in q_lower:
-                empty_message = (
-                    "I don't currently have enough playoff data to answer this question confidently.\n"
-                    "No playoff data was found for this query in the available playoff tables.\n"
-                    "- This player may not have records in the currently selected playoff seasons.\n"
-                    "- Try a specific playoff year (example: 'Giannis 2021 playoff performance').\n"
-                    "- If you want, ask for regular-season stats instead."
-                )
-            elif pronoun_stats_query_missing_player(effective_question):
-                empty_message = (
-                    "This question uses **his / her / their** but no player was resolved from your message or "
-                    "recent chat context.\n"
-                    "- Name the player explicitly, e.g. **LeBron James defensive stats from 2004-2016**.\n"
-                    "- Or send the same **conversationId** / **sessionId** as your previous question and include "
-                    "**history** (or ask right after a message that names the player)."
-                )
-            else:
-                empty_message = (
-                    "I don't currently have enough data in the database to answer this question confidently.\n"
-                    "No data matched this query.\n"
-                    "- The player name may be misspelled or formatted differently in the database.\n"
-                    "- The requested season/split may not exist in the currently available tables.\n"
-                    "- Try a specific season, e.g. 'Giannis 2020 season' or 'Giannis 2023 playoff performance'."
-                )
+        unsupported_message = _unsupported_specialty_message(effective_question)
+        if unsupported_message:
             payload = {
                 "success": True,
-                "analysis": empty_message,
+                "analysis": unsupported_message,
                 "data": [],
-                "question": request.question,
-                "tablesUsed": tables_used,
+                "question": analysis_question,
             }
             if _analysis_debug_enabled():
                 payload["debug"] = {
                     "historyContextApplied": history_context_applied,
                     "historyContextReason": history_context_reason,
                     "conversationId": request.conversationId,
-                    "sessionId": request.sessionId,
-                    "historyFromServerMemory": history_from_server_memory,
+                    "originalQuestion": request.question,
+                    "effectiveQuestion": effective_question,
+                    "analysisQuestion": analysis_question,
+                    "unsupportedReason": "specialty_table_unavailable",
                 }
-            if context_key:
-                _remember_user_question(context_key, request.question)
-            _set_cached_response(cache_key, payload)
+            return payload
+
+        # Run the query once here; query_analyzer should only interpret the returned dataframe.
+        query_result = run_query(effective_question)
+
+        # Handle empty or failed queries with a helpful message instead of crashing
+        if query_result is None or query_result.empty:
+            payload = {
+                "success": True,
+                "analysis": (
+                    "No data was found for this query. This could mean:\n"
+                    "- The player or team did not appear in the requested season/playoffs.\n"
+                    "- The player or team name may be misspelled or not recognized.\n"
+                    "- Try specifying a season year, e.g. 'Giannis 2023 playoff performance'."
+                ),
+                "data": [],
+                "question": analysis_question
+            }
+            if _analysis_debug_enabled():
+                payload["debug"] = {
+                    "historyContextApplied": history_context_applied,
+                    "historyContextReason": history_context_reason,
+                    "conversationId": request.conversationId,
+                    "originalQuestion": request.question,
+                    "effectiveQuestion": effective_question,
+                    "analysisQuestion": analysis_question,
+                }
             return payload
 
         # Clean NaN before JSON serialization
@@ -561,35 +747,23 @@ async def analysis_endpoint(
 
         # Pass the already-fetched dataframe directly to the analyzer
         # so it does NOT run a second query internally
-        analysis_question = effective_question if history_context_applied else request.question
         analysis_result = analyze_question_with_data(analysis_question, query_result)
-        q_lower = (request.question or "").lower()
-        if "clutch" in q_lower:
-            low_analysis = (analysis_result or "").lower()
-            if ("last 5 minutes" not in low_analysis) or ("totals" not in low_analysis):
-                analysis_result = (
-                    (analysis_result or "").rstrip()
-                    + "\n\nThis clutch response uses last 5 minutes context totals from the clutch table."
-                )
 
         payload = {
             "success": True,
             "analysis": analysis_result,
             "data": clean_data,
-            "question": request.question,
-            "tablesUsed": tables_used,
+            "question": analysis_question
         }
         if _analysis_debug_enabled():
             payload["debug"] = {
                 "historyContextApplied": history_context_applied,
                 "historyContextReason": history_context_reason,
                 "conversationId": request.conversationId,
-                "sessionId": request.sessionId,
-                "historyFromServerMemory": history_from_server_memory,
+                "originalQuestion": request.question,
+                "effectiveQuestion": effective_question,
+                "analysisQuestion": analysis_question,
             }
-        if context_key:
-            _remember_user_question(context_key, request.question)
-        _set_cached_response(cache_key, payload)
         return payload
 
     except Exception as e:

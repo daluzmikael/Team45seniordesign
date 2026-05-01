@@ -8,73 +8,17 @@ import importlib.util
 
 import numpy as np
 import pandas as pd
+from Interpreter.interpreter import run_query
 
-# Dynamically find and import query_bot
-query_bot_module = None
+from dotenv import load_dotenv
+from openai import OpenAI
 
-def find_query_bot():
-    """Search for query_bot.py starting from current file and going up the directory tree"""
-    current_file = Path(__file__).resolve()
-    current_dir = current_file.parent
-    
-    # Search upward through parent directories
-    search_dir = current_dir
-    for _ in range(5):  # Search up to 5 levels up
-        # Check common locations relative to current search directory
-        candidates = [
-            search_dir / "query_bot.py",
-            search_dir / "Executer" / "query_bot.py",
-            search_dir / ".." / "Executer" / "query_bot.py",  # Analyzer/../Executer
-            search_dir / "backend" / "Executer" / "query_bot.py",
-            search_dir / "backend" / "query_bot.py",
-        ]
-        
-        for candidate in candidates:
-            resolved = candidate.resolve()
-            if resolved.exists():
-                return str(resolved)
-        
-        # Move up one directory
-        search_dir = search_dir.parent
-    
-    return None
-
-# Try to import query_bot
-try:
-    # First try direct import (if already in path)
-    import query_bot as query_bot_module
-except ImportError:
-    # Find the file dynamically
-    query_bot_path = find_query_bot()
-    
-    if query_bot_path:
-        # Load it manually using importlib
-        try:
-            spec = importlib.util.spec_from_file_location("query_bot", query_bot_path)
-            if spec and spec.loader:
-                query_bot_module = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(query_bot_module)
-        except Exception as e:
-            print(f"Warning: Failed to load query_bot from {query_bot_path}: {e}")
-
-# Optional stub client if query_bot doesn't export one
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
-
-
-def _resolve_client(module: Optional[Any]):
-    if module is not None and hasattr(module, "client"):
-        return getattr(module, "client")
-    if OpenAI is not None:
-        api_key = os.getenv("OPENAI_API_KEY")
-        if api_key:
-            try:
-                return OpenAI(api_key=api_key)
-            except Exception:
-                return None
-    return None
+load_dotenv()
+api_key = os.getenv("OPENAI_API_KEY")
+client = OpenAI(
+    api_key=api_key,
+    base_url="https://us.api.openai.com/v1"
+)
 
 
 def _resolve_user_input(module: Optional[Any]) -> Optional[str]:
@@ -83,59 +27,35 @@ def _resolve_user_input(module: Optional[Any]) -> Optional[str]:
     return None
 
 
-def _resolve_df_output(module: Optional[Any]) -> Optional[pd.DataFrame]:
-    if module is not None and hasattr(module, "df_output"):
-        value = getattr(module, "df_output")
-        try:
-            if isinstance(value, pd.DataFrame):
-                return value
-        except Exception:
-            pass
-    try:
-        import temp_df
-        if hasattr(temp_df, "df_output") and isinstance(temp_df.df_output, pd.DataFrame):
-            return temp_df.df_output
-    except Exception:
-        pass
-    return None
+
+# -------------------------
+# Display column renames
+# -------------------------
+# Map confusing or non-existent stat columns to friendlier display names so
+# the analyzer narrative + table never confuse users. Add new mappings here.
+_DISPLAY_COLUMN_RENAMES = {
+    "PIE":  "PIE (PER equivalent)",
+    "pie":  "PIE (PER equivalent)",
+}
 
 
-def _normalize_stats_df_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Align DataFrame column names with what formatters expect, using names as returned
-    from PostgreSQL (quoted identifiers like fg%, 3pm) without recomputing stats.
-    """
-    if df is None or getattr(df, "empty", True):
+def _rename_columns_for_display(df):
+    """Return a shallow-copied df with confusing column names rewritten for display."""
+    if df is None or df.empty:
         return df
-    out = df.copy()
-    cols = list(out.columns)
-    colset = set(cols)
-    renames: Dict[str, str] = {}
+    rename_map = {c: _DISPLAY_COLUMN_RENAMES[c] for c in df.columns if c in _DISPLAY_COLUMN_RENAMES}
+    if not rename_map:
+        return df
+    return df.rename(columns=rename_map)
 
-    def _add(src: str, dst: str) -> None:
-        if src in colset and dst not in colset:
-            renames[src] = dst
 
-    _add("player", "player_name")
-    for _src in ("fg%", "FG%"):
-        _add(_src, "fg_pct")
-    for _src in ("3p%", "3P%"):
-        _add(_src, "fg3_pct")
-    for _src in ("ft%", "FT%"):
-        _add(_src, "ft_pct")
-    _add("3pm", "fg3m")
-    _add("3pa", "fg3a")
-    _add("c_3p", "fg3_pct")
-    _add("+/-", "plus_minus")
-    # Playoff totals-style tables store shooting rates in fg / ft without separate fgm/ftm.
-    if "fg_pct" not in colset and "fg" in colset and "fgm" not in colset:
-        _add("fg", "fg_pct")
-    if "ft_pct" not in colset and "ft" in colset and "ftm" not in colset:
-        _add("ft", "ft_pct")
+def _user_asked_for_per(question: str) -> bool:
+    """True only when the user explicitly asked for classic PER (Hollinger).
 
-    if renames:
-        out = out.rename(columns=renames)
-    return out
+    Avoids matching 'per game', 'per minute', 'per possession', 'performance'.
+    """
+    q = (question or "").lower()
+    return bool(re.search(r"\b(player efficiency rating|per)\b(?!\s*game|formance|\s*minute|\s*possession)", q))
 
 
 # -------------------------
@@ -327,8 +247,17 @@ def _minmax(series: pd.Series) -> np.ndarray:
 
 
 def compute_scores(df: pd.DataFrame, cfg: ScoreConfig) -> pd.DataFrame:
+    entity_col = "player_name"
     if "player_name" not in df.columns:
-        raise ValueError("DataFrame must include 'player_name'.")
+        if "TEAM_NAME" in df.columns:
+            entity_col = "TEAM_NAME"
+        elif "TeamName" in df.columns:
+            entity_col = "TeamName"
+        elif "team_abbreviation" in df.columns:
+            entity_col = "team_abbreviation"
+        else:
+            raise ValueError("DataFrame must include 'player_name' or a valid team column.")
+
     present = [c for c in cfg.weights if c in df.columns]
     if not present:
         raise ValueError("No required metric columns found for this domain.")
@@ -360,7 +289,7 @@ def compute_scores(df: pd.DataFrame, cfg: ScoreConfig) -> pd.DataFrame:
         contribs.sort(key=lambda x: x[1], reverse=True)
         rows.append(
             {
-                "player_name": df.iloc[i]["player_name"],
+                entity_col: df.iloc[i][entity_col],
                 "composite_score": float(score[i]),
                 "top_contributors": contribs[:3],
             }
@@ -372,27 +301,10 @@ def infer_domain(user_q: str, cols: List[str]) -> str:
     uq = (user_q or "").lower()
     txt = " ".join(cols).lower()
 
-    # Season-summary joins that include defense_totals_regularseason_* (opp_pts is the tell).
-    if "opp_pts" in txt and (
-        re.search(r"(?i)\b(compare|between)\b", uq)
-        or " versus " in uq
-        or re.search(r"(?i)\bvs\b", uq)
-        or "who was better" in uq
-        or "who is better" in uq
-        or re.search(r"(?i)\bwhich\s+(?:one|player)\s+(?:was|is)\s+better\b", uq)
-        or re.search(r"(?i)\bwhich\s+had\s+(?:the\s+)?better\s+season\b", uq)
-        or any(
-            k in uq
-            for k in [
-                "breakdown",
-                "break down",
-                "deep dive",
-                "in depth",
-                "in-depth",
-            ]
-        )
+    if any(k in uq for k in ["team", "franchise", "standings", "winrate"]) or any(
+        k in txt for k in ["teamname", "team_name", "w_pct", "wins", "net_rating"]
     ):
-        return "defense"
+        return "team_performance"
 
     if any(k in uq for k in ["rebound", "boards", "glass", "oreb", "dreb"]) or any(
         k in txt for k in ["trb_per_game", "trb_pct", "oreb_pct", "dreb_pct", "contested_reb"]
@@ -404,7 +316,7 @@ def infer_domain(user_q: str, cols: List[str]) -> str:
     ):
         return "overall_impact"
 
-    if any(k in uq for k in ["defense", "defender", "rim", "steal", "block"]) or any(
+    if any(k in uq for k in ["defense", "defensive", "defender", "rim", "steal", "block", "deflect", "contest"]) or any(
         k in txt for k in ["defensive_impact", "rim_fg_pct_allowed", "deflections_per_game", "def_rtg"]
     ):
         return "defense"
@@ -478,11 +390,11 @@ def _is_simple_top_scorers_question(question: str, domain: str) -> bool:
 
 def _build_simple_top_scorers_prompts(question: str, rows_to_show: pd.DataFrame) -> tuple[str, str]:
     system_prompt = (
-        "You are an NBA stats assistant. For simple top-scorer questions, keep the response short and plain.\n"
+        "You are an NBA stats assistant. For simple leaderboard questions, keep the response short and plain.\n"
         "Output format must be exactly:\n"
         "1) One short lead sentence in plain English, like: "
         "\"[Player] led the league at [PPG] PPG on [FG%] FG.\"\n"
-        "2) A compact list of exactly the top 5 scorers from the provided data, each line in this exact style: "
+        "2) A compact list with exactly the number of rows requested by the user, each line in this exact style: "
         "Name, TEAM | X ppg | Y% fg | Z% 3p | N games\n"
         "3) One final follow-up line asking if the user wants deeper scoring breakdowns, such as: "
         "\"Want me to break down each player's scoring profile further?\"\n\n"
@@ -507,7 +419,7 @@ def _build_simple_top_scorers_prompts(question: str, rows_to_show: pd.DataFrame)
 
 def _extract_requested_top_n(question: str, default_n: int = 5, max_n: int = 50) -> int:
     q = (question or "").lower()
-    match = re.search(r"\b(top|best|leading)\s+(\d{1,3})\b", q)
+    match = re.search(r"\b(top|best|leading|worst|bottom|lowest)\s+(\d{1,3})\b", q)
     if not match:
         return default_n
     try:
@@ -523,14 +435,12 @@ def _extract_season_reference_text(question: str) -> Optional[str]:
     q = (question or "").lower()
     is_playoffs = "playoff" in q or "postseason" in q
 
-    range_match = re.search(r"\b(19\d{2}|20\d{2})\s*[-/_]\s*(\d{2,4})\b", q)
+    range_match = re.search(r"\b(19\d{2}|20\d{2})\s*[-/]\s*(\d{2,4})\b", q)
     if range_match:
         start = int(range_match.group(1))
         end_raw = range_match.group(2)
         if len(end_raw) == 2:
             end = int(f"{str(start)[:2]}{end_raw}")
-            if end < start:
-                end += 100
         else:
             end = int(end_raw)
         if is_playoffs:
@@ -544,14 +454,12 @@ def _extract_season_reference_text(question: str) -> Optional[str]:
             start = year - 1
             end = year
             return f"{start}-{str(end)[-2:]} playoffs"
-        # Bare regular-season year references are treated as season START year.
-        # Example: "2020 season" -> 2020-21.
         start = year
         end = year + 1
         return f"{start}-{str(end)[-2:]} season"
 
     if "this season" in q or "current season" in q:
-        return "2025-26 season"
+        return "2024-25 season"
     if "this playoff" in q or "current playoff" in q:
         return "2024-25 playoffs"
     if "last season" in q:
@@ -560,54 +468,6 @@ def _extract_season_reference_text(question: str) -> Optional[str]:
         return "2024-25 playoffs"
 
     return None
-
-
-def _question_has_explicit_season_phrase(question: str) -> bool:
-    """True if the user named a season window; mirrors backend interpreter season cues."""
-    ql = (question or "").lower()
-    if re.search(r"\b(19\d{2}|20\d{2})\s*[-/_]\s*(\d{2}|19\d{2}|20\d{2})\b", ql):
-        return True
-    if re.search(r"\b(19\d{2}|20\d{2})\b", ql):
-        return True
-    seasonal = (
-        "this season",
-        "current season",
-        "last season",
-        "this playoff",
-        "current playoff",
-        "last playoff",
-        "postseason",
-        "playoffs",
-        "regular season",
-    )
-    return any(k in ql for k in seasonal)
-
-
-def _implicit_default_season_llm_note(question: str) -> str:
-    """When no season is named, remind the model the backend defaults to the current NBA season."""
-    if _question_has_explicit_season_phrase(question):
-        return ""
-    ql = (question or "").lower()
-    if any(
-        h in ql
-        for h in (
-            "what year",
-            "which year",
-            "when did",
-            "draft",
-            "debut",
-            "retire",
-            "career high",
-            "career total",
-            "mvp race",
-        )
-    ):
-        return ""
-    return (
-        "\n\nSeason context: The query used the current default NBA season because the question "
-        "did not specify a year or range (2025-26 regular season). Say explicitly that these numbers "
-        "are for **this season (2025-26)** (or equivalent wording) in the opening or first paragraph."
-    )
 
 
 def _is_single_player_stats_question(question: str, df: pd.DataFrame) -> bool:
@@ -656,110 +516,6 @@ def _is_single_player_stats_question(question: str, df: pd.DataFrame) -> bool:
     return unique_players == 1
 
 
-def _is_clutch_question_or_frame(question: str, df: pd.DataFrame) -> bool:
-    q = (question or "").lower()
-    has_clutch_intent = any(k in q for k in ["clutch", "close game", "last 5 minutes"])
-    # Avoid false positives: non-clutch season tables can share overlapping columns.
-    # Only explicit clutch intent should route to clutch profile formatting.
-    return has_clutch_intent
-
-
-def _format_single_player_clutch_profile(df: pd.DataFrame, question: str) -> str:
-    def _is_missing(v: Any) -> bool:
-        try:
-            return pd.isna(v)
-        except Exception:
-            return v is None
-
-    def _fmt_num(v: Any, digits: int = 1) -> str:
-        if _is_missing(v):
-            return "N/A"
-        try:
-            return f"{float(v):.{digits}f}"
-        except Exception:
-            return "N/A"
-
-    def _fmt_int(v: Any) -> str:
-        if _is_missing(v):
-            return "N/A"
-        try:
-            return str(int(float(v)))
-        except Exception:
-            return "N/A"
-
-    def _fmt_pct(v: Any, digits: int = 1) -> str:
-        if _is_missing(v):
-            return "N/A"
-        try:
-            num = float(v)
-            if 0 <= num <= 1:
-                num *= 100.0
-            return f"{num:.{digits}f}%"
-        except Exception:
-            return "N/A"
-
-    working = df.copy()
-    if "player_name" in working.columns:
-        working = working.dropna(subset=["player_name"])
-    if "gp" in working.columns:
-        working = working.sort_values(by=["gp"], ascending=[False], na_position="last")
-    if "player_name" in working.columns:
-        working = working.drop_duplicates(subset=["player_name"], keep="first")
-    if working.empty:
-        return "\nNo clutch stats were available for this question."
-
-    row = working.iloc[0]
-    name = str(row.get("player_name", "N/A")) if not _is_missing(row.get("player_name")) else "N/A"
-    team = str(row.get("team_abbreviation", "N/A")) if not _is_missing(row.get("team_abbreviation")) else "N/A"
-    gp = _fmt_int(row.get("gp"))
-
-    metric_specs = [
-        ("PTS", "pts", _fmt_num),
-        ("AST", "ast", _fmt_num),
-        ("REB", "reb", _fmt_num),
-        ("TOV", "tov", _fmt_num),
-        ("STL", "stl", _fmt_num),
-        ("BLK", "blk", _fmt_num),
-        ("FG%", "fg_pct", _fmt_pct),
-        ("3P%", "fg3_pct", _fmt_pct),
-        ("FT%", "ft_pct", _fmt_pct),
-        ("W%", "w_pct", _fmt_pct),
-        ("+/-", "plus_minus", _fmt_num),
-    ]
-    available_metrics = [(label, col, fmt) for label, col, fmt in metric_specs if col in working.columns]
-    if not available_metrics:
-        return f"\n## **{name}** ({team})\n\nNo clutch metric columns were returned for this query."
-
-    header = "| " + " | ".join(label for label, _, _ in available_metrics) + " |"
-    divider = "|" + "|".join(["---:" for _ in available_metrics]) + "|"
-    values = "| " + " | ".join(fmt(row.get(col)) for _, col, fmt in available_metrics) + " |"
-
-    pts = _fmt_num(row.get("pts")) if "pts" in working.columns else "N/A"
-    ast = _fmt_num(row.get("ast")) if "ast" in working.columns else "N/A"
-    clutch_summary = (
-        f"This clutch view represents last-5-minutes context totals. {name} appeared in {gp} clutch games"
-        + (f", with {pts} total clutch points" if pts != "N/A" else "")
-        + (f" and {ast} total clutch assists" if ast != "N/A" else "")
-        + ". Values shown are totals from the clutch table, not per-game rates."
-    )
-
-    return "\n" + "\n".join(
-        [
-            f"## **{name}** ({team})",
-            "",
-            f"_Clutch sample (last 5 minutes context): {gp} games_",
-            "",
-            header,
-            divider,
-            values,
-            "",
-            clutch_summary,
-            "",
-            "Want me to break down his clutch shot profile next?",
-        ]
-    )
-
-
 def _is_single_player_season_trend_question(question: str, df: pd.DataFrame) -> bool:
     q = (question or "").lower()
     if df is None or df.empty or "player_name" not in df.columns:
@@ -801,55 +557,6 @@ def _is_single_player_season_trend_question(question: str, df: pd.DataFrame) -> 
     except Exception:
         unique_players = 0
     return unique_players <= 2
-
-
-def _fallback_trend_stat_columns(
-    working: pd.DataFrame, is_defense: bool, is_shooting: bool, is_rebounding: bool
-) -> list[tuple[str, str]]:
-    """When preset column lists miss the dataframe, infer numeric stat columns to still render a table."""
-    skip = {
-        "season_start",
-        "season_label",
-        "season",
-        "season_year",
-        "season_id",
-        "player_name",
-        "team",
-        "team_abbreviation",
-        "player_id",
-    }
-    extras: list[str] = []
-    for c in working.columns:
-        if c in skip:
-            continue
-        try:
-            if pd.api.types.is_numeric_dtype(working[c]):
-                extras.append(str(c))
-        except Exception:
-            continue
-    if is_defense:
-        pref = ["stl", "blk", "dreb", "oreb", "reb", "pf", "gp"]
-        ordered = [c for c in pref if c in extras]
-        if not ordered:
-            ordered = extras[:10]
-        return [(c.upper().replace("_", " "), c) for c in ordered]
-    if is_shooting:
-        pref = ["fg_pct", "fg3_pct", "ft_pct", "fgm", "fga", "fg3m", "fg3a", "gp"]
-        ordered = [c for c in pref if c in extras]
-        if not ordered:
-            ordered = extras[:10]
-        return [(c.upper().replace("_", " "), c) for c in ordered]
-    if is_rebounding:
-        pref = ["reb", "oreb", "dreb", "gp"]
-        ordered = [c for c in pref if c in extras]
-        if not ordered:
-            ordered = extras[:10]
-        return [(c.upper().replace("_", " "), c) for c in ordered]
-    pref = ["pts", "reb", "ast", "fg_pct", "fg3_pct", "gp"]
-    ordered = [c for c in pref if c in extras]
-    if not ordered:
-        ordered = extras[:10]
-    return [(c.upper().replace("_", " "), c) for c in ordered]
 
 
 def _format_single_player_season_trend_response(df: pd.DataFrame, question: str, client: Optional[Any]) -> str:
@@ -906,58 +613,20 @@ def _format_single_player_season_trend_response(df: pd.DataFrame, question: str,
     if dedupe_keys:
         working = working.drop_duplicates(subset=dedupe_keys, keep="first")
 
-    is_shooting = any(k in q for k in ["shoot", "fg%", "3 point", "3p", "percentage"])
-    is_rebounding = any(k in q for k in ["rebound", "boards", "glass"])
-    is_defense = any(
-        k in q
-        for k in [
-            "defensive stat",
-            "defensive stats",
-            "defensive numbers",
-            "defensive profile",
-            "defensively",
-            "defensive",
-            "defense stat",
-            "defense stats",
-            "defense",
-            "defender",
-            "block",
-            "blk",
-            "steal",
-            "stl",
-            "rim protection",
-            "stopper",
-        ]
-    )
-    # Query may already be defensive-only (no per-game points column); honor that even if phrasing is vague.
-    if not is_defense and "stl" in working.columns and "pts" not in working.columns:
-        is_defense = True
-    # Full row per-game data: still show defensive columns when the question is clearly defensive.
-    if not is_defense and re.search(r"\b(defensive|defense stats)\b", q) and "stl" in working.columns:
-        is_defense = True
+    is_shooting = any(k in q for k in ["shoot", "fg%", "3 point", "3p", "percentage", "three point", "free throw", "ft%"])
+    is_rebounding = any(k in q for k in ["rebound", "boards", "glass", "oreb", "dreb"])
+    is_defense = any(k in q for k in ["block", "blk", "steal", "stl", "defense", "defensive", "defend", "deflect", "contest"])
 
     if is_shooting:
         columns = [("FG%", "fg_pct"), ("3P%", "fg3_pct"), ("FT%", "ft_pct"), ("FGM", "fgm"), ("FGA", "fga"), ("3PM", "fg3m"), ("3PA", "fg3a")]
     elif is_rebounding:
         columns = [("REB", "reb"), ("OREB", "oreb"), ("DREB", "dreb"), ("REB Rank", "reb_rank"), ("OREB Rank", "oreb_rank"), ("DREB Rank", "dreb_rank")]
     elif is_defense:
-        columns = [
-            ("STL", "stl"),
-            ("BLK", "blk"),
-            ("DREB", "dreb"),
-            ("OREB", "oreb"),
-            ("REB", "reb"),
-            ("PF", "pf"),
-            ("STL Rank", "stl_rank"),
-            ("BLK Rank", "blk_rank"),
-            ("Games", "gp"),
-        ]
+        columns = [("STL", "stl"), ("BLK", "blk"), ("DREB", "dreb"), ("PF", "pf"), ("Games", "gp")]
     else:
         columns = [("PTS", "pts"), ("REB", "reb"), ("AST", "ast"), ("FG%", "fg_pct"), ("3P%", "fg3_pct")]
 
     available = [(label, col) for label, col in columns if col in working.columns]
-    if not available:
-        available = _fallback_trend_stat_columns(working, is_defense, is_shooting, is_rebounding)
     if not available:
         return ""
 
@@ -986,22 +655,38 @@ def _format_single_player_season_trend_response(df: pd.DataFrame, question: str,
 
     if client is not None:
         try:
-            sample = working[[season_col] + [c for _, c in available]].head(8).to_dict(orient="records")
+            # Send ALL rows (not just 8) so the summary covers the full span.
+            trend_data = working[[season_col] + [c for _, c in available]].to_dict(orient="records")
+            num_seasons = len(trend_data)
+
             trend_system = (
-                "Write 2 concise sentences summarizing the trend in these season-by-season defensive stats "
-                "(steals, blocks, rebound splits, fouls as shown). Focus on defensive impact, not scoring; "
-                "cite at least one concrete number from the sample."
-                if is_defense
-                else "Write 2 concise sentences summarizing the trend in these season-by-season stats. Use plain language and include at least one concrete stat reference."
+                "You are an NBA analyst writing a trend summary below a stats table.\n"
+                "The user can already SEE the table — do NOT repeat every number from it.\n"
+                "Instead, tell the STORY the numbers reveal:\n"
+                "- Identify the peak season(s) and the low point(s) with specific numbers.\n"
+                "- Describe the overall trajectory (improving, declining, consistent, U-shaped, etc.).\n"
+                "- If there's a notable jump or drop between consecutive seasons, call it out and "
+                "speculate briefly on context (injury, team change, role shift) if obvious.\n"
+                "- For multi-player data, compare their trajectories — who improved more, "
+                "who was more consistent, who peaked higher.\n"
+                "Write 3-5 sentences in a natural, engaging sports-analyst tone. "
+                "Reference concrete numbers but don't just list them — weave them into insight."
             )
+            trend_user = (
+                f"Question: {question}\n"
+                f"Player(s): {unique_players or [player_name]}\n"
+                f"Seasons covered: {num_seasons}\n"
+                f"Data: {trend_data}"
+            )
+
             resp = client.chat.completions.create(
-                model="gpt-4o-mini",
+                model="gpt-5.4-mini",
                 messages=[
                     {"role": "system", "content": trend_system},
-                    {"role": "user", "content": f"Question: {question}\nPlayers: {unique_players or [player_name]}\nSeason rows: {sample}"},
+                    {"role": "user", "content": trend_user},
                 ],
-                temperature=0.2,
-                max_tokens=140,
+                temperature=0.3,
+                max_completion_tokens=300,
             )
             summary = (resp.choices[0].message.content or "").strip()
         except Exception:
@@ -1035,11 +720,7 @@ def _format_single_player_season_trend_response(df: pd.DataFrame, question: str,
 
     asks_peak = any(k in q for k in ["highest", "best", "most", "peak"])
     if asks_peak and not working.empty:
-        metric_candidates = (
-            ["stl", "blk", "dreb", "reb", "oreb", "pf"]
-            if is_defense
-            else ["pts", "ast", "reb", "blk", "stl", "fg3m", "fg_pct", "fg3_pct", "ft_pct"]
-        )
+        metric_candidates = ["pts", "ast", "reb", "blk", "stl", "fg3m", "fg_pct", "fg3_pct", "ft_pct"]
         chosen = next((c for c in metric_candidates if c in working.columns), None)
         if chosen is not None:
             numeric = pd.to_numeric(working[chosen], errors="coerce")
@@ -1052,15 +733,35 @@ def _format_single_player_season_trend_response(df: pd.DataFrame, question: str,
                 summary = f"His peak {metric_label} season in this span was {peak_season} at {peak_val}."
 
     if not summary:
+        # Auto-generate a basic arc description from the data itself.
         if is_multi_player:
-            summary = "This table shows the season-by-season rows for each player in the requested span so you can compare their production over time."
-        elif is_defense:
-            summary = (
-                "This table shows season-by-season defensive counting stats for the requested span "
-                "(steals, blocks, rebounding splits, fouls)."
-            )
+            summary = "The table above shows each player's season-by-season production across the requested span."
         else:
-            summary = "This table shows the season-by-season trend so you can see how his production and efficiency changed over time."
+            # Try to auto-detect peak and trajectory from the primary stat column.
+            primary_col = available[0][1] if available else None
+            if primary_col and primary_col in working.columns:
+                try:
+                    numeric = pd.to_numeric(working[primary_col], errors="coerce")
+                    if numeric.notna().any():
+                        peak_idx = int(numeric.idxmax())
+                        low_idx = int(numeric.idxmin())
+                        peak_row = working.loc[peak_idx]
+                        low_row = working.loc[low_idx]
+                        peak_season = str(peak_row.get(season_col, "N/A"))
+                        low_season = str(low_row.get(season_col, "N/A"))
+                        peak_val = _fmt_pct(peak_row.get(primary_col)) if "pct" in primary_col else _fmt_num(peak_row.get(primary_col))
+                        low_val = _fmt_pct(low_row.get(primary_col)) if "pct" in primary_col else _fmt_num(low_row.get(primary_col))
+                        stat_label = available[0][0]
+                        summary = (
+                            f"Over this span, his {stat_label} peaked at {peak_val} in {peak_season} "
+                            f"and hit a low of {low_val} in {low_season}."
+                        )
+                    else:
+                        summary = "The table above shows the season-by-season trend across the requested span."
+                except Exception:
+                    summary = "The table above shows the season-by-season trend across the requested span."
+            else:
+                summary = "The table above shows the season-by-season trend across the requested span."
 
     lines.extend(["", summary, "", "Want me to break down any specific season further?"])
     return "\n" + "\n".join(lines)
@@ -1086,48 +787,69 @@ def _generate_natural_player_season_summary(
         "team_abbreviation": _safe(row.get("team_abbreviation")),
         "season_text": season_text or "requested season",
         "gp": _safe(row.get("gp")),
+        "w_pct": _safe(row.get("w_pct")),
+        "min": _safe(row.get("min")),
         "pts": _safe(row.get("pts")),
         "pts_rank": _safe(row.get("pts_rank")),
         "fg_pct": _safe(row.get("fg_pct")),
         "fg3_pct": _safe(row.get("fg3_pct")),
+        "ft_pct": _safe(row.get("ft_pct")),
         "fga": _safe(row.get("fga")),
         "fga_rank": _safe(row.get("fga_rank")),
+        "fg3m": _safe(row.get("fg3m")),
         "fg3a": _safe(row.get("fg3a")),
         "fg3a_rank": _safe(row.get("fg3a_rank")),
+        "ftm": _safe(row.get("ftm")),
+        "fta": _safe(row.get("fta")),
         "reb": _safe(row.get("reb")),
+        "oreb": _safe(row.get("oreb")),
+        "dreb": _safe(row.get("dreb")),
         "reb_rank": _safe(row.get("reb_rank")),
         "ast": _safe(row.get("ast")),
         "ast_rank": _safe(row.get("ast_rank")),
+        "tov": _safe(row.get("tov")),
         "stl": _safe(row.get("stl")),
         "stl_rank": _safe(row.get("stl_rank")),
         "blk": _safe(row.get("blk")),
         "blk_rank": _safe(row.get("blk_rank")),
+        "pf": _safe(row.get("pf")),
         "plus_minus": _safe(row.get("plus_minus")),
+        "dd2": _safe(row.get("dd2")),
+        "td3": _safe(row.get("td3")),
     }
 
     system_prompt = (
-        "You are an NBA analyst. Write a short, natural season review in 2-3 sentences.\n"
-        "Tone must be neutral and direct, not robotic and not overhyped.\n"
-        "Do not use a rigid template like 'X averaged ... top Y ...'.\n"
-        "Use the provided stats together to explain scoring + efficiency + volume context.\n"
-        "Always mention games played and note sample-size caution if games are low (around <50).\n"
-        "Return plain text only."
+        "You are an NBA analyst writing an in-depth season review.\n\n"
+        "Structure your response as a natural, flowing analysis — NOT a stat dump.\n"
+        "Cover these angles in 4-6 sentences:\n"
+        "1. SCORING & EFFICIENCY: points, shooting splits (FG%, 3P%, FT%), volume (FGA), "
+        "and what they reveal about the player's role (primary scorer, secondary, etc.).\n"
+        "2. PLAYMAKING & BALL SECURITY: assists, turnovers, assist-to-turnover feel.\n"
+        "3. REBOUNDING & DEFENSE: rebounds (offensive vs defensive if available), "
+        "steals, blocks — note if these are elite, average, or a weakness.\n"
+        "4. IMPACT: plus-minus, win percentage, games played. Flag injury-shortened "
+        "seasons (under ~60 games) or heavy workloads (over 36 min).\n\n"
+        "Use the rank columns (pts_rank, reb_rank, etc.) to contextualize where the player "
+        "stood league-wide — e.g. 'ranking 6th in scoring' is more meaningful than just '26.4 PPG'.\n"
+        "Mention double-doubles (dd2) or triple-doubles (td3) if they're notable (5+).\n"
+        "Tone: knowledgeable, neutral, direct. Not robotic, not overhyped.\n"
+        "Return plain text only — no headers, no bullet points, no markdown."
     )
     user_prompt = (
         f"Question: {question}\n"
         f"Season profile data: {payload}\n"
-        "Write the 2-3 sentence review now."
+        "Write the season analysis now."
     )
 
     try:
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5.4-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.3,
-            max_tokens=180,
+            max_completion_tokens=400,
         )
         txt = (resp.choices[0].message.content or "").strip()
         return txt if txt else None
@@ -1172,12 +894,6 @@ def _format_single_player_stats_profile(df: pd.DataFrame, question: str, client:
     def _v(row: pd.Series, key: str, default: str = "N/A") -> Any:
         return row.get(key, default)
 
-    def _v_any(row: pd.Series, keys: List[str], default: str = "N/A") -> Any:
-        for key in keys:
-            if key in row.index:
-                return row.get(key)
-        return default
-
     working = df.copy()
     if "player_name" in working.columns:
         working = working.dropna(subset=["player_name"])
@@ -1188,14 +904,6 @@ def _format_single_player_stats_profile(df: pd.DataFrame, question: str, client:
         return "\nNo player stats were available for this question."
 
     row = working.iloc[0]
-    q_lower = (question or "").lower()
-    is_totals_frame = any(
-        c in working.columns for c in ["c_3pm", "c_3pa", "c_3p"]
-    ) or ("fg" in working.columns and "fg_pct" not in working.columns)
-    explicit_totals_ask = any(
-        t in q_lower for t in ["total", "totals", "minutes", "min", "across", "combined", "sum"]
-    )
-    use_totals_language = is_totals_frame or explicit_totals_ask
     name = str(_v(row, "player_name")) if not _is_missing(_v(row, "player_name")) else "N/A"
     team = str(_v(row, "team_abbreviation")) if not _is_missing(_v(row, "team_abbreviation")) else "N/A"
     age = _fmt_num(_v(row, "age"), digits=1)
@@ -1296,152 +1004,72 @@ def _format_single_player_stats_profile(df: pd.DataFrame, question: str, client:
             return f"top {rank_i} in the league"
         return f"ranked {rank_i}th in the league"
 
-    season_summary = None if use_totals_language else _generate_natural_player_season_summary(row, question, season_text, client)
+    season_summary = _generate_natural_player_season_summary(row, question, season_text, client)
     if not season_summary:
         summary_sentences = []
-        if use_totals_language:
+        summary_sentences.append(
+            f"{name} averaged {_fmt_num(_v(row, 'pts'))} points per game, {_top_or_rank(_rank_to_int(pts_rank))}, while shooting {fg_text} from the field."
+        )
+        if fga_rank_i is not None and fg3a_rank_i is not None:
             summary_sentences.append(
-                f"In {season_text or 'the requested season'}, {name} logged {_fmt_num(_v(row, 'min'))} total minutes across {gp} games."
+                f"He did that on {_fmt_num(_v(row, 'fga'))} field-goal attempts per game (#{fga_rank}) and {_fmt_num(_v(row, 'fg3a'))} three-point attempts per game (#{fg3a_rank}), which adds context to his {fg_text} FG and {fg3_text} 3P efficiency."
             )
-            if not _is_missing(_v(row, "pts")):
-                summary_sentences.append(
-                    f"His scoring total was {_fmt_num(_v(row, 'pts'))} points."
-                )
-            if not _is_missing(_v(row, "ast")) or not _is_missing(_v(row, "reb")):
-                summary_sentences.append(
-                    f"He added {_fmt_num(_v(row, 'reb'))} total rebounds and {_fmt_num(_v(row, 'ast'))} total assists."
-                )
+        if gp_i is not None and gp_i < 50:
             summary_sentences.append(
-                "These values are season totals from the totals table and are not per-game calculations."
+                f"He played {gp} games, so this season line comes from a relatively small sample."
             )
-        else:
-            summary_sentences.append(
-                f"{name} averaged {_fmt_num(_v(row, 'pts'))} points per game, {_top_or_rank(_rank_to_int(pts_rank))}, while shooting {fg_text} from the field."
-            )
-            if fga_rank_i is not None and fg3a_rank_i is not None:
-                summary_sentences.append(
-                    f"He did that on {_fmt_num(_v(row, 'fga'))} field-goal attempts per game (#{fga_rank}) and {_fmt_num(_v(row, 'fg3a'))} three-point attempts per game (#{fg3a_rank}), which adds context to his {fg_text} FG and {fg3_text} 3P efficiency."
-                )
-            if gp_i is not None and gp_i < 50:
-                summary_sentences.append(
-                    f"He played {gp} games, so this season line comes from a relatively small sample."
-                )
         season_summary = " ".join(summary_sentences)
 
-    def _append_filtered_table(lines_out: list[str], title: str, cells: list[tuple[str, str]]) -> None:
-        filtered = [(label, value) for label, value in cells if value != "N/A"]
-        if not filtered:
-            return
-        if title:
-            lines_out.append(title)
-        lines_out.append("| " + " | ".join(label for label, _ in filtered) + " |")
-        lines_out.append("|" + "|".join(["---:" for _ in filtered]) + "|")
-        lines_out.append("| " + " | ".join(value for _, value in filtered) + " |")
-        lines_out.append("")
-
-    bio_parts = []
-    if age != "N/A":
-        bio_parts.append(f"Age: {age}")
-    if mins != "N/A":
-        bio_parts.append(f"Minutes: {mins}")
-    if w_pct != "N/A":
-        bio_parts.append(f"W%: {w_pct}")
-    if gp != "N/A":
-        bio_parts.append(f"Games Played: {gp}")
-
-    lines = [heading, ""]
-    if bio_parts:
-        lines.append("_" + " | ".join(bio_parts) + "_")
-        lines.append("")
-
-    _append_filtered_table(
-        lines,
+    lines = [
+        heading,
         "",
-        [
-            ("PTS" if use_totals_language else "PPG", _fmt_num(_v(row, "pts"))),
-            ("REB", _fmt_num(_v(row, "reb"))),
-            ("AST", _fmt_num(_v(row, "ast"))),
-            ("Plus/Minus", _fmt_num(_v(row, "plus_minus"))),
-            (extra_label, extra_value),
-        ],
-    )
-    _append_filtered_table(
-        lines,
+        f"_Age: {age} | Minutes: {mins} | W%: {w_pct} | Games Played: {gp}_",
+        "",
+        f"| PPG | REB | AST | Plus/Minus | {extra_label} |",
+        "|---:|---:|---:|---:|---:|",
+        f"| {_fmt_num(_v(row, 'pts'))} | {_fmt_num(_v(row, 'reb'))} | {_fmt_num(_v(row, 'ast'))} | {_fmt_num(_v(row, 'plus_minus'))} | {extra_value} |",
+        "",
         "### Scoring",
-        [
-            ("PTS", _fmt_num(_v(row, "pts"))),
-            ("FG%", _fmt_pct(_v(row, "fg_pct"))),
-            ("3P%", _fmt_pct(_v(row, "fg3_pct"))),
-            ("FT%", _fmt_pct(_v(row, "ft_pct"))),
-            ("PTS Rank", _fmt_int(_v(row, "pts_rank"))),
-            ("FG% Rank", _fmt_int(_v(row, "fg_pct_rank"))),
-            ("3P% Rank", _fmt_int(_v(row, "fg3_pct_rank"))),
-            ("FT% Rank", _fmt_int(_v(row, "ft_pct_rank"))),
-        ],
-    )
-    _append_filtered_table(
-        lines,
+        "| PTS | FG% | 3P% | FT% | PTS Rank | FG% Rank | 3P% Rank | FT% Rank |",
+        "|---:|---:|---:|---:|---:|---:|---:|---:|",
+        f"| {_fmt_num(_v(row, 'pts'))} | {_fmt_pct(_v(row, 'fg_pct'))} | {_fmt_pct(_v(row, 'fg3_pct'))} | {_fmt_pct(_v(row, 'ft_pct'))} | {_fmt_int(_v(row, 'pts_rank'))} | {_fmt_int(_v(row, 'fg_pct_rank'))} | {_fmt_int(_v(row, 'fg3_pct_rank'))} | {_fmt_int(_v(row, 'ft_pct_rank'))} |",
+        "",
         "### Rebounding",
-        [
-            ("REB", _fmt_num(_v(row, "reb"))),
-            ("DREB", _fmt_num(_v(row, "dreb"))),
-            ("OREB", _fmt_num(_v(row, "oreb"))),
-            ("REB Rank", _fmt_int(_v(row, "reb_rank"))),
-            ("DREB Rank", _fmt_int(_v(row, "dreb_rank"))),
-            ("OREB Rank", _fmt_int(_v(row, "oreb_rank"))),
-        ],
-    )
-    _append_filtered_table(
-        lines,
+        "| REB | DREB | OREB | REB Rank | DREB Rank | OREB Rank |",
+        "|---:|---:|---:|---:|---:|---:|",
+        f"| {_fmt_num(_v(row, 'reb'))} | {_fmt_num(_v(row, 'dreb'))} | {_fmt_num(_v(row, 'oreb'))} | {_fmt_int(_v(row, 'reb_rank'))} | {_fmt_int(_v(row, 'dreb_rank'))} | {_fmt_int(_v(row, 'oreb_rank'))} |",
+        "",
         "### Assists & Ball Security",
-        [
-            ("AST", _fmt_num(_v(row, "ast"))),
-            ("TOV", _fmt_num(_v(row, "tov"))),
-            ("AST Rank", _fmt_int(_v(row, "ast_rank"))),
-            ("TOV Rank", _fmt_int(_v(row, "tov_rank"))),
-        ],
-    )
-    _append_filtered_table(
-        lines,
-        "### Advanced",
-        [
-            ("TS%", _fmt_pct(_v_any(row, ["ts", "ts_pct", "ts%", "TS", "TS%"]))),
-            ("USG%", _fmt_num(_v_any(row, ["usg", "usg_pct", "usg%", "USG", "USG%"]))),
-            ("OFFRTG", _fmt_num(_v_any(row, ["offrtg", "off_rtg", "off_rating", "OFFRTG"]))),
-            ("DEFRTG", _fmt_num(_v_any(row, ["defrtg", "def_rtg", "def_rating", "DEFRTG"]))),
-            ("NETRTG", _fmt_num(_v_any(row, ["netrtg", "net_rtg", "net_rating", "NETRTG"]))),
-            ("PIE", _fmt_num(_v_any(row, ["pie", "PIE"]))),
-        ],
-    )
-    _append_filtered_table(
-        lines,
+        "| AST | TOV | AST Rank | TOV Rank |",
+        "|---:|---:|---:|---:|",
+        f"| {_fmt_num(_v(row, 'ast'))} | {_fmt_num(_v(row, 'tov'))} | {_fmt_int(_v(row, 'ast_rank'))} | {_fmt_int(_v(row, 'tov_rank'))} |",
+        "",
         "### Defense",
-        [
-            ("STL", _fmt_num(_v(row, "stl"))),
-            ("BLK", _fmt_num(_v(row, "blk"))),
-            ("PF", _fmt_num(_v(row, "pf"))),
-            ("STL Rank", _fmt_int(_v(row, "stl_rank"))),
-            ("BLK Rank", _fmt_int(_v(row, "blk_rank"))),
-            ("PF Rank", _fmt_int(_v(row, "pf_rank"))),
-        ],
-    )
-    _append_filtered_table(
-        lines,
+        "| STL | BLK | PF | STL Rank | BLK Rank | PF Rank |",
+        "|---:|---:|---:|---:|---:|---:|",
+        f"| {_fmt_num(_v(row, 'stl'))} | {_fmt_num(_v(row, 'blk'))} | {_fmt_num(_v(row, 'pf'))} | {_fmt_int(_v(row, 'stl_rank'))} | {_fmt_int(_v(row, 'blk_rank'))} | {_fmt_int(_v(row, 'pf_rank'))} |",
+        "",
         "### Double-Double / Triple-Double",
-        [
-            ("Double Double", _fmt_num(_v_any(row, ["double_double", "dd2"]))),
-            ("Triple Double", _fmt_num(_v_any(row, ["triple_double", "td3"]))),
-            ("DD2 Rank", _fmt_int(_v(row, "dd2_rank"))),
-            ("TD3 Rank", _fmt_int(_v(row, "td3_rank"))),
-        ],
-    )
-    lines.extend([season_summary, "", "Want me to break down his season profile further?"])
+        "| DD2 | TD3 | DD2 Rank | TD3 Rank |",
+        "|---:|---:|---:|---:|",
+        f"| {_fmt_num(_v(row, 'dd2'))} | {_fmt_num(_v(row, 'td3'))} | {_fmt_int(_v(row, 'dd2_rank'))} | {_fmt_int(_v(row, 'td3_rank'))} |",
+        "",
+        season_summary,
+        "",
+        "Want me to break down his season profile further?",
+    ]
     return "\n" + "\n".join(lines)
 
 
 def _is_games_played_question(question: str, df: pd.DataFrame) -> bool:
-    q = (question or "").lower()
+    # Strip any injected follow-up context like "(continuing comparison with ...)"
+    # so that phrases from prior assistant responses don't false-positive.
+    raw_q = re.sub(r"\(continuing comparison with[^)]*\)", "", question or "")
+    q = raw_q.lower().strip()
     if "gp" not in df.columns:
+        return False
+    # Never fire for multi-player data — it's a comparison, not a games-played lookup.
+    if "player_name" in df.columns and df["player_name"].dropna().nunique() > 1:
         return False
     return any(
         phrase in q
@@ -1456,52 +1084,9 @@ def _is_games_played_question(question: str, df: pd.DataFrame) -> bool:
     )
 
 
-def _is_total_minutes_question(question: str, df: pd.DataFrame) -> bool:
-    q = (question or "").lower()
-    if df is None or df.empty:
-        return False
-    has_minutes_intent = ("minute" in q or "minutes" in q) and any(
-        t in q for t in ["total", "totals", "how many", "across"]
-    )
-    return has_minutes_intent and ("min" in df.columns)
-
-
-def _format_total_minutes_response(df: pd.DataFrame, question: str) -> str:
-    row = df.iloc[0]
-    player = str(row.get("player_name", row.get("player", "Player")))
-    team = str(row.get("team_abbreviation", row.get("team", "N/A")))
-    season_text = None
-    if "season_label" in df.columns and not pd.isna(row.get("season_label")):
-        season_text = f"{row.get('season_label')} season"
-    elif "season_start" in df.columns and not pd.isna(row.get("season_start")):
-        try:
-            start = int(float(row.get("season_start")))
-            season_text = f"{start}-{str(start + 1)[-2:]} season"
-        except Exception:
-            season_text = None
-    if season_text is None:
-        season_text = _extract_season_reference_text(question) or "requested season"
-
-    def _fmt(v: Any, digits: int = 0) -> str:
-        if v is None or pd.isna(v):
-            return "N/A"
-        try:
-            return f"{float(v):.{digits}f}" if digits > 0 else str(int(round(float(v))))
-        except Exception:
-            return "N/A"
-
-    mins = _fmt(row.get("min"), 0)
-    gp = _fmt(row.get("gp"), 0)
-    team_text = "" if (not team or team == "N/A") else f" for {team}"
-    return (
-        f"\nIn the **{season_text}**, **{player}** played **{mins} total minutes** across **{gp} games**"
-        f"{team_text}.\n"
-        "This answer uses season totals from the totals table (not per-game calculations)."
-    )
-
-
 def _is_concise_single_player_season_lookup_question(question: str, df: pd.DataFrame) -> bool:
-    q = (question or "").lower()
+    raw_q = re.sub(r"\(continuing comparison with[^)]*\)", "", question or "")
+    q = raw_q.lower().strip()
     asks_year_or_season = any(k in q for k in ["what year", "which year", "what season", "which season"])
     asks_ordinal = re.search(
         r"\b(\d{1,2}(st|nd|rd|th)|first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth)\s+(season|year)\b",
@@ -1664,11 +1249,6 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
         except Exception:
             return "N/A"
 
-    def _display_name(name: str, team: str) -> str:
-        if team == "N/A":
-            return name
-        return f"{name} ({team})"
-
     def _first_present(candidates: List[str], available_cols: set[str]) -> Optional[str]:
         for col in candidates:
             if col in available_cols:
@@ -1681,6 +1261,7 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
     working = df.copy()
     cols = set(working.columns)
     q = (question or "").lower()
+    requested_n = _extract_requested_top_n(question, default_n=5, max_n=50)
 
     metric_configs = [
         {
@@ -1692,7 +1273,7 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
             "table_header": "| # | Player | REB | OREB | DREB | Games |",
             "table_divider": "|---|---|---:|---:|---:|---:|",
             "row_builder": lambda idx, row, name, team: (
-                f"| {idx} | **{_display_name(name, team)}** | {_fmt_num(row.get('reb'))} reb | "
+                f"| {idx} | **{name}** ({team}) | {_fmt_num(row.get('reb'))} reb | "
                 f"{_fmt_num(row.get('oreb'))} oreb | {_fmt_num(row.get('dreb'))} dreb | {_fmt_games(row.get('gp'))} |"
             ),
         },
@@ -1705,7 +1286,7 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
             "table_header": "| # | Player | AST | TOV | Games |",
             "table_divider": "|---|---|---:|---:|---:|",
             "row_builder": lambda idx, row, name, team: (
-                f"| {idx} | **{_display_name(name, team)}** | {_fmt_num(row.get('ast'))} ast | "
+                f"| {idx} | **{name}** ({team}) | {_fmt_num(row.get('ast'))} ast | "
                 f"{_fmt_num(row.get('tov'))} tov | {_fmt_games(row.get('gp'))} |"
             ),
         },
@@ -1718,7 +1299,7 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
             "table_header": "| # | Player | STL | BLK | Games |",
             "table_divider": "|---|---|---:|---:|---:|",
             "row_builder": lambda idx, row, name, team: (
-                f"| {idx} | **{_display_name(name, team)}** | {_fmt_num(row.get('stl'))} stl | "
+                f"| {idx} | **{name}** ({team}) | {_fmt_num(row.get('stl'))} stl | "
                 f"{_fmt_num(row.get('blk'))} blk | {_fmt_games(row.get('gp'))} |"
             ),
         },
@@ -1731,7 +1312,7 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
             "table_header": "| # | Player | BLK | STL | Games |",
             "table_divider": "|---|---|---:|---:|---:|",
             "row_builder": lambda idx, row, name, team: (
-                f"| {idx} | **{_display_name(name, team)}** | {_fmt_num(row.get('blk'))} blk | "
+                f"| {idx} | **{name}** ({team}) | {_fmt_num(row.get('blk'))} blk | "
                 f"{_fmt_num(row.get('stl'))} stl | {_fmt_games(row.get('gp'))} |"
             ),
         },
@@ -1744,7 +1325,7 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
             "table_header": "| # | Player | 3PM | 3PA | 3P | Games |",
             "table_divider": "|---|---|---:|---:|---:|---:|",
             "row_builder": lambda idx, row, name, team: (
-                f"| {idx} | **{_display_name(name, team)}** | {_fmt_num(row.get('fg3m'))} 3pm | "
+                f"| {idx} | **{name}** ({team}) | {_fmt_num(row.get('fg3m'))} 3pm | "
                 f"{_fmt_num(row.get('fg3a'))} 3pa | {_fmt_pct(row.get('fg3_pct'))} 3p | {_fmt_games(row.get('gp'))} |"
             ),
         },
@@ -1765,7 +1346,7 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
             "table_header": "| # | Player | PPG | FG | 3P | Games |",
             "table_divider": "|---|---|---:|---:|---:|---:|",
             "row_builder": lambda idx, row, name, team: (
-                f"| {idx} | **{_display_name(name, team)}** | {_fmt_num(row.get('pts'))} ppg | "
+                f"| {idx} | **{name}** ({team}) | {_fmt_num(row.get('pts'))} ppg | "
                 f"{_fmt_pct(row.get('fg_pct'))} fg | {_fmt_pct(row.get('fg3_pct'))} 3p | {_fmt_games(row.get('gp'))} |"
             ),
         }
@@ -1775,35 +1356,54 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
     if metric_col is None:
         metric_col = "pts" if "pts" in cols else ("reb" if "reb" in cols else "")
 
-    numeric_rank_col: Optional[str] = None
-    numeric_metric_col: Optional[str] = None
-    if rank_col in cols:
-        numeric_rank_col = "__rank_num__"
-        working[numeric_rank_col] = pd.to_numeric(working[rank_col], errors="coerce")
-    if metric_col in cols and metric_col:
-        numeric_metric_col = "__metric_num__"
-        working[numeric_metric_col] = pd.to_numeric(working[metric_col], errors="coerce")
+    if rank_col in cols and metric_col in cols:
+        working = working.sort_values(by=[rank_col, metric_col], ascending=[True, False], na_position="last")
+    elif rank_col in cols:
+        working = working.sort_values(by=[rank_col], ascending=[True], na_position="last")
+    elif metric_col in cols:
+        working = working.sort_values(by=[metric_col], ascending=[False], na_position="last")
 
-    if numeric_rank_col and numeric_metric_col:
-        working = working.sort_values(by=[numeric_rank_col, numeric_metric_col], ascending=[True, False], na_position="last")
-    elif numeric_rank_col:
-        working = working.sort_values(by=[numeric_rank_col], ascending=[True], na_position="last")
-    elif numeric_metric_col:
-        working = working.sort_values(by=[numeric_metric_col], ascending=[False], na_position="last")
-
+    before_dedup = working.copy()
     if "player_name" in cols:
         working = working.dropna(subset=["player_name"])
         working = working.drop_duplicates(subset=["player_name"], keep="first")
     else:
         working = working.drop_duplicates(keep="first")
 
-    requested_n = _extract_requested_top_n(question, default_n=5, max_n=50)
+    # Re-sort AFTER dedup to make sure the order is clean.
+    if rank_col in cols and metric_col in cols:
+        working = working.sort_values(by=[rank_col, metric_col], ascending=[True, False], na_position="last")
+    elif rank_col in cols:
+        working = working.sort_values(by=[rank_col], ascending=[True], na_position="last")
+    elif metric_col in cols:
+        working = working.sort_values(by=[metric_col], ascending=[False], na_position="last")
+
+    # For "worst" questions, flip the sort so the worst performers come first.
+    is_worst = any(k in q for k in ["worst", "bottom", "lowest"])
+    if is_worst and metric_col in cols:
+        working = working.sort_values(by=[metric_col], ascending=[True], na_position="last")
+
+    # If the query already returned the requested number of rows but de-duping
+    # collapsed it, do not silently show fewer rows. This can happen when a
+    # season table contains multiple team rows for the same player.
+    if len(working) < requested_n and len(before_dedup) >= requested_n:
+        working = before_dedup
+
     top = working.head(requested_n)
     if top.empty:
         return "\nNo leaderboard data was available for this question."
 
     lead_row = top.iloc[0]
-    lead_name = str(lead_row.get("player_name", "N/A")) if not _is_missing(lead_row.get("player_name")) else "N/A"
+
+    def get_entity_name(row):
+        for col in ["player_name", "TEAM_NAME", "TeamName", "team_abbreviation"]:
+            if col in row and not pd.isna(row[col]):
+                return str(row[col])
+        return "N/A"
+
+    lead_row = top.iloc[0]
+    lead_name = get_entity_name(lead_row) # This now works perfectly
+    
     lead_metric = _fmt_num(lead_row.get(metric_col))
     season_text = _extract_season_reference_text(question)
     if season_text:
@@ -1816,11 +1416,18 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
     lines = [lead_line, "", selected["table_header"], selected["table_divider"]]
 
     for idx, (_, row) in enumerate(top.iterrows(), start=1):
-        name = str(row.get("player_name", "N/A")) if not _is_missing(row.get("player_name")) else "N/A"
+        # FIXED: Call your function here for every row
+        name = get_entity_name(row) 
         team = str(row.get("team_abbreviation", "N/A")) if not _is_missing(row.get("team_abbreviation")) else "N/A"
+        
+        # Optional safeguard: prevents printing "GSW (GSW)" if the name is already the team abbreviation
+        if name == team:
+            team = "Team"
+            
         lines.append(selected["row_builder"](idx, row, name, team))
 
     lines.append("")
+    lines.append(f"Showing {len(top)} of {requested_n} requested rows.")
     lines.append("Want me to break down each player's profile further?")
     return "\n" + "\n".join(lines)
 
@@ -1924,13 +1531,13 @@ def _format_spatial_shots_narrative(df: pd.DataFrame, question: str, client: Any
     user_prompt = f"Question:\n{question}\n\n{summary}\n\nAnswer in a relaxed, broadcast tone."
     try:
         resp = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5.4-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.75,
-            max_tokens=900,
+            max_completion_tokens=900,
         )
         raw = (resp.choices[0].message.content or "").strip()
         formatted = raw.replace("###", "\n\n###").replace("####", "\n\n####")
@@ -1939,515 +1546,17 @@ def _format_spatial_shots_narrative(df: pd.DataFrame, question: str, client: Any
         return f"\nError generating shot-location narrative: {e}"
 
 
-def _should_format_compare_season_breakdown(question: str, df: pd.DataFrame) -> bool:
-    """Use structured offense/defense sections instead of raw side-by-side tables."""
-    if df is None or getattr(df, "empty", True):
-        return False
-    q = (question or "").lower()
-    if not (
-        re.search(r"(?i)\b(compare|between)\b", q)
-        or " versus " in q
-        or re.search(r"(?i)\bvs\b", q)
-        or "who was better" in q
-        or "who is better" in q
-        or re.search(r"(?i)\bwhich\s+(?:one|player)\s+(?:was|is)\s+better\b", q)
-        or re.search(r"(?i)\bwhich\s+had\s+(?:the\s+)?better\s+season\b", q)
-    ):
-        return False
-    n = len(df)
-    # Structured narrative is built for a head-to-head pair; 3+ rows should use generic tables.
-    if n != 2:
-        return False
-    cols = {c.lower() for c in df.columns}
-    if "player_name" not in cols and "player" not in cols:
-        return False
-    deep = any(
-        ph in q
-        for ph in (
-            "breakdown",
-            "break down",
-            "deep dive",
-            "in depth",
-            "in-depth",
-            "full picture",
-            "comprehensive",
-            "granular",
-        )
-    )
-    has_season = "season_start" in cols or "season_label" in cols
-    has_def_totals = "opp_pts" in cols
-    return deep or (has_def_totals and has_season)
-
-
-def _format_compare_season_breakdown(df: pd.DataFrame, question: str) -> str:
-    """Narrative + grouped tables for 2-player (or few-row) season-compare frames with defense_totals."""
-    work = df.copy()
-
-    def _missing(v: Any) -> bool:
-        try:
-            return v is None or pd.isna(v)
-        except Exception:
-            return v is None
-
-    def _fmt_num(v: Any, digits: int = 1) -> str:
-        if _missing(v):
-            return "N/A"
-        try:
-            return f"{float(v):.{digits}f}"
-        except Exception:
-            return "N/A"
-
-    def _fmt_int(v: Any) -> str:
-        if _missing(v):
-            return "N/A"
-        try:
-            return str(int(float(v)))
-        except Exception:
-            return "N/A"
-
-    def _fmt_pct(v: Any, digits: int = 1) -> str:
-        if _missing(v):
-            return "N/A"
-        try:
-            num = float(v)
-            if 0 <= num <= 1:
-                num *= 100.0
-            return f"{num:.{digits}f}%"
-        except Exception:
-            return "N/A"
-
-    def _append_table(lines_out: List[str], title: str, cells: List[tuple[str, str]]) -> None:
-        filtered = [(a, b) for a, b in cells if b != "N/A"]
-        if not filtered:
-            return
-        if title:
-            lines_out.append(title)
-        lines_out.append("| " + " | ".join(a for a, _ in filtered) + " |")
-        lines_out.append("|" + "|".join(["---:" for _ in filtered]) + "|")
-        lines_out.append("| " + " | ".join(b for _, b in filtered) + " |")
-        lines_out.append("")
-
-    name_col = "player_name" if "player_name" in work.columns else "player"
-    if "season_start" in work.columns:
-        try:
-            work["_ss"] = pd.to_numeric(work["season_start"], errors="coerce")
-            work = work.sort_values("_ss", na_position="last")
-        except Exception:
-            pass
-
-    lines: List[str] = [
-        "## Season comparison",
-        "",
-        "Below is a **structured breakdown** (per-game offense + advanced efficiency where available, "
-        "plus **defensive impact totals** from the defense summary table — steals/blocks/defensive rating "
-        "and opponent scoring context).",
-        "",
-    ]
-
-    for _, row in work.iterrows():
-        name = str(row.get(name_col, "Player"))
-        team = str(row.get("team", "")) if not _missing(row.get("team")) else ""
-        season_lbl = None
-        if "season_label" in work.columns and not _missing(row.get("season_label")):
-            season_lbl = str(row.get("season_label"))
-        elif "season_start" in work.columns and not _missing(row.get("season_start")):
-            try:
-                sy = int(float(row.get("season_start")))
-                season_lbl = f"{sy}-{str(sy + 1)[-2:]}"
-            except Exception:
-                season_lbl = None
-        head = f"### {name}"
-        if team:
-            head += f" ({team})"
-        if season_lbl:
-            head += f" — **{season_lbl}**"
-        lines.append(head)
-        lines.append("")
-
-        _append_table(
-            lines,
-            "**Per-game offense**",
-            [
-                ("GP", _fmt_int(row.get("gp"))),
-                ("PTS", _fmt_num(row.get("pts"))),
-                ("REB", _fmt_num(row.get("reb"))),
-                ("AST", _fmt_num(row.get("ast"))),
-                ("FG%", _fmt_pct(row.get("fg_pct"))),
-                ("3P%", _fmt_pct(row.get("fg3_pct"))),
-                ("FT%", _fmt_pct(row.get("ft_pct"))),
-            ],
-        )
-
-        adv_cells = [
-            ("TS%", _fmt_pct(row.get("ts"))),
-            ("USG%", _fmt_num(row.get("usg"))),
-            ("ORtg", _fmt_num(row.get("offrtg"))),
-            ("DRtg (adv)", _fmt_num(row.get("defrtg"))),
-            ("NetRtg", _fmt_num(row.get("netrtg"))),
-        ]
-        if any(b != "N/A" for _, b in adv_cells):
-            _append_table(lines, "**Advanced (season totals)**", adv_cells)
-
-        def_cells = [
-            ("DREB", _fmt_num(row.get("dreb"))),
-            ("STL", _fmt_num(row.get("stl"))),
-            ("BLK", _fmt_num(row.get("blk"))),
-            ("Def RTG", _fmt_num(row.get("def_rtg"))),
-            ("Opp PTS", _fmt_num(row.get("opp_pts"))),
-        ]
-        if any(b != "N/A" for _, b in def_cells):
-            _append_table(
-                lines,
-                "**Defense totals profile** (`defense_totals_regularseason_*`)",
-                def_cells,
-            )
-        lines.append("")
-
-    if len(work) == 2:
-        a, b = work.iloc[0], work.iloc[-1]
-        na = str(a.get(name_col, "Player A"))
-        nb = str(b.get(name_col, "Player B"))
-        pa, pb = _fmt_num(a.get("pts")), _fmt_num(b.get("pts"))
-        ta, tb = _fmt_pct(a.get("ts")), _fmt_pct(b.get("ts"))
-        da, db = _fmt_num(a.get("def_rtg")), _fmt_num(b.get("def_rtg"))
-        oa, ob = _fmt_num(a.get("opp_pts")), _fmt_num(b.get("opp_pts"))
-        hook = (
-            f"At a glance: **{na}** scored **{pa}** PPG with **{ta}** true shooting, while **{nb}** put up **{pb}** on **{tb}** TS. "
-        )
-        if da != "N/A" and db != "N/A":
-            hook += (
-                f"On the defensive totals sheet, **{na}** carried a **{da}** defensive rating vs opponent scoring (**{oa}** opp PTS context) "
-                f"compared with **{db}** / **{ob}** for **{nb}** — lower defensive rating and opponent points allowed generally signal stronger team defense "
-                f"while that player was on the floor in this table's definition."
-            )
-        lines.insert(2, hook)
-        lines.insert(3, "")
-
-    lines.append(
-        "Want a **single-season** compare (same year for both players) or a **playoff** split next?"
-    )
-    return "\n" + "\n".join(lines).strip()
-
-
-def analyze_dataframe() -> str:
-    if query_bot_module is None:
-        return (
-            "Error: Could not import query_bot. Make sure query_bot.py exists in backend/Executer/ directory."
-        )
-
-    user_input = _resolve_user_input(query_bot_module)
-    df_output = _resolve_df_output(query_bot_module)
-    client = _resolve_client(query_bot_module)
-
-    if not user_input:
-        return "Error: No user input available from query_bot."
-    if df_output is None:
-        return "Error: No data available to analyze (df_output missing)."
-    if df_output.empty:
-        return "Error: The query returned an empty result set."
-    if client is None:
-        return "Error: OpenAI client not available. Set OPENAI_API_KEY or expose 'client' in query_bot."
-
-    df_output = _normalize_stats_df_columns(df_output)
-
-    if _is_spatial_shot_dataframe(df_output):
-        return _format_spatial_shots_narrative(df_output, user_input, client)
-
-    if _should_format_compare_season_breakdown(user_input, df_output):
-        return _format_compare_season_breakdown(df_output, user_input)
-
-    domain = infer_domain(user_input, df_output.columns.tolist())
-
-    # Check if we are using the game logs table by looking for game_id
-    is_game_log = "game_id" in df_output.columns
-
-    # Skip the scoring/ranking engine entirely if it's just a player's game logs
-    score_table: Optional[pd.DataFrame] = None
-    if ENABLE_COMPOSITE_SCORING and not is_game_log:
-        try:
-            cfg = DOMAIN_CONFIGS[domain]
-            score_table = compute_scores(df_output, cfg)
-        except Exception:
-            score_table = None
-
-    is_comparison = len(df_output) <= 5 and any(
-        k in user_input.lower() for k in ["compare", "better", "versus", "vs", "between", "who"]
-    )
-    rows_to_show = df_output if is_comparison else df_output.head(20)
-
-    df_summary = (
-        f"DataFrame shape: {df_output.shape[0]} rows, {df_output.shape[1]} columns\n"
-        f"Columns: {', '.join(df_output.columns.tolist())}\n\n"
-        f"Data:\n{rows_to_show.to_string(index=False)}\n"
-    )
-    if len(df_output) > 20 and not is_comparison:
-        df_summary += f"\nSummary statistics:\n{df_output.describe().to_string()}\n"
-
-    rubric_by_domain = {
-        "defense": "Prioritize defensive_impact; rim protection (rim_fg_pct_allowed lower is better; rim_shots_contested higher is better); on-ball impact (opp_fg_pct_as_primary_defender lower is better); versatility; disruptions (deflections, loose balls).",
-        "shooting": "Prioritize accuracy (three_pt_pct), then volume (three_pm, three_pa). Include role, shot quality, and sustainability commentary.",
-        "playmaking": "Prioritize ast_per_game, ast_pct, potential_ast, assist_points_created; penalize turnovers (tov_per_game lower is better); reward efficiency (ast_to_tov). Consider on-ball workload.",
-        "scoring": "Prioritize ppg and efficiency (ts_pct), then usage and volume (fga). Discuss shot mix and scalability.",
-    }
-
-    # Check if we are using the game logs table by looking for game_id
-    is_game_log = "game_id" in df_output.columns
-
-    is_simple_top_scorers = _is_simple_top_scorers_question(user_input, domain)
-    is_single_player_trend = _is_single_player_season_trend_question(user_input, df_output)
-    is_single_player_stats = _is_single_player_stats_question(user_input, df_output)
-    is_clutch_profile = _is_clutch_question_or_frame(user_input, df_output)
-    is_games_played_q = _is_games_played_question(user_input, df_output)
-    is_total_minutes_q = _is_total_minutes_question(user_input, df_output)
-    is_concise_season_lookup = _is_concise_single_player_season_lookup_question(user_input, df_output)
-
-    if is_games_played_q:
-        return _format_games_played_response(df_output, user_input)
-    if is_total_minutes_q:
-        return _format_total_minutes_response(df_output, user_input)
-    if is_concise_season_lookup:
-        return _format_concise_single_player_season_lookup_response(df_output, user_input)
-
-    if is_clutch_profile:
-        return _format_single_player_clutch_profile(df_output, user_input)
-    if is_single_player_trend:
-        trend_text = _format_single_player_season_trend_response(df_output, user_input, client)
-        if trend_text and trend_text.strip():
-            return trend_text
-    if is_single_player_stats:
-        return _format_single_player_stats_profile(df_output, user_input, client)
-    elif is_simple_top_scorers:
-        return _format_simple_top_scorers_response(df_output, user_input)
-    elif ENABLE_COMPOSITE_SCORING and score_table is not None and not score_table.empty:
-        score_text = score_table.to_string(index=True)
-        system_prompt = (
-            "You are an expert NBA analyst providing insightful, narrative-driven analysis.\n\n"
-            "Adapt your formatting to best answer the specific question asked. Do NOT use standard rigid headers like 'Executive Summary' or 'Detailed Analysis' every time.\n"
-            "Instead, write in a fluid, engaging sports article style:\n"
-            "- Start with a strong hook or direct answer.\n"
-            "- Use natural paragraphs, bold text for emphasis, and bullet points only when helpful (like listing specific player rankings).\n"
-            "- Incorporate context, player roles, and data limitations organically into your sentences.\n"
-            "Use the provided ranking. Be specific and reference actual numbers from the data."
-        )
-        if is_game_log:
-            system_prompt += "\n\nNote: The data provided comes from game-by-game logs. Focus on trends, streaks, consistency, or individual game performances rather than just overall averages."
-            
-        user_prompt = (
-            f"Question: {user_input}\n\n"
-            f"Domain: {domain}\n"
-            f"Guidance: {rubric_by_domain[domain]}\n\n"
-            f"RANKED (DO NOT REORDER):\n{score_text}\n\n"
-            f"ORIGINAL DATA (first rows):\n{rows_to_show.to_string(index=False)}\n\n"
-            f"Analyze the top result and compare to the next strongest contenders in a natural, engaging format."
-        )
-    else:
-        system_prompt = (
-            "You are an expert NBA analyst providing insightful, narrative-driven analysis.\n\n"
-            f"Domain: {domain}\n"
-            f"Guidance: {rubric_by_domain[domain]}\n\n"
-            "Adapt your formatting to best answer the specific question asked. Do NOT use standard rigid headers like 'Executive Summary' or 'Detailed Analysis' every time.\n"
-            "Instead, structure your response organically:\n"
-            "- For a simple stat check, provide a concise, direct answer.\n"
-            "- For complex questions, use engaging paragraphs and bold text for emphasis.\n"
-            "- Only use bullet points if listing out specific game logs or multiple stats.\n"
-            "Be specific and reference actual numbers from the data."
-        )
-        if is_game_log:
-            system_prompt += "\n\nNote: The data provided comes from game-by-game logs. Focus your narrative on recent form, splits, streaks, or single-game anomalies."
-
-        user_prompt = (
-            f"User's question: {user_input}\n\n"
-            f"Data:\n{df_summary}\n"
-            "Analyze the data and answer the question in a fluid, engaging sports-analyst style."
-            f"{_implicit_default_season_llm_note(user_input)}"
-        )
-
-    try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0,
-            max_tokens=1600,
-        )
-        raw_response = response.choices[0].message.content.strip()
-        
-        # Format the response for better readability
-        formatted_response = raw_response.replace("###", "\n\n###").replace("####", "\n\n####")
-        formatted_response = "\n" + formatted_response.strip()
-        
-        return formatted_response
-    except Exception as e:
-        return f"Error during AI analysis: {str(e)}"
-
-
-def analyze() -> str:
-    return analyze_dataframe()
-
-
 def analyze_question(question: str) -> str:
-    """Run a real-time question through query_bot, then analyze the resulting DataFrame."""
-    if query_bot_module is None:
-        return (
-            "Error: Could not import query_bot. Make sure query_bot.py exists in backend/Executer/ directory."
-        )
-
-    df = None
-    if hasattr(query_bot_module, 'run_query'):
-        try:
-            df = query_bot_module.run_query(question)
-        except Exception as exc:
-            return f"Error running query_bot.run_query: {exc}"
-    elif hasattr(query_bot_module, 'natural_language_to_sql'):
-        try:
-            df = query_bot_module.natural_language_to_sql(question)
-        except Exception as exc:
-            return f"Error running query_bot.natural_language_to_sql: {exc}"
-
+    """Run a real-time question from the CLI and analyze the resulting DataFrame."""
     try:
-        setattr(query_bot_module, 'user_input', question)
-    except Exception:
-        pass
-
-    if df is None:
-        df = _resolve_df_output(query_bot_module)
-
-    client = _resolve_client(query_bot_module)
-    if df is None:
-        return "Error: No data returned from query_bot."
-    if df is not None and getattr(df, 'empty', False):
+        df = run_query(question)
+    except Exception as exc:
+        return f"Error running query: {exc}"
+        
+    if df is None or getattr(df, 'empty', False):
         return "Error: The query returned an empty result set."
-    if client is None:
-        return "Error: OpenAI client not available. Set OPENAI_API_KEY or expose 'client' in query_bot."
-
-    df = _normalize_stats_df_columns(df)
-
-    if _is_spatial_shot_dataframe(df):
-        return _format_spatial_shots_narrative(df, question, client)
-
-    domain = infer_domain(question, df.columns.tolist())
-
-    score_table: Optional[pd.DataFrame] = None
-    if ENABLE_COMPOSITE_SCORING:
-        try:
-            cfg = DOMAIN_CONFIGS[domain]
-            score_table = compute_scores(df, cfg)
-        except Exception:
-            score_table = None
-
-    is_comparison = len(df) <= 5 and any(
-        k in question.lower() for k in ["compare", "better", "versus", "vs", "between", "who"]
-    )
-    rows_to_show = df if is_comparison else df.head(20)
-
-    df_summary = (
-        f"DataFrame shape: {df.shape[0]} rows, {df.shape[1]} columns\n"
-        f"Columns: {', '.join(df.columns.tolist())}\n\n"
-        f"Data:\n{rows_to_show.to_string(index=False)}\n"
-    )
-    if len(df) > 20 and not is_comparison:
-        df_summary += f"\nSummary statistics:\n{df.describe().to_string()}\n"
-
-    rubric_by_domain = {
-        "defense": "Prioritize defensive_impact; rim protection (rim_fg_pct_allowed lower is better; rim_shots_contested higher is better); on-ball impact (opp_fg_pct_as_primary_defender lower is better); versatility; disruptions (deflections, loose balls).",
-        "shooting": "Prioritize accuracy (three_pt_pct), then volume (three_pm, three_pa). Include role, shot quality, and sustainability commentary.",
-        "playmaking": "Prioritize ast_per_game, ast_pct, potential_ast, assist_points_created; penalize turnovers (tov_per_game lower is better); reward efficiency (ast_to_tov). Consider on-ball workload.",
-        "scoring": "Prioritize ppg and efficiency (ts_pct), then usage and volume (fga). Discuss shot mix and scalability.",
-    }
-
-    # Check if we are using the game logs table by looking for game_id
-    is_game_log = "game_id" in df.columns 
-
-    is_simple_top_scorers = _is_simple_top_scorers_question(question, domain)
-    is_single_player_trend = _is_single_player_season_trend_question(question, df)
-    is_single_player_stats = _is_single_player_stats_question(question, df)
-    is_clutch_profile = _is_clutch_question_or_frame(question, df)
-    is_games_played_q = _is_games_played_question(question, df)
-    is_total_minutes_q = _is_total_minutes_question(question, df)
-    is_concise_season_lookup = _is_concise_single_player_season_lookup_question(question, df)
-
-    if is_games_played_q:
-        return _format_games_played_response(df, question)
-    if is_total_minutes_q:
-        return _format_total_minutes_response(df, question)
-    if is_concise_season_lookup:
-        return _format_concise_single_player_season_lookup_response(df, question)
-
-    if is_clutch_profile:
-        return _format_single_player_clutch_profile(df, question)
-    if is_single_player_trend:
-        trend_text = _format_single_player_season_trend_response(df, question, client)
-        if trend_text and trend_text.strip():
-            return trend_text
-    if is_single_player_stats:
-        return _format_single_player_stats_profile(df, question, client)
-    elif is_simple_top_scorers:
-        return _format_simple_top_scorers_response(df, question)
-    elif ENABLE_COMPOSITE_SCORING and score_table is not None and not score_table.empty:
-        score_text = score_table.to_string(index=True)
-        system_prompt = (
-            "You are an expert NBA analyst providing insightful, narrative-driven analysis.\n\n"
-            "Adapt your formatting to best answer the specific question asked. Do NOT use standard rigid headers like 'Executive Summary' or 'Detailed Analysis' every time.\n"
-            "Instead, write in a fluid, engaging sports article style:\n"
-            "- Start with a strong hook or direct answer.\n"
-            "- Use natural paragraphs, bold text for emphasis, and bullet points only when helpful (like listing specific player rankings).\n"
-            "- Incorporate context, player roles, and data limitations organically into your sentences.\n"
-            "Use the provided ranking. Be specific and reference actual numbers from the data."
-        )
-        if is_game_log:
-            system_prompt += "\n\nNote: The data provided comes from game-by-game logs. Focus on trends, streaks, consistency, or individual game performances rather than just overall averages."
-            
-        user_prompt = (
-            f"Question: {question}\n\n"
-            f"Domain: {domain}\n"
-            f"Guidance: {rubric_by_domain[domain]}\n\n"
-            f"RANKED (DO NOT REORDER):\n{score_text}\n\n"
-            f"ORIGINAL DATA (first rows):\n{rows_to_show.to_string(index=False)}\n\n"
-            f"Analyze the top result and compare to the next strongest contenders in a natural, engaging format."
-        )
-    else:
-        system_prompt = (
-            "You are an expert NBA analyst providing insightful, narrative-driven analysis.\n\n"
-            f"Domain: {domain}\n"
-            f"Guidance: {rubric_by_domain[domain]}\n\n"
-            "Adapt your formatting to best answer the specific question asked. Do NOT use standard rigid headers like 'Executive Summary' or 'Detailed Analysis' every time.\n"
-            "Instead, structure your response organically:\n"
-            "- For a simple stat check, provide a concise, direct answer.\n"
-            "- For complex questions, use engaging paragraphs and bold text for emphasis.\n"
-            "- Only use bullet points if listing out specific game logs or multiple stats.\n"
-            "Be specific and reference actual numbers from the data."
-        )
-        if is_game_log:
-            system_prompt += "\n\nNote: The data provided comes from game-by-game logs. Focus your narrative on recent form, splits, streaks, or single-game anomalies."
-
-        user_prompt = (
-            f"User's question: {question}\n\n"
-            f"Data:\n{df_summary}\n"
-            "Analyze the data and answer the question in a fluid, engaging sports-analyst style."
-            f"{_implicit_default_season_llm_note(question)}"
-        )
-
-    try:
-        response = _resolve_client(query_bot_module).chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0,
-            max_tokens=1600,
-        )
-        raw_response = response.choices[0].message.content.strip()
         
-        # Format the response for better readability
-        formatted_response = raw_response.replace("###", "\n\n###").replace("####", "\n\n####")
-        formatted_response = "\n" + formatted_response.strip()
-        
-        return formatted_response
-    except Exception as e:
-        return f"Error during AI analysis: {str(e)}"
+    return analyze_question_with_data(question, df)
 
 
 def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
@@ -2456,22 +1565,13 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
     This is called from main.py after run_query() has already succeeded,
     so we never run the query twice or trigger a false empty-result error.
     """
-    client = _resolve_client(query_bot_module)
-    if client is None:
-        # Fall back to building a client directly from env
-        try:
-            from openai import OpenAI
-            client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        except Exception as e:
-            return f"Error: OpenAI client not available: {e}"
+
 
     if df is None or df.empty:
         return (
             "No data was found for this query. The player may not have participated "
             "in the requested season or playoffs, or the name was not recognized."
         )
-
-    df = _normalize_stats_df_columns(df)
 
     # Shot-chart / court coordinate data: narrative style, pre-aggregated — avoid rigid table dumps.
     if _is_spatial_shot_dataframe(df):
@@ -2491,18 +1591,73 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
         except Exception:
             score_table = None
 
-    is_comparison = len(df) <= 5 and any(
+    # Detect single-player drill-down tag set by main.py. When present, scope
+    # the dataframe to ONLY that player and treat as a profile, not a comparison.
+    drilldown_match = re.search(r"\(single-player drill-down:\s*([^)]+)\)", question or "")
+    if drilldown_match and "player_name" in df.columns:
+        target_player = drilldown_match.group(1).strip()
+        target_lower = target_player.lower()
+        # Match by substring (handles 'LeBron' matching 'LeBron James').
+        mask = df["player_name"].dropna().astype(str).str.lower().str.contains(target_lower, regex=False)
+        filtered = df[mask.reindex(df.index, fill_value=False)]
+        if not filtered.empty:
+            df = filtered
+            print(f"[Analyzer] Drill-down tag found: scoped df to '{target_player}' "
+                  f"({len(df)} rows from original {unique_player_count if 'unique_player_count' in dir() else '?'} players)")
+
+    # Detect comparisons: explicit keywords OR multiple unique players in a small result set.
+    comparison_keywords = any(
         k in question.lower() for k in ["compare", "better", "versus", "vs", "between", "who"]
     )
+    try:
+        unique_player_count = df["player_name"].dropna().astype(str).str.strip().nunique() if "player_name" in df.columns else 0
+    except Exception:
+        unique_player_count = 0
+
+    team_entity_col = next(
+        (c for c in ["TEAM_NAME", "TeamName", "team_name", "team_abbreviation"] if c in df.columns),
+        None,
+    )
+    try:
+        unique_team_count = df[team_entity_col].dropna().astype(str).str.strip().nunique() if team_entity_col else 0
+    except Exception:
+        unique_team_count = 0
+    unique_entity_count = max(unique_player_count, unique_team_count)
+    # Drill-down explicitly disables comparison mode regardless of df shape.
+    is_drilldown = drilldown_match is not None
+    is_comparison = (
+        not is_drilldown
+        and len(df) <= 10
+        and (comparison_keywords or unique_entity_count >= 2)
+        and unique_entity_count >= 2
+    )
+    comparison_entity_label = "TEAM" if unique_team_count >= 2 and unique_player_count == 0 else "PLAYER"
+    comparison_entity_noun = "teams" if comparison_entity_label == "TEAM" else "players"
+    comparison_entity_singular = "team" if comparison_entity_label == "TEAM" else "player"
     rows_to_show = df if is_comparison else df.head(20)
 
+    # Apply user-friendly column renames before showing data to GPT or the user.
+    display_df = _rename_columns_for_display(df)
+    display_rows_to_show = display_df if is_comparison else display_df.head(20)
+
     df_summary = (
-        f"DataFrame shape: {df.shape[0]} rows, {df.shape[1]} columns\n"
-        f"Columns: {', '.join(df.columns.tolist())}\n\n"
-        f"Data:\n{rows_to_show.to_string(index=False)}\n"
+        f"DataFrame shape: {display_df.shape[0]} rows, {display_df.shape[1]} columns\n"
+        f"Columns: {', '.join(display_df.columns.tolist())}\n\n"
+        f"Data:\n{display_rows_to_show.to_string(index=False)}\n"
     )
-    if len(df) > 20 and not is_comparison:
-        df_summary += f"\nSummary statistics:\n{df.describe().to_string()}\n"
+    if len(display_df) > 20 and not is_comparison:
+        df_summary += f"\nSummary statistics:\n{display_df.describe().to_string()}\n"
+
+    # If the user asked for "PER" specifically, prepend a note for GPT so it
+    # opens with a one-line acknowledgment that classic PER isn't stored.
+    per_note = ""
+    if _user_asked_for_per(question) and any(c in df.columns for c in ("PIE", "pie")):
+        per_note = (
+            "\n\nIMPORTANT: This database does not store classic PER (Hollinger). "
+            "The 'PIE (PER equivalent)' column shown is the NBA's official equivalent. "
+            "Open your answer with one short sentence acknowledging this so the user "
+            "knows what they're seeing."
+        )
 
     rubric_by_domain = {
         "defense": "Prioritize defensive_impact; rim protection (rim_fg_pct_allowed lower is better; rim_shots_contested higher is better); on-ball impact (opp_fg_pct_as_primary_defender lower is better); versatility; disruptions (deflections, loose balls).",
@@ -2515,24 +1670,18 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
     is_simple_top_scorers = _is_simple_top_scorers_question(question, domain)
     is_single_player_trend = _is_single_player_season_trend_question(question, df)
     is_single_player_stats = _is_single_player_stats_question(question, df)
-    is_clutch_profile = is_single_player_stats and _is_clutch_question_or_frame(question, df)
     is_games_played_q = _is_games_played_question(question, df)
-    is_total_minutes_q = _is_total_minutes_question(question, df)
     is_concise_season_lookup = _is_concise_single_player_season_lookup_question(question, df)
 
     if is_games_played_q:
         return _format_games_played_response(df, question)
-    if is_total_minutes_q:
-        return _format_total_minutes_response(df, question)
     if is_concise_season_lookup:
         return _format_concise_single_player_season_lookup_response(df, question)
 
     if is_single_player_trend:
         trend_text = _format_single_player_season_trend_response(df, question, client)
-        if trend_text and trend_text.strip():
+        if trend_text:
             return trend_text
-    if is_clutch_profile:
-        return _format_single_player_clutch_profile(df, question)
     if is_single_player_stats:
         return _format_single_player_stats_profile(df, question, client)
     elif is_simple_top_scorers:
@@ -2548,6 +1697,14 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
             "- Incorporate context, player roles, and data limitations organically.\n"
             "Use the provided ranking. Be specific and reference actual numbers from the data."
         )
+        if is_comparison:
+            system_prompt += (
+                f"\n\nThis is a {comparison_entity_label} COMPARISON. Structure your response as:\n"
+                f"1. A paragraph on each {comparison_entity_singular}'s performance, referencing specific stats.\n"
+                "2. Where they each have an edge (scoring, efficiency, playmaking, defense, etc.).\n"
+                "3. End with a clear 1-2 sentence VERDICT: who had the better season overall and why. "
+                "Be decisive — don't hedge with 'both were great'. Pick a winner and justify it."
+            )
         if is_game_log:
             system_prompt += "\n\nNote: Data comes from game-by-game logs. Focus on trends, streaks, consistency, or individual game performances."
 
@@ -2556,8 +1713,8 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
             f"Domain: {domain}\n"
             f"Guidance: {rubric_by_domain.get(domain, '')}\n\n"
             f"RANKED (DO NOT REORDER):\n{score_text}\n\n"
-            f"ORIGINAL DATA (first rows):\n{rows_to_show.to_string(index=False)}\n\n"
-            f"Analyze the top result and compare to the next strongest contenders in a natural, engaging format."
+            f"ORIGINAL DATA (first rows):\n{display_rows_to_show.to_string(index=False)}\n\n"
+            f"Analyze the top result and compare to the next strongest contenders in a natural, engaging format.{per_note}"
         )
     else:
         system_prompt = (
@@ -2570,27 +1727,83 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
             "- Only use bullet points if listing out specific game logs or multiple stats.\n"
             "Be specific and reference actual numbers from the data."
         )
+        if is_comparison:
+            system_prompt += (
+                f"\n\nThis is a {comparison_entity_label} COMPARISON. Structure your response as:\n"
+                f"1. A paragraph on each {comparison_entity_singular}'s performance, referencing specific stats.\n"
+                "2. Where they each have an edge (scoring, efficiency, playmaking, defense, etc.).\n"
+                "3. End with a clear 1-2 sentence VERDICT: who had the better season overall and why. "
+                "Be decisive — don't hedge with 'both were great'. Pick a winner and justify it."
+            )
         if is_game_log:
             system_prompt += "\n\nNote: Data comes from game-by-game logs. Focus your narrative on recent form, splits, streaks, or single-game anomalies."
 
         user_prompt = (
             f"User's question: {question}\n\n"
-            f"Data:\n{df_summary}\n"
+            f"Data:\n{df_summary}{per_note}\n"
             "Analyze the data and answer the question in a fluid, engaging sports-analyst style."
-            f"{_implicit_default_season_llm_note(question)}"
         )
+
+    # For comparisons, reinforce the directive in the user prompt too so
+    # the model can't ignore the system-level instruction.
+    if is_comparison:
+        try:
+            if "player_name" in df.columns:
+                unique_players = df["player_name"].dropna().astype(str).str.strip().unique().tolist()
+            elif team_entity_col:
+                unique_players = df[team_entity_col].dropna().astype(str).str.strip().unique().tolist()
+            else:
+                unique_players = []
+        except Exception:
+            unique_players = []
+        if len(unique_players) >= 2:
+            names_str = " and ".join(unique_players[:4])
+            user_prompt += (
+                f"\n\nCRITICAL: This is a HEAD-TO-HEAD comparison between {names_str}. "
+                f"You MUST discuss BOTH {comparison_entity_noun} in detail — do NOT only mention one. "
+                f"Cover each {comparison_entity_singular}'s stats, where each has an edge, and end with a verdict."
+            )
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-5.4-mini",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0,
-            max_tokens=1600,
+            max_completion_tokens=1600,
         )
         raw_response = response.choices[0].message.content.strip()
+
+        # RETRY: if the response is suspiciously short for a comparison
+        # (under 150 chars when we have 2+ players), the model likely
+        # ignored the comparison directive. Retry with higher temperature
+        # and an even more forceful prompt.
+        if is_comparison and len(raw_response) < 150:
+            retry_prompt = (
+                f"Your previous response was too short and only mentioned one {comparison_entity_singular}. "
+                f"The user asked to COMPARE multiple {comparison_entity_noun}. Here is the data again:\n\n"
+                f"{df_summary}\n\n"
+                f"Write a FULL comparison covering EACH {comparison_entity_singular}'s stats, their relative "
+                f"strengths, and a clear verdict on who performed better. "
+                f"Minimum 4 sentences."
+            )
+            retry_response = client.chat.completions.create(
+                model="gpt-5.4-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                    {"role": "assistant", "content": raw_response},
+                    {"role": "user", "content": retry_prompt},
+                ],
+                temperature=0.3,
+                max_completion_tokens=1600,
+            )
+            retry_text = retry_response.choices[0].message.content.strip()
+            if len(retry_text) > len(raw_response):
+                raw_response = retry_text
+
         formatted_response = raw_response.replace("###", "\n\n###").replace("####", "\n\n####")
         return "\n" + formatted_response.strip()
     except Exception as e:

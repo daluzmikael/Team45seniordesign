@@ -23,14 +23,18 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # 2. Connect to PostgreSQL (AWS RDS)
 def get_connection():
-    """Get a fresh database connection"""
+    """Get a fresh database connection (database name from POSTGRES_DB, default NBA-STATS)."""
+    load_dotenv()
+    password = os.getenv("POSTGRES_PASSWORD")
+    if not password:
+        raise RuntimeError("POSTGRES_PASSWORD is not set in environment or .env")
     return psycopg2.connect(
-        host="nba-sdp-project.cs1c0smw8vqa.us-east-1.rds.amazonaws.com",
-        port=5432,
-        dbname="postgres",
-        user="VonLindenthal",
-        password="Vlindenthal1!",
-        sslmode="require"
+        host=os.getenv("POSTGRES_HOST", "nba-sdp-project.cs1c0smw8vqa.us-east-1.rds.amazonaws.com"),
+        port=int(os.getenv("POSTGRES_PORT", "5432")),
+        dbname=os.getenv("POSTGRES_DB", "NBA-STATS"),
+        user=os.getenv("POSTGRES_USER", "VonLindenthal"),
+        password=password,
+        sslmode=os.getenv("POSTGRES_SSLMODE", "require"),
     )
 
 conn = get_connection()
@@ -158,11 +162,12 @@ CRITICAL TABLE USAGE RULES:
    - USE FOR: "Averages", "Top Scorers", "Season long trends", and percentage stats.
    - These tables DO NOT have a 'season_id' or 'game_date' column.
    - These tables DO have pre-calculated percentage columns (e.g., 'fg_pct', 'fg3_pct', 'ft_pct').
+   - If the question needs columns from **two** compatible tables (same kind of entity/season), use **JOIN** and keys that exist in the schema below.
 
 2. **Game Logs** (`player_game_logs`):
    - USE FOR: "Recent Games", "Streaks", "Matchups", "Last X games".
    - This table HAS 'game_date' and 'season_id'.
-   - This table DOES NOT have percentage columns. To get a percentage, you MUST calculate it: (SUM(fg3m)::float / NULLIF(SUM(fg3a), 0)).
+   - This table does NOT store shooting percentage columns. Select raw makes and attempts only (fgm, fga, fg3m, fg3a, ftm, fta). For FG%/3P%/FT% as stored values, use a season summary table instead.
    - CRITICAL: Use `season_id = '22025'` for current 2025-26 stats.
 
 GENERAL RULES:

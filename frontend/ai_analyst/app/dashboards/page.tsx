@@ -83,11 +83,10 @@ const EXAMPLE_CATEGORIES = [
   {
     label: "Scatter Plots",
     examples: [
-      "Scatter plot of points per game vs age in the 2021-22 playoffs",
       "Scatterplot of TS% vs PPG for 2023-24",
       "Show me a scatter of true shooting percentages in 2018-19",
       "Plot rebounds per game vs assists per game in 2022-23 playoffs",
-      "Scatter plot of total points vs ppg in the 2021-22 playoffs",
+      "Scatter plot of total points vs ppg in the 2021-22",
     ],
   },
 ]

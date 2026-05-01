@@ -18,7 +18,7 @@ import Scatter from "@/components/recharts/Scatter"
 interface AnalysisResult {
   success: boolean
   chartType: string
-  data: any[]
+  data: Record<string, unknown>[]
   config: {
     statKey?: string
     playerNames?: string[]
@@ -82,11 +82,10 @@ const EXAMPLE_CATEGORIES = [
   {
     label: "Scatter Plots",
     examples: [
-      "Scatter plot of points per game vs age in the 2021-22 playoffs",
       "Scatterplot of TS% vs PPG for 2023-24",
       "Show me a scatter of true shooting percentages in 2018-19",
       "Plot rebounds per game vs assists per game in 2022-23 playoffs",
-      "Scatter plot of total points vs ppg in the 2021-22 playoffs",
+      "Scatter plot of total points vs ppg in the 2021-22",
     ],
   },
 ]
@@ -126,9 +125,9 @@ export default function DashboardsPage() {
       }
 
       setResult(data)
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error(err)
-      setError(err.message || "Was not able to connect to server")
+      setError(err instanceof Error ? err.message : "Was not able to connect to server")
     } finally {
       setIsLoading(false)
     }
@@ -294,7 +293,7 @@ export default function DashboardsPage() {
                   playerName: result.config.playerNames?.[0] || "Player",
                   statDisplayName: result.config.statDisplayName || "Shot Chart",
                   timeFrame: result.config.timeFrame,
-                  mode: (result.config as any).mode || "volume",
+                  mode: result.config.mode || "volume",
                 }}
               />
             </div>

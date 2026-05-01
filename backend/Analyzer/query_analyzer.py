@@ -388,6 +388,13 @@ def _is_simple_top_scorers_question(question: str, domain: str) -> bool:
     return not any(marker in q for marker in complex_markers)
 
 
+def _is_team_or_standings_dataframe(df: pd.DataFrame) -> bool:
+    if df is None or df.empty:
+        return False
+    team_cols = {"TEAM_NAME", "TeamName", "TeamCity", "DiffPointsPG", "PointsPG", "OppPointsPG"}
+    return any(col in df.columns for col in team_cols)
+
+
 def _build_simple_top_scorers_prompts(question: str, rows_to_show: pd.DataFrame) -> tuple[str, str]:
     system_prompt = (
         "You are an NBA stats assistant. For simple leaderboard questions, keep the response short and plain.\n"
@@ -1667,7 +1674,11 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
         "rebounding": "Prioritize trb_pct and trb_per_game, then oreb_pct and dreb_pct. Discuss contested rebounds and positioning.",
     }
 
-    is_simple_top_scorers = _is_simple_top_scorers_question(question, domain)
+    is_team_or_standings = _is_team_or_standings_dataframe(df)
+    is_simple_top_scorers = (
+        _is_simple_top_scorers_question(question, domain)
+        and not is_team_or_standings
+    )
     is_single_player_trend = _is_single_player_season_trend_question(question, df)
     is_single_player_stats = _is_single_player_stats_question(question, df)
     is_games_played_q = _is_games_played_question(question, df)
@@ -1704,10 +1715,10 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
                 "2. Where they each have an edge (scoring, efficiency, playmaking, defense, etc.).\n"
                 "3. End with a clear 1-2 sentence VERDICT: who had the better season overall and why. "
                 "Be decisive — don't hedge with 'both were great'. Pick a winner and justify it."
-            )
+        )
         if is_game_log:
             system_prompt += "\n\nNote: Data comes from game-by-game logs. Focus on trends, streaks, consistency, or individual game performances."
-
+            
         user_prompt = (
             f"Question: {question}\n\n"
             f"Domain: {domain}\n"
@@ -1734,7 +1745,7 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
                 "2. Where they each have an edge (scoring, efficiency, playmaking, defense, etc.).\n"
                 "3. End with a clear 1-2 sentence VERDICT: who had the better season overall and why. "
                 "Be decisive — don't hedge with 'both were great'. Pick a winner and justify it."
-            )
+        )
         if is_game_log:
             system_prompt += "\n\nNote: Data comes from game-by-game logs. Focus your narrative on recent form, splits, streaks, or single-game anomalies."
 
@@ -1775,7 +1786,7 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
             max_completion_tokens=1600,
         )
         raw_response = response.choices[0].message.content.strip()
-
+        
         # RETRY: if the response is suspiciously short for a comparison
         # (under 150 chars when we have 2+ players), the model likely
         # ignored the comparison directive. Retry with higher temperature

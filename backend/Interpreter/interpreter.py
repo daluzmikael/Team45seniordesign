@@ -878,6 +878,70 @@ def _pick_available_advanced_table(
     return _advanced_table_name_for_window(best[0], best[1], is_playoffs)
 
 
+def _is_point_differential_request(user_input: str) -> bool:
+    q = _extract_current_question_text(user_input).lower()
+    return any(
+        term in q
+        for term in [
+            "point differential",
+            "point diff",
+            "points differential",
+            "points diff",
+            "scoring differential",
+            "score differential",
+            "diffpointspg",
+            "diff points",
+        ]
+    )
+
+
+def _standings_table_name_for_window(start: int, end: int) -> str:
+    yy = str(end)[-2:]
+    return f"nba_standings_season_{start}_{yy}_leaguestandingsv3"
+
+
+def _rewrite_point_differential_trend_sql(sql_query: str, user_input: str) -> str:
+    if not sql_query or not _is_point_differential_request(user_input):
+        return sql_query
+
+    span = _extract_requested_season_start_span(user_input)
+    if span is None:
+        return sql_query
+
+    start_year, end_year, is_playoffs = span
+    if is_playoffs:
+        return sql_query
+
+    # A bare "from 2010 to 2024" means seasons 2010-11 through 2024-25.
+    season_starts = range(start_year, end_year + 1)
+    legs = []
+    for start in season_starts:
+        end = start + 1
+        season_label = f"{start}-{str(end)[-2:]}"
+        table_name = _standings_table_name_for_window(start, end)
+        legs.append(
+            "SELECT "
+            f"{start} AS season_start, '{season_label}' AS season_label, "
+            '"TeamCity", "TeamName", "WINS", "LOSSES", "WinPCT", "PointsPG", "OppPointsPG", "DiffPointsPG" '
+            f"FROM {table_name}"
+        )
+
+    if not legs:
+        return sql_query
+
+    logger.info(
+        "rewriter:point_differential emitted %d standings UNION legs for requested range",
+        len(legs),
+    )
+    return (
+        "SELECT season_start, season_label, \"TeamCity\", \"TeamName\", \"WINS\", \"LOSSES\", "
+        "\"WinPCT\", \"PointsPG\", \"OppPointsPG\", \"DiffPointsPG\" "
+        f"FROM ({' UNION ALL '.join(legs)}) AS point_differential_trend "
+        "ORDER BY season_start ASC, NULLIF(\"DiffPointsPG\", '')::numeric DESC NULLS LAST "
+        "LIMIT 500"
+    )
+
+
 def _enforce_advanced_table_mapping(sql_query: str, user_input: str, schema_description: str = "") -> str:
     if not sql_query or not _is_advanced_metrics_request(user_input):
         return sql_query
@@ -1992,7 +2056,11 @@ RULE 8 — TEAM AND FRANCHISE QUERIES:
   → Use `team_advanced_season_YYYY_YY_regular_season_pergame` / `team_advanced_season_YYYY_YY_playoffs_pergame`
     for team offense, defense, net rating, pace, true shooting, eFG, rebounding rate, turnover rate, and team-level comparisons.
   → Use `nba_standings_season_YYYY_YY_leaguestandingsv3` for records, standings, seed, conference/division rank,
-    home/road record, last 10, streaks, and games-back questions.
+    home/road record, last 10, streaks, point differential, and games-back questions.
+  → "point differential" means standings column "DiffPointsPG" (points per game differential),
+    NOT team_advanced "NET_RATING". If a range is requested ("from 2010 to 2024"),
+    UNION ALL one `nba_standings_season_YYYY_YY_leaguestandingsv3` table per season and
+    include `season_start` / `season_label`; do NOT collapse to one year or LIMIT 1.
   → For "this season", "current season", or no year on team_advanced/nba_standings, use 2025_26 when available.
     Use 2024_25 only for "last season" or explicit 2024-25 wording.
   → Team advanced columns are UPPERCASE and must be double-quoted:
@@ -2542,6 +2610,21 @@ WHERE "TEAM_NAME" ILIKE '%Celtics%' OR "TEAM_NAME" ILIKE '%Lakers%'
 ORDER BY NULLIF("DEF_RATING", '')::numeric ASC NULLS LAST
 LIMIT 10;
 
+Q: "point differential from 2010 to 2024"
+→ RULE 8. Point differential is "DiffPointsPG" in standings, not "NET_RATING".
+   This is a multi-season range, so UNION every standings table from 2010-11 through 2024-25.
+SELECT season_start, season_label, "TeamCity", "TeamName", "WINS", "LOSSES", "WinPCT", "PointsPG", "OppPointsPG", "DiffPointsPG"
+FROM (
+  SELECT 2010 AS season_start, '2010-11' AS season_label, "TeamCity", "TeamName", "WINS", "LOSSES", "WinPCT", "PointsPG", "OppPointsPG", "DiffPointsPG"
+  FROM nba_standings_season_2010_11_leaguestandingsv3
+  UNION ALL
+  SELECT 2011 AS season_start, '2011-12' AS season_label, "TeamCity", "TeamName", "WINS", "LOSSES", "WinPCT", "PointsPG", "OppPointsPG", "DiffPointsPG"
+  FROM nba_standings_season_2011_12_leaguestandingsv3
+  -- continue one UNION ALL leg per requested season through 2024-25
+) AS point_differential_trend
+ORDER BY season_start ASC, NULLIF("DiffPointsPG", '')::numeric DESC NULLS LAST
+LIMIT 500;
+
 Q: "Who had the most drives per game in 2023?"
 → RULE 0 + RULE 11. "drives" → tracking_pt_drives. "in 2023" → 2023_24 season.
    "DRIVES" is already per-game in this table — DO NOT divide by GP.
@@ -2660,6 +2743,7 @@ Generate the SQL:"""
     sql_query = _rewrite_nth_season_comparison_sql(sql_query, user_input_param, conn)
     sql_query = _rewrite_implicit_head_to_head_to_career_sql(sql_query, user_input_param, conn)
     sql_query = _enforce_advanced_table_mapping(sql_query, user_input_param, schema_description)
+    sql_query = _rewrite_point_differential_trend_sql(sql_query, user_input_param)
     sql_query = _rewrite_career_aggregate_to_by_season(sql_query, user_input_param, conn)
     sql_query = _ensure_rebounding_leaderboard_columns(sql_query, user_input_param)
     sql_query = _ensure_assist_leaderboard_columns(sql_query, user_input_param)
@@ -2690,6 +2774,7 @@ Generate the SQL:"""
             sql_query = _rewrite_nth_season_comparison_sql(sql_query, user_input_param, conn)
             sql_query = _rewrite_implicit_head_to_head_to_career_sql(sql_query, user_input_param, conn)
             sql_query = _enforce_advanced_table_mapping(sql_query, user_input_param, schema_description)
+            sql_query = _rewrite_point_differential_trend_sql(sql_query, user_input_param)
             sql_query = _expand_player_name_filters_for_encoding(sql_query)
             sql_query = _ensure_profile_columns_in_sql(sql_query, user_input_param)
             sql_query = _ensure_season_columns_in_sql(sql_query)
@@ -2733,6 +2818,7 @@ Generate the SQL:"""
                 sql_query = _rewrite_nth_season_comparison_sql(sql_query, user_input_param, conn)
                 sql_query = _rewrite_implicit_head_to_head_to_career_sql(sql_query, user_input_param, conn)
                 sql_query = _enforce_advanced_table_mapping(sql_query, user_input_param, schema_description)
+                sql_query = _rewrite_point_differential_trend_sql(sql_query, user_input_param)
                 sql_query = _rewrite_career_aggregate_to_by_season(sql_query, user_input_param, conn)
                 sql_query = _ensure_rebounding_leaderboard_columns(sql_query, user_input_param)
                 sql_query = _ensure_assist_leaderboard_columns(sql_query, user_input_param)

@@ -1430,6 +1430,56 @@ def _ensure_assist_leaderboard_columns(sql_query: str, user_input: str) -> str:
     return q
 
 
+def _overfetch_all_players_leaderboard_sql(sql_query: str, user_input: str) -> str:
+    """
+    Season-summary tables can include multiple rows for traded players. If SQL
+    limits to exactly top N before the analyzer de-dupes player_name, the final
+    rendered leaderboard may show fewer than N rows. Fetch a little extra for
+    simple all_players leaderboards; the analyzer still displays requested N.
+    """
+    q = sql_query or ""
+    if not q:
+        return q
+
+    q_lower = q.lower()
+    current_q = _extract_current_question_text(user_input).lower()
+    if "all_players_regular_" not in q_lower and "all_players_playoffs_" not in q_lower:
+        return q
+    if not re.search(r"(?i)\border\s+by\b", q) or not re.search(r"(?i)\blimit\s+\d+\b", q):
+        return q
+    if re.search(r"(?i)\bplayer_name\s+ilike\b", q) or re.search(r"(?i)\bgroup\s+by\b|\bunion\b", q):
+        return q
+    if not any(
+        k in current_q
+        for k in [
+            "top",
+            "leader",
+            "leaders",
+            "lead the league",
+            "leading",
+            "best",
+            "highest",
+            "most",
+            "bottom",
+            "worst",
+            "lowest",
+        ]
+    ):
+        return q
+
+    def repl(match: re.Match) -> str:
+        try:
+            requested = int(match.group(1))
+        except Exception:
+            return match.group(0)
+        expanded = min(max(requested * 3, requested + 10), 150)
+        if expanded <= requested:
+            return match.group(0)
+        return f"LIMIT {expanded}"
+
+    return re.sub(r"(?i)\blimit\s+(\d+)\b", repl, q, count=1)
+
+
 def _ensure_all_players_broad_columns(sql_query: str, user_input: str) -> str:
     q = sql_query or ""
     q_lower = q.lower()
@@ -1444,7 +1494,9 @@ def _ensure_all_players_broad_columns(sql_query: str, user_input: str) -> str:
     # Never inject base-table columns into derived/subquery shapes like by_season.
     if " as by_season" in q_lower or re.search(r"(?is)\bfrom\s*\(", q):
         return q
-    if any(k in q_lower for k in [" sum(", " avg(", " count(", " group by ", " union all ", " order by ", " limit "]):
+    if re.search(r"(?i)\b(sum|avg|count)\s*\(", q) or re.search(
+        r"(?i)\b(group\s+by|union\s+all|order\s+by)\b", q
+    ):
         return q
 
     select_match = re.search(r"(?is)\bselect\b(?P<select_part>.*?)\bfrom\b", q)
@@ -1497,7 +1549,9 @@ def _ensure_profile_columns_in_sql(sql_query: str, user_input: str) -> str:
         return q
     if "player_name ilike" not in q_lower:
         return q
-    if any(k in q_lower for k in [" group by ", " union ", "sum(", " order by ", " limit "]):
+    if re.search(r"(?i)\bsum\s*\(", q) or re.search(
+        r"(?i)\b(group\s+by|union|order\s+by)\b", q
+    ):
         return q
 
     select_match = re.search(r"(?is)\bselect\b(?P<select_part>.*?)\bfrom\b", q)
@@ -1932,10 +1986,26 @@ RULE 7 — TOP PLAYERS / LEADERBOARD QUESTIONS:
   → ALWAYS ORDER BY the requested stat (e.g., ORDER BY pts_rank ASC NULLS LAST).
 
 RULE 8 — TEAM AND FRANCHISE QUERIES:
-  Trigger phrases: "top teams", "best NBA teams", "team winrate", "team standings"
-  → ALWAYS use `team_advanced_season_YYYY_YY_regular_season_pergame` or `nba_standings_season_YYYY_YY_leaguestandingsv3`
-  → Advanced table columns are UPPERCASE: "TEAM_ID", "TEAM_NAME", "W_PCT", "OFF_RATING", "DEF_RATING" (Wrap in double quotes).
-  → Standings columns are CamelCase: "TeamName", "WINS", "LOSSES".
+  Trigger phrases: "top teams", "best NBA teams", "team winrate", "team standings", "best offense",
+    "best defense", "net rating", "which team", "Warriors", "Lakers", "Celtics", franchise/team names.
+  → If the subject is a TEAM or FRANCHISE, do NOT query player tables.
+  → Use `team_advanced_season_YYYY_YY_regular_season_pergame` / `team_advanced_season_YYYY_YY_playoffs_pergame`
+    for team offense, defense, net rating, pace, true shooting, eFG, rebounding rate, turnover rate, and team-level comparisons.
+  → Use `nba_standings_season_YYYY_YY_leaguestandingsv3` for records, standings, seed, conference/division rank,
+    home/road record, last 10, streaks, and games-back questions.
+  → For "this season", "current season", or no year on team_advanced/nba_standings, use 2025_26 when available.
+    Use 2024_25 only for "last season" or explicit 2024-25 wording.
+  → Team advanced columns are UPPERCASE and must be double-quoted:
+    "TEAM_ID", "TEAM_NAME", "GP", "W", "L", "W_PCT", "OFF_RATING", "DEF_RATING",
+    "NET_RATING", "AST_PCT", "REB_PCT", "TM_TOV_PCT", "EFG_PCT", "TS_PCT", "PACE", "PIE".
+  → Standings columns are CamelCase/text and must be double-quoted:
+    "TeamCity", "TeamName", "Conference", "Division", "PlayoffRank", "WINS", "LOSSES",
+    "WinPCT", "Record", "HOME", "ROAD", "L10", "CurrentStreak", "PointsPG", "OppPointsPG", "DiffPointsPG".
+  → All team_advanced_* and nba_standings_* numeric columns are TEXT, so leaderboards and numeric filters require
+    NULLIF("COLUMN", '')::numeric casts in WHERE/ORDER BY.
+  → Team name matching:
+    - team_advanced_*: use "TEAM_NAME" ILIKE '%Warriors%' or '%Golden State Warriors%'.
+    - nba_standings_*: use "TeamName" ILIKE '%Warriors%' OR "TeamCity" ILIKE '%Golden State%'.
 
 RULE 9 — SHOT CHARTS, DISTANCE, AND PLAY-BY-PLAY (court_shots):
   Trigger phrases: "shot chart", "where does X shoot from", "average shot distance", "dunks", "layups", "step back"
@@ -1966,6 +2036,10 @@ RULE 11 — SPECIALTY STATS & TRACKING (STRICT 63-CHAR TABLE NAMES):
       Regular Season: `nba_hustle_season_YYYY_YY_season_type_regular_season_per_mo`
       Playoffs: `nba_hustle_season_YYYY_YY_season_type_playoffs_per_mode_per`
       Columns to use: "SCREEN_ASSISTS", "SCREEN_AST_PTS", "DEFLECTIONS", "CHARGES_DRAWN"
+      Availability in this database:
+        - Regular-season hustle data exists from 2015_16 through 2025_26 only.
+        - Playoff hustle data exists for 1998_99, 2004_05, and 2015_16 through 2024_25.
+        - If the requested hustle/deflections season is unavailable, do NOT invent a table.
       
   → Clutch ("clutch", "last 5 minutes"):
       Regular: `nba_clutch_season_YYYY_YY_season_type_regular_season_per_mo`
@@ -2443,6 +2517,31 @@ FROM (
 ) AS combined
 ORDER BY season_label, player_name;
 
+Q: "Which teams have the best net rating this season?"
+→ RULE 8. Team-level advanced metric. Use team_advanced 2025_26, not player tables.
+   Values are TEXT, so cast for sorting and sample filters.
+SELECT "TEAM_NAME", "GP", "W", "L", "W_PCT", "OFF_RATING", "DEF_RATING", "NET_RATING", "PACE"
+FROM team_advanced_season_2025_26_regular_season_pergame
+WHERE NULLIF("GP", '')::numeric >= 20
+ORDER BY NULLIF("NET_RATING", '')::numeric DESC NULLS LAST
+LIMIT 10;
+
+Q: "What seed are the Warriors this season?"
+→ RULE 8. Standings/seed question. Use nba_standings 2025_26 and match team city/name.
+SELECT "TeamCity", "TeamName", "Conference", "PlayoffRank", "WINS", "LOSSES", "WinPCT", "Record", "L10", "CurrentStreak"
+FROM nba_standings_season_2025_26_leaguestandingsv3
+WHERE "TeamName" ILIKE '%Warriors%' OR "TeamCity" ILIKE '%Golden State%'
+LIMIT 5;
+
+Q: "Compare the Celtics and Lakers defenses in 2024-25"
+→ RULE 8. Team-level defensive comparison. Use team_advanced 2024_25 and DEF_RATING.
+   Lower DEF_RATING is better.
+SELECT "TEAM_NAME", "GP", "W", "L", "W_PCT", "DEF_RATING", "NET_RATING", "DREB_PCT", "PACE"
+FROM team_advanced_season_2024_25_regular_season_pergame
+WHERE "TEAM_NAME" ILIKE '%Celtics%' OR "TEAM_NAME" ILIKE '%Lakers%'
+ORDER BY NULLIF("DEF_RATING", '')::numeric ASC NULLS LAST
+LIMIT 10;
+
 Q: "Who had the most drives per game in 2023?"
 → RULE 0 + RULE 11. "drives" → tracking_pt_drives. "in 2023" → 2023_24 season.
    "DRIVES" is already per-game in this table — DO NOT divide by GP.
@@ -2564,6 +2663,7 @@ Generate the SQL:"""
     sql_query = _rewrite_career_aggregate_to_by_season(sql_query, user_input_param, conn)
     sql_query = _ensure_rebounding_leaderboard_columns(sql_query, user_input_param)
     sql_query = _ensure_assist_leaderboard_columns(sql_query, user_input_param)
+    sql_query = _overfetch_all_players_leaderboard_sql(sql_query, user_input_param)
     sql_query = _ensure_all_players_broad_columns(sql_query, user_input_param)
     sql_query = _expand_player_name_filters_for_encoding(sql_query)
     sql_query = _ensure_profile_columns_in_sql(sql_query, user_input_param)
@@ -2636,6 +2736,7 @@ Generate the SQL:"""
                 sql_query = _rewrite_career_aggregate_to_by_season(sql_query, user_input_param, conn)
                 sql_query = _ensure_rebounding_leaderboard_columns(sql_query, user_input_param)
                 sql_query = _ensure_assist_leaderboard_columns(sql_query, user_input_param)
+                sql_query = _overfetch_all_players_leaderboard_sql(sql_query, user_input_param)
                 sql_query = _ensure_all_players_broad_columns(sql_query, user_input_param)
                 sql_query = _expand_player_name_filters_for_encoding(sql_query)
                 sql_query = _ensure_profile_columns_in_sql(sql_query, user_input_param)

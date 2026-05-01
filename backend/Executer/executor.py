@@ -41,7 +41,9 @@ def get_connection():
 _HEAVY_USE_PATTERNS = [
     r"all_players_regular_\d{4}_\d{4}$",
     r"all_players_playoffs_\d{4}_\d{4}$",
-    r"nba_advanced_season_\d{4}_\d{2}_season_type_(regular_season|playoffs)_per_mode_p",
+    r"nba_advanced_season_\d{4}_\d{2}_season_type_(regular_season_per|playoffs_per_mode_p)$",
+    r"team_advanced_season_\d{4}_\d{2}_(regular_season|playoffs)_pergame$",
+    r"nba_standings_season_\d{4}_\d{2}_leaguestandingsv3$",
     r"player_game_logs$",
     r"court_shots$",
 ]
@@ -52,9 +54,7 @@ _OTHER_FAMILY_PREFIXES = [
     "nba_clutch_season_",
     "nba_lineups_group_",       # nba_lineups_group_5_season_*
     "nba_schedule_",
-    "nba_standings_",
     "nba_player_tracking_pt_",  # catchshoot, drives, passing, defense, etc.
-    "team_advanced_season_",     # team-level advanced stats
 ]
 
 def _summarize_sql(sql: str, max_chars: int = 600) -> str:
@@ -87,7 +87,16 @@ def get_db_schema(conn):
     regular_tables  = sorted(t for t in heavy if re.match(r"all_players_regular_\d{4}_\d{4}$", t))
     playoffs_tables = sorted(t for t in heavy if re.match(r"all_players_playoffs_\d{4}_\d{4}$", t))
     advanced_tables = sorted(t for t in heavy if t.startswith("nba_advanced_season_"))
-    other_heavy     = [t for t in heavy if t not in regular_tables and t not in playoffs_tables and t not in advanced_tables]
+    team_advanced_tables = sorted(t for t in heavy if t.startswith("team_advanced_season_"))
+    standings_tables = sorted(t for t in heavy if t.startswith("nba_standings_season_"))
+    other_heavy     = [
+        t for t in heavy
+        if t not in regular_tables
+        and t not in playoffs_tables
+        and t not in advanced_tables
+        and t not in team_advanced_tables
+        and t not in standings_tables
+    ]
 
     schema_parts = []
 
@@ -127,9 +136,27 @@ def get_db_schema(conn):
     if advanced_tables:
         schema_parts.append(
             "=== Advanced Season Tables ===\n"
-            "Pattern: nba_advanced_season_YYYY_YY_season_type_TYPE_per_mode_p\n"
+            "Pattern: nba_advanced_season_YYYY_YY_season_type_regular_season_per and nba_advanced_season_YYYY_YY_season_type_playoffs_per_mode_p\n"
             f"Columns: {_columns_for(advanced_tables[-1])}\n"
             f"Available ({len(advanced_tables)}): {', '.join(advanced_tables)}\n"
+        )
+
+    if team_advanced_tables:
+        schema_parts.append(
+            "=== Team Advanced Tables ===\n"
+            "Pattern: team_advanced_season_YYYY_YY_regular_season_pergame and team_advanced_season_YYYY_YY_playoffs_pergame\n"
+            "Use for team offense, defense, net rating, pace, shooting efficiency, rebounding rate, turnover rate, and team-level advanced comparisons.\n"
+            f"Columns: {_columns_for(team_advanced_tables[-1])}\n"
+            f"Available ({len(team_advanced_tables)}): {', '.join(team_advanced_tables)}\n"
+        )
+
+    if standings_tables:
+        schema_parts.append(
+            "=== Team Standings Tables ===\n"
+            "Pattern: nba_standings_season_YYYY_YY_leaguestandingsv3\n"
+            "Use for team records, seeds, conference/division rank, home/road records, last 10, streaks, and standings context.\n"
+            f"Columns: {_columns_for(standings_tables[-1])}\n"
+            f"Available ({len(standings_tables)}): {', '.join(standings_tables)}\n"
         )
 
     for t in other_heavy:

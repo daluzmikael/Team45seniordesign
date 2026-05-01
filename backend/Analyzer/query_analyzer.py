@@ -390,11 +390,11 @@ def _is_simple_top_scorers_question(question: str, domain: str) -> bool:
 
 def _build_simple_top_scorers_prompts(question: str, rows_to_show: pd.DataFrame) -> tuple[str, str]:
     system_prompt = (
-        "You are an NBA stats assistant. For simple top-scorer questions, keep the response short and plain.\n"
+        "You are an NBA stats assistant. For simple leaderboard questions, keep the response short and plain.\n"
         "Output format must be exactly:\n"
         "1) One short lead sentence in plain English, like: "
         "\"[Player] led the league at [PPG] PPG on [FG%] FG.\"\n"
-        "2) A compact list of exactly the top 5 scorers from the provided data, each line in this exact style: "
+        "2) A compact list with exactly the number of rows requested by the user, each line in this exact style: "
         "Name, TEAM | X ppg | Y% fg | Z% 3p | N games\n"
         "3) One final follow-up line asking if the user wants deeper scoring breakdowns, such as: "
         "\"Want me to break down each player's scoring profile further?\"\n\n"
@@ -1261,6 +1261,7 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
     working = df.copy()
     cols = set(working.columns)
     q = (question or "").lower()
+    requested_n = _extract_requested_top_n(question, default_n=5, max_n=50)
 
     metric_configs = [
         {
@@ -1362,6 +1363,7 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
     elif metric_col in cols:
         working = working.sort_values(by=[metric_col], ascending=[False], na_position="last")
 
+    before_dedup = working.copy()
     if "player_name" in cols:
         working = working.dropna(subset=["player_name"])
         working = working.drop_duplicates(subset=["player_name"], keep="first")
@@ -1381,7 +1383,12 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
     if is_worst and metric_col in cols:
         working = working.sort_values(by=[metric_col], ascending=[True], na_position="last")
 
-    requested_n = _extract_requested_top_n(question, default_n=5, max_n=50)
+    # If the query already returned the requested number of rows but de-duping
+    # collapsed it, do not silently show fewer rows. This can happen when a
+    # season table contains multiple team rows for the same player.
+    if len(working) < requested_n and len(before_dedup) >= requested_n:
+        working = before_dedup
+
     top = working.head(requested_n)
     if top.empty:
         return "\nNo leaderboard data was available for this question."
@@ -1420,6 +1427,7 @@ def _format_simple_top_scorers_response(df: pd.DataFrame, question: str) -> str:
         lines.append(selected["row_builder"](idx, row, name, team))
 
     lines.append("")
+    lines.append(f"Showing {len(top)} of {requested_n} requested rows.")
     lines.append("Want me to break down each player's profile further?")
     return "\n" + "\n".join(lines)
 
@@ -1605,14 +1613,27 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
         unique_player_count = df["player_name"].dropna().astype(str).str.strip().nunique() if "player_name" in df.columns else 0
     except Exception:
         unique_player_count = 0
+
+    team_entity_col = next(
+        (c for c in ["TEAM_NAME", "TeamName", "team_name", "team_abbreviation"] if c in df.columns),
+        None,
+    )
+    try:
+        unique_team_count = df[team_entity_col].dropna().astype(str).str.strip().nunique() if team_entity_col else 0
+    except Exception:
+        unique_team_count = 0
+    unique_entity_count = max(unique_player_count, unique_team_count)
     # Drill-down explicitly disables comparison mode regardless of df shape.
     is_drilldown = drilldown_match is not None
     is_comparison = (
         not is_drilldown
         and len(df) <= 10
-        and (comparison_keywords or unique_player_count >= 2)
-        and unique_player_count >= 2
+        and (comparison_keywords or unique_entity_count >= 2)
+        and unique_entity_count >= 2
     )
+    comparison_entity_label = "TEAM" if unique_team_count >= 2 and unique_player_count == 0 else "PLAYER"
+    comparison_entity_noun = "teams" if comparison_entity_label == "TEAM" else "players"
+    comparison_entity_singular = "team" if comparison_entity_label == "TEAM" else "player"
     rows_to_show = df if is_comparison else df.head(20)
 
     # Apply user-friendly column renames before showing data to GPT or the user.
@@ -1678,8 +1699,8 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
         )
         if is_comparison:
             system_prompt += (
-                "\n\nThis is a PLAYER COMPARISON. Structure your response as:\n"
-                "1. A paragraph on each player's performance, referencing specific stats.\n"
+                f"\n\nThis is a {comparison_entity_label} COMPARISON. Structure your response as:\n"
+                f"1. A paragraph on each {comparison_entity_singular}'s performance, referencing specific stats.\n"
                 "2. Where they each have an edge (scoring, efficiency, playmaking, defense, etc.).\n"
                 "3. End with a clear 1-2 sentence VERDICT: who had the better season overall and why. "
                 "Be decisive — don't hedge with 'both were great'. Pick a winner and justify it."
@@ -1708,8 +1729,8 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
         )
         if is_comparison:
             system_prompt += (
-                "\n\nThis is a PLAYER COMPARISON. Structure your response as:\n"
-                "1. A paragraph on each player's performance, referencing specific stats.\n"
+                f"\n\nThis is a {comparison_entity_label} COMPARISON. Structure your response as:\n"
+                f"1. A paragraph on each {comparison_entity_singular}'s performance, referencing specific stats.\n"
                 "2. Where they each have an edge (scoring, efficiency, playmaking, defense, etc.).\n"
                 "3. End with a clear 1-2 sentence VERDICT: who had the better season overall and why. "
                 "Be decisive — don't hedge with 'both were great'. Pick a winner and justify it."
@@ -1727,15 +1748,20 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
     # the model can't ignore the system-level instruction.
     if is_comparison:
         try:
-            unique_players = df["player_name"].dropna().astype(str).str.strip().unique().tolist()
+            if "player_name" in df.columns:
+                unique_players = df["player_name"].dropna().astype(str).str.strip().unique().tolist()
+            elif team_entity_col:
+                unique_players = df[team_entity_col].dropna().astype(str).str.strip().unique().tolist()
+            else:
+                unique_players = []
         except Exception:
             unique_players = []
         if len(unique_players) >= 2:
             names_str = " and ".join(unique_players[:4])
             user_prompt += (
                 f"\n\nCRITICAL: This is a HEAD-TO-HEAD comparison between {names_str}. "
-                f"You MUST discuss BOTH players in detail — do NOT only mention one. "
-                f"Cover each player's stats, where each has an edge, and end with a verdict."
+                f"You MUST discuss BOTH {comparison_entity_noun} in detail — do NOT only mention one. "
+                f"Cover each {comparison_entity_singular}'s stats, where each has an edge, and end with a verdict."
             )
 
     try:
@@ -1756,10 +1782,10 @@ def analyze_question_with_data(question: str, df: pd.DataFrame) -> str:
         # and an even more forceful prompt.
         if is_comparison and len(raw_response) < 150:
             retry_prompt = (
-                f"Your previous response was too short and only mentioned one player. "
-                f"The user asked to COMPARE multiple players. Here is the data again:\n\n"
+                f"Your previous response was too short and only mentioned one {comparison_entity_singular}. "
+                f"The user asked to COMPARE multiple {comparison_entity_noun}. Here is the data again:\n\n"
                 f"{df_summary}\n\n"
-                f"Write a FULL comparison covering EACH player's stats, their relative "
+                f"Write a FULL comparison covering EACH {comparison_entity_singular}'s stats, their relative "
                 f"strengths, and a clear verdict on who performed better. "
                 f"Minimum 4 sentences."
             )

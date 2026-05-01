@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useState, useCallback } from "react"
-import { useRouter, useParams } from "next/navigation"
+import { useRouter, useParams, usePathname } from "next/navigation"
 import {
   MessageSquarePlus,
   Search,
@@ -26,7 +26,6 @@ import {
   SidebarMenuAction,
   SidebarMenuButton,
   SidebarMenuItem,
-  SidebarSeparator,
 } from "@/components/ui/sidebar"
 import { Button } from "@/components/ui/button"
 import {
@@ -74,8 +73,10 @@ const DATE_ORDER = ["Today", "Yesterday", "Previous 7 Days", "Older"]
 export function AppSidebar() {
   const { user, logout } = useAuth()
   const router = useRouter()
+  const pathname = usePathname()
   const params = useParams<{ id?: string }>()
   const activeId = params?.id
+  const isDashboardTab = pathname?.startsWith("/dashboards")
 
   const [conversations, setConversations] = useState<ConversationMeta[]>([])
   const [loadingHistory, setLoadingHistory] = useState(false)
@@ -138,9 +139,23 @@ export function AppSidebar() {
     return () => window.removeEventListener("conversation-updated", handler)
   }, [loadConversations])
 
-  // start a new chat with empty history
-  const handleNewChat = () => {
+  const handleAnalystTab = () => {
+    window.dispatchEvent(new Event("analyst-new-chat"))
     router.push("/")
+  }
+
+  const handleDashboardsTab = () => {
+    window.dispatchEvent(new Event("dashboard-new-chat"))
+    router.push("/dashboards")
+  }
+
+  // start a new chat with empty history for the current section
+  const handleNewChat = () => {
+    if (isDashboardTab) {
+      handleDashboardsTab()
+      return
+    }
+    handleAnalystTab()
   }
 
   // delete conversation (for anyone who looks at this, its just frontend for now, need to add delete endpoint for backend eventually firebase)
@@ -166,7 +181,6 @@ export function AppSidebar() {
   const grouped = groupByDate(conversations)
   const tabClass =
     "border-0 bg-red-500 text-zinc-100 hover:bg-red-400 font-medium data-[active=true]:bg-red-500 data-[active=true]:text-zinc-100 data-[active=true]:hover:bg-red-400"
-  const activeTabClass = "bg-red-500 text-zinc-100"
   const searchClass =
     "border-0 bg-[var(--surface-matte-raised)] text-zinc-900 hover:bg-[var(--surface-matte-hover)] dark:bg-[var(--surface-matte-raised)] dark:text-zinc-100 dark:hover:bg-[var(--surface-matte-hover)]"
   const savedChatClass =
@@ -203,19 +217,23 @@ export function AppSidebar() {
           <SidebarGroupContent>
             <SidebarMenu>
               <SidebarMenuItem>
-                <SidebarMenuButton asChild className={tabClass}>
-                  <Link href="/dashboards">
-                    <LayoutDashboard className="h-4 w-4" />
-                    <span>Dashboards</span>
-                  </Link>
+                <SidebarMenuButton
+                  className={tabClass}
+                  isActive={isDashboardTab}
+                  onClick={handleDashboardsTab}
+                >
+                  <LayoutDashboard className="h-4 w-4" />
+                  <span>Dashboards</span>
                 </SidebarMenuButton>
               </SidebarMenuItem>
               <SidebarMenuItem>
-                <SidebarMenuButton asChild className={tabClass}>
-                  <Link href="/">
-                    <MessageCircle className="h-4 w-4" />
-                    <span>Analyst</span>
-                  </Link>
+                <SidebarMenuButton
+                  className={tabClass}
+                  isActive={!isDashboardTab}
+                  onClick={handleAnalystTab}
+                >
+                  <MessageCircle className="h-4 w-4" />
+                  <span>Analyst</span>
                 </SidebarMenuButton>
               </SidebarMenuItem>
             </SidebarMenu>

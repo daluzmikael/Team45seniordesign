@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { useRouter } from "next/navigation"
 import { v4 as uuidv4 } from "uuid"
 import { Button } from "@/components/ui/button"
@@ -10,6 +10,12 @@ import { Send } from "lucide-react"
 export default function Home() {
   const router = useRouter()
   const [message, setMessage] = useState("")
+
+  useEffect(() => {
+    const resetHome = () => setMessage("")
+    window.addEventListener("analyst-new-chat", resetHome)
+    return () => window.removeEventListener("analyst-new-chat", resetHome)
+  }, [])
 
   const startChat = (question?: string) => {
     const text = (question ?? message).trim()

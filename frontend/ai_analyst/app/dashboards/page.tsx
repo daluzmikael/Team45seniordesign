@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { Search, Loader2, AlertCircle, ChevronDown } from "lucide-react"
 import { Input } from "@/components/ui/input"
 import { Button } from "@/components/ui/button"
@@ -18,7 +18,7 @@ import Scatter from "@/components/recharts/Scatter"
 interface AnalysisResult {
   success: boolean
   chartType: string
-  data: any[]
+  data: Record<string, unknown>[]
   config: {
     statKey?: string
     playerNames?: string[]
@@ -98,6 +98,19 @@ export default function DashboardsPage() {
   const [error, setError] = useState<string | null>(null)
   const [expandedCategory, setExpandedCategory] = useState<string | null>(null)
 
+  const resetDashboard = () => {
+    setSearchQuery("")
+    setIsLoading(false)
+    setResult(null)
+    setError(null)
+    setExpandedCategory(null)
+  }
+
+  useEffect(() => {
+    window.addEventListener("dashboard-new-chat", resetDashboard)
+    return () => window.removeEventListener("dashboard-new-chat", resetDashboard)
+  }, [])
+
   const handleSearch = async () => {
     if (!searchQuery.trim()) return
 
@@ -126,9 +139,9 @@ export default function DashboardsPage() {
       }
 
       setResult(data)
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error(err)
-      setError(err.message || "Was not able to connect to server")
+      setError(err instanceof Error ? err.message : "Was not able to connect to server")
     } finally {
       setIsLoading(false)
     }
@@ -294,7 +307,7 @@ export default function DashboardsPage() {
                   playerName: result.config.playerNames?.[0] || "Player",
                   statDisplayName: result.config.statDisplayName || "Shot Chart",
                   timeFrame: result.config.timeFrame,
-                  mode: (result.config as any).mode || "volume",
+                  mode: result.config.mode || "volume",
                 }}
               />
             </div>

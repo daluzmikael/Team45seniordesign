@@ -61,17 +61,58 @@ function getColor(value: number, mode: string): string {
     return `rgb(${r},${g},${b})`
   }
   if (mode === "hotspots") {
-    // Pure green scale for best zones
-    const r = Math.round(15 + value * 60)
-    const g = Math.round(60 + value * 195)
-    const b = Math.round(40 + value * 40)
+    // Muted/olive green → medium green → bright vivid green.
+    // value=0 is the lowest FG% in the qualifying set (still a "good" zone),
+    // value=1 is the highest (elite zone). Three stops give clear visual spread.
+    if (value < 0.33) {
+      const t = value / 0.33
+      // Olive/muted (80,110,60) → medium green (40,160,60)
+      const r = Math.round(80 - t * 40)
+      const g = Math.round(110 + t * 50)
+      const b = Math.round(60 + t * 0)
+      return `rgb(${r},${g},${b})`
+    }
+    if (value < 0.66) {
+      const t = (value - 0.33) / 0.33
+      // Medium green (40,160,60) → bright green (20,210,60)
+      const r = Math.round(40 - t * 20)
+      const g = Math.round(160 + t * 50)
+      const b = Math.round(60)
+      return `rgb(${r},${g},${b})`
+    }
+    const t = (value - 0.66) / 0.34
+    // Bright green (20,210,60) → vivid neon green (10,240,80)
+    const r = Math.round(20 - t * 10)
+    const g = Math.round(210 + t * 30)
+    const b = Math.round(60 + t * 20)
     return `rgb(${r},${g},${b})`
   }
   if (mode === "coldspots") {
-    // Pure red scale for worst zones
-    const r = Math.round(100 + value * 155)
-    const g = Math.round(20 + value * 25)
-    const b = Math.round(25 + value * 15)
+    // Bright vivid red → medium red → dull/dark red.
+    // value=0 is WORST FG% (rendered as biggest hex by the size logic below),
+    // value=1 is least-bad cold zone. Colors are: worst=brightest red, 
+    // least-bad=dullest red — so the dangerous zones pop visually.
+    if (value < 0.33) {
+      const t = value / 0.33
+      // Vivid red (230,30,30) → medium red (190,50,40)
+      const r = Math.round(230 - t * 40)
+      const g = Math.round(30 + t * 20)
+      const b = Math.round(30 + t * 10)
+      return `rgb(${r},${g},${b})`
+    }
+    if (value < 0.66) {
+      const t = (value - 0.33) / 0.33
+      // Medium red (190,50,40) → dull red (155,65,55)
+      const r = Math.round(190 - t * 35)
+      const g = Math.round(50 + t * 15)
+      const b = Math.round(40 + t * 15)
+      return `rgb(${r},${g},${b})`
+    }
+    const t = (value - 0.66) / 0.34
+    // Dull red (155,65,55) → dark/muted red (120,75,65)
+    const r = Math.round(155 - t * 35)
+    const g = Math.round(65 + t * 10)
+    const b = Math.round(55 + t * 10)
     return `rgb(${r},${g},${b})`
   }
   // Volume: indigo → purple → magenta → orange → yellow
@@ -256,12 +297,12 @@ export default function ShotChart({ data, config }: ShotChartProps) {
   const legendColors = [0, 0.25, 0.5, 0.75, 1].map(v => getColor(v, mode))
   const legendLabelLeft = mode === "volume" ? "Few"
     : mode === "accuracy" ? "Cold"
-    : mode === "coldspots" ? "Bad"
-    : "Low"
+    : mode === "coldspots" ? "Worst"
+    : "Good"
   const legendLabelRight = mode === "volume" ? "Many"
     : mode === "accuracy" ? "Hot"
-    : mode === "coldspots" ? "Worse"
-    : "High"
+    : mode === "coldspots" ? "Bad"
+    : "Best"
 
   const courtBg = isDark ? "#000000" : "#f5f5f0"
   const legendTextColor = isDark ? "rgba(255,255,255,0.45)" : "rgba(0,0,0,0.55)"
@@ -304,10 +345,26 @@ export default function ShotChart({ data, config }: ShotChartProps) {
               colorVal = Math.min(1, Math.max(0, pct / 0.9)) // 0% → 0, 45% → 0.5, 90%+ → 1
               // Size by volume so you can still see where they shoot most
               size = HEX_RADIUS * (0.5 + 0.5 * Math.min(1, bin.total / Math.max(maxVal * 0.3, 1)))
+            } else if (mode === "hotspots") {
+              // Color AND size by FG%. Higher FG% = bigger + brighter green.
+              // Normalize within the qualifying set's min/max for proper spread.
+              const pct = (bin as any).pct ?? 0
+              const minPct = Math.min(...bins.map(b => (b as any).pct ?? 0))
+              const maxPct = Math.max(...bins.map(b => (b as any).pct ?? 0))
+              const range = maxPct - minPct || 0.01
+              colorVal = (pct - minPct) / range  // 0 = worst hotspot, 1 = best hotspot
+              // Better FG% = bigger hex (39/42 shows larger than 39/60)
+              size = HEX_RADIUS * (0.45 + 0.55 * colorVal)
             } else {
-              // hotspots / coldspots — uniform size, color by FG%
-              colorVal = (bin as any).pct ?? 0
-              size = HEX_RADIUS * 0.9
+              // Coldspots: color AND size by FG%. LOWER FG% = bigger + brighter red.
+              const pct = (bin as any).pct ?? 0
+              const minPct = Math.min(...bins.map(b => (b as any).pct ?? 0))
+              const maxPct = Math.max(...bins.map(b => (b as any).pct ?? 0))
+              const range = maxPct - minPct || 0.01
+              const normalized = (pct - minPct) / range  // 0 = worst FG%, 1 = least-bad
+              colorVal = normalized  // getColor maps 0→brightest red, 1→dullest red
+              // Invert size: worst FG% (normalized=0) gets the biggest hex
+              size = HEX_RADIUS * (0.45 + 0.55 * (1 - normalized))
             }
 
             return (

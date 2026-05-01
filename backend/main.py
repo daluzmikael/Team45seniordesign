@@ -9,7 +9,7 @@ logging.getLogger().setLevel(
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Set
 from DashboardBackend.dashboardInterpreter import interpret_question
 from Analyzer.query_analyzer import analyze_question_with_data
 from auth import (
@@ -127,14 +127,86 @@ def _is_affirmative_followup(question: str) -> bool:
 
 
 _COMPARISON_FOLLOWUP_MARKERS = (
-    "better", "worse", "more", "less", "compare", "vs ", " vs.",
+    "better", "worse", "compare", "vs ", " vs.",
     "between them", "of the two", "of those two",
-    "who was", "who is", "who's", " or ", "as well as",
+    "who was better", "who is better", "who's better",
+    " or ", "as well as",
+    # Comparative phrasing requires "than" — bare "more" / "less" matches
+    # too aggressively (e.g. "tell me more about X" is a drill-down, not
+    # a comparison).
+    "more than", "less than", "greater than",
 )
 
 def _looks_like_comparison_followup(question: str) -> bool:
-    q = " " + (question or "").strip().lower() + " "
+    raw = (question or "").strip().lower()
+    # Strip a leading discourse "or " — when "Or what about KD?" comes after a
+    # prior turn, that's a drill-down on KD, not a comparison.
+    if raw.startswith("or "):
+        raw = raw[3:].strip()
+    q = " " + raw + " "
     return any(m in q for m in _COMPARISON_FOLLOWUP_MARKERS)
+
+
+# Phrases that signal the user wants a deeper look at a SPECIFIC entity from
+# the prior turn. When combined with a named player in the question, this lets
+# us scope the response to that one player.
+_DRILLDOWN_MARKERS = (
+    "more in-depth", "more in depth", "more detail", "more details",
+    "deeper", "deep dive", "deep-dive", "drill down", "drill-down",
+    "tell me more", "tell me about",
+    "breakdown of", "break down",
+    "more on", "more about", "expand on", "elaborate on",
+    "what about", "how about",
+    "focus on", "just ",
+)
+
+def _looks_like_single_player_drilldown(question: str) -> bool:
+    """True when the question has a 'tell me more / drill down' shape.
+    Used to scope a follow-up to one named player (not a comparison)."""
+    raw = (question or "").strip().lower()
+    if raw.startswith("or "):
+        raw = raw[3:].strip()
+    q = " " + raw + " "
+    if any(m in q for m in _COMPARISON_FOLLOWUP_MARKERS):
+        return False
+    return any(m in q for m in _DRILLDOWN_MARKERS)
+
+
+# Match 1-3 word capitalized names. Allows internal uppercase (LeBron, McGee).
+# Trailing 's (possessive) is stripped before matching. Sentence-start filter
+# keeps common question words from leaking through.
+_QUESTION_NAME_RE = re.compile(r"\b([A-Z][a-zA-Z]{2,}(?:\s+[A-Z][a-zA-Z\.\-']*){0,2})\b")
+
+def _extract_named_players_from_question(question: str) -> List[str]:
+    """Pull capitalized 1-3 word names from the user's question.
+    Conservative — drops obvious section-header / stat-phrase / common-word
+    false positives via _NAME_STOPWORDS and a sentence-start filter."""
+    if not question:
+        return []
+    found: List[str] = []
+    seen: Set[str] = set()
+    # Strip possessive 's so "Curry's" → "Curry"
+    cleaned = re.sub(r"['\u2019]s\b", "", question)
+    # Skip common sentence-start capitalized words that look like names
+    sentence_start_blocklist = {
+        "what", "who", "where", "when", "why", "how", "show", "give",
+        "tell", "compare", "find", "list", "rank", "between", "statistically",
+        "analyze", "break", "more", "yes", "yeah", "ok", "sure",
+        "deeper", "deep", "expand", "elaborate", "focus", "just",
+        "describe", "explain", "summarize", "look", "looking",
+    }
+    for cand in _QUESTION_NAME_RE.findall(cleaned):
+        key = cand.lower()
+        first_word = key.split()[0] if key else ""
+        if first_word in sentence_start_blocklist:
+            continue
+        if any(stop in key for stop in _NAME_STOPWORDS):
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(cand)
+    return found
 
 
 # Stop words to filter out of name candidates pulled from prior assistant text.
@@ -143,18 +215,6 @@ _NAME_STOPWORDS = {
     "free throw", "double double", "triple double", "double-double",
     "triple-double", "plus minus", "plus-minus", "western conference",
     "eastern conference", "all star", "all-star",
-    # Section headers from the analyzer's profile/trend formatters.
-    # These look like Capitalized Two-Word names but aren't players.
-    "games played", "ball security", "season stats", "career stats",
-    "shooting efficiency", "scoring efficiency", "shot chart", "shot selection",
-    "skill profile", "season review", "trend analysis", "stat value",
-    "points per", "assists per", "rebounds per", "steals per", "blocks per",
-    "field goals", "three point", "free throws", "true shooting",
-    "overall impact", "net rating", "offensive rating", "defensive rating",
-    "win shares", "usage rate",
-    # Common NBA terms that regex captures as names
-    "most valuable", "season high", "career high",
-    "total points", "total rebounds", "total assists",
 }
 
 _NAME_CANDIDATE_RE = re.compile(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z\.\-']+){1,2})\b")
@@ -238,6 +298,7 @@ def _should_apply_history_context(question: str) -> bool:
         "which one",
         "who is better",
         "who's better",
+        "who was better",
         "yes",
         "yeah",
         "yep",
@@ -245,6 +306,38 @@ def _should_apply_history_context(question: str) -> bool:
         "ok",
         "okay",
         "sure",
+        # Drill-down phrasings — user is asking for more detail on something
+        # established earlier in the conversation.
+        "more in-depth",
+        "more in depth",
+        "more detail",
+        "tell me more",
+        "tell me about",
+        "breakdown of",
+        "break down",
+        "more on",
+        "more about",
+        "expand on",
+        "elaborate",
+        "deeper",
+        "deep dive",
+        "drill down",
+        "focus on",
+        # Single-pronoun follow-ups — implicitly reference the prior subject.
+        "how was he",
+        "how is he",
+        "how was she",
+        "how is she",
+        "was he",
+        "was she",
+        "is he",
+        "is she",
+        "did he",
+        "did she",
+        "does he",
+        "does she",
+        " he ",
+        " she ",
     ]
     if any(marker in q for marker in followup_markers):
         return True
@@ -327,6 +420,27 @@ async def analysis_endpoint(
                     # narrative covers all parties, not just the named one.
                     request.question = (
                         f"{request.question} (continuing comparison with {names_clause})"
+                    )
+
+            # NEW: single-player drill-down. If the follow-up explicitly names
+            # ONE player (and it's not comparison-shaped), constrain everything
+            # to that player so we don't accidentally include others from prior
+            # turns. This prevents responses like "Give a breakdown of Prigioni"
+            # from also discussing Plumlee just because he was in the prior turn.
+            elif _looks_like_single_player_drilldown(request.question):
+                named = _extract_named_players_from_question(request.question)
+                if len(named) == 1:
+                    only_player = named[0]
+                    effective_question += (
+                        f"\n\nFollow-up constraint: this drill-down is about {only_player} ONLY. "
+                        f"Filter SQL to player_name ILIKE '%{only_player}%' and do NOT include "
+                        f"any other players from the prior conversation. The narrative must focus "
+                        f"exclusively on {only_player}."
+                    )
+                    # Also tag the question the analyzer sees so it knows this
+                    # is a single-player profile, not a comparison.
+                    request.question = (
+                        f"{request.question} (single-player drill-down: {only_player})"
                     )
 
             history_context_applied = True

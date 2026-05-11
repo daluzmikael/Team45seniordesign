@@ -71,7 +71,7 @@ Team45seniordesign/
 
 ## Requirements
 
-You need these installed locally:
+You need these installed locally or in venv:
 
 - Python 3.13 recommended
 - Node.js 20 recommended

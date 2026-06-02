@@ -29,10 +29,10 @@ def get_connection():
     if not password:
         raise RuntimeError("POSTGRES_PASSWORD is not set in environment or .env")
     return psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "nba-sdp-project.cs1c0smw8vqa.us-east-1.rds.amazonaws.com"),
+        host=os.environ["POSTGRES_HOST"],
         port=int(os.getenv("POSTGRES_PORT", "5432")),
-        dbname=os.getenv("POSTGRES_DB", "NBA-STATS"),
-        user=os.getenv("POSTGRES_USER", "VonLindenthal"),
+        dbname=os.environ["POSTGRES_DB"],
+        user=os.environ["POSTGRES_USER"],
         password=password,
         sslmode=os.getenv("POSTGRES_SSLMODE", "require"),
     )

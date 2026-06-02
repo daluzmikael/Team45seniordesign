@@ -1,8 +1,8 @@
 import logging
 import os
 import json
-import psycopg2
 from psycopg2.extras import RealDictCursor
+from Executer.executor import get_connection
 from openai import OpenAI
 from typing import Dict, List, Any, Tuple, Optional
 from dotenv import load_dotenv
@@ -18,16 +18,6 @@ else:
     logger.warning("OPENAI_API_KEY is not set")
 client = OpenAI(api_key=api_key_env,
                 base_url="https://us.api.openai.com/v1")
-
-# AWS postgres database info
-DB_CONFIG = {
-    "host": "nba-sdp-project.cs1c0smw8vqa.us-east-1.rds.amazonaws.com",
-    "port": 5432,
-    "dbname": "postgres",
-    "user": "VonLindenthal",
-    "password": "Vlindenthal1!",
-    "sslmode": "require",
-}
 
 # Database schema info for GPT
 DATABASE_SCHEMA = """
@@ -1239,7 +1229,7 @@ def interpret_question(user_question: str) -> Dict[str, Any]:
         print(f"Chart Type: {chart_type}")
         print(f"Generated SQL: {sql_query}")
 
-        conn = psycopg2.connect(**DB_CONFIG)
+        conn = get_connection()
         with conn.cursor(cursor_factory=RealDictCursor) as cursor:
             cursor.execute(sql_query)
             raw_data = cursor.fetchall()

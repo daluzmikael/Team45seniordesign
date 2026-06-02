@@ -18,16 +18,14 @@ _SCHEMA_TTL_SECONDS = 600
 # this import, or uvicorn). Avoid basicConfig here so we do not steal first configuration
 # and hide DEBUG lines in the interpreter.
 logger = logging.getLogger(__name__)
-# 2. Connect to PostgreSQL (AWS RDS)
 def get_connection():
-    """Get a fresh database connection"""
     return psycopg2.connect(
-        host="nba-sdp-project.cs1c0smw8vqa.us-east-1.rds.amazonaws.com",
-        port=5432,
-        dbname="postgres",
-        user="VonLindenthal",
-        password="Vlindenthal1!",
-        sslmode="require"
+        host=os.environ["POSTGRES_HOST"],
+        port=int(os.getenv("POSTGRES_PORT", "5432")),
+        dbname=os.environ["POSTGRES_DB"],
+        user=os.environ["POSTGRES_USER"],
+        password=os.environ["POSTGRES_PASSWORD"],
+        sslmode=os.getenv("POSTGRES_SSLMODE", "require"),
     )
 
 

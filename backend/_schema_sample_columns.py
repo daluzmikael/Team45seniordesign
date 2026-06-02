@@ -11,10 +11,10 @@ from dotenv import load_dotenv
 def main() -> None:
     load_dotenv(Path(__file__).resolve().parent / ".env")
     conn = psycopg2.connect(
-        host=os.getenv("POSTGRES_HOST", "nba-sdp-project.cs1c0smw8vqa.us-east-1.rds.amazonaws.com"),
+        host=os.environ["POSTGRES_HOST"],
         port=int(os.getenv("POSTGRES_PORT", "5432")),
-        dbname=os.getenv("POSTGRES_DB", "NBA-STATS"),
-        user=os.getenv("POSTGRES_USER", "VonLindenthal"),
+        dbname=os.environ["POSTGRES_DB"],
+        user=os.environ["POSTGRES_USER"],
         password=os.environ["POSTGRES_PASSWORD"],
         sslmode=os.getenv("POSTGRES_SSLMODE", "require"),
     )
